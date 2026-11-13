@@ -60,7 +60,8 @@ impl<'a> Record<'a> {
         Record { partition: Some(p), ..self }
     }
 
-    /// Its timestamp (CreateTime, ms since the epoch), rather than when it is sent.
+    /// Its timestamp (CreateTime, ms since the epoch), rather than when it is sent: at least 0, or
+    /// [`Producer::send`] refuses it (as Java's producer does).
     pub fn timestamp(self, ms: i64) -> Self {
         Record { timestamp: Some(ms), ..self }
     }
@@ -300,7 +301,8 @@ impl<C: Deliveries> Producer<C> {
     /// - [`Error::Fatal`]: the producer is fatal ([`fatal_error`](Producer::fatal_error)).
     /// - [`Error::Broker`] with [`Code::MESSAGE_TOO_LARGE`]: the message cannot fit a batch of
     ///   `message.max.bytes`.
-    /// - [`Error::Config`]: an empty topic, or a message larger than `queue.buffering.max.kbytes`.
+    /// - [`Error::Config`]: an empty topic, a timestamp below 0, or a message larger than
+    ///   `queue.buffering.max.kbytes`.
     /// - [`Error::Transport`]: the producer is closing.
     pub fn send(&self, r: Record<'_>, opaque: C::Opaque) -> std::result::Result<(), (Error, C::Opaque)> {
         let sh = &*self.shared;
@@ -314,6 +316,9 @@ impl<C: Deliveries> Producer<C> {
         }
         if r.topic.is_empty() {
             return Err((Error::Config("a record without a topic".into()), opaque));
+        }
+        if let Some(ms) = r.timestamp.filter(|ms| *ms < 0) {
+            return Err((Error::Config(format!("timestamp {ms}: a timestamp is at least 0")), opaque));
         }
         let size = size_of(r.key, r.value, r.headers);
         // what no wait would ever take: refused for what it is, not QueueFull
@@ -985,6 +990,21 @@ fn take_due<C: Deliveries>(
 /// A broker's thread: its partitions' batches sent as they are due, the answers applied. It
 /// connects at once, before its first batch is due.
 fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
+    /// A thread that panics is no longer the broker's: a new one is started at the next metadata,
+    /// else its partitions would never be sent again.
+    struct Gone<'a, C: Deliveries>(&'a Shared<C>, i32);
+    impl<C: Deliveries> Drop for Gone<'_, C> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let mut st = self.0.lock();
+                st.threads.retain(|t| *t != self.1);
+                st.metadata_due = true;
+                drop(st);
+                self.0.work.notify_all();
+            }
+        }
+    }
+    let _gone = Gone(sh, id);
     let addr = sh.lock().brokers.get(&id).cloned();
     let mut conn: Option<Conn> = addr.and_then(|a| Conn::open(sh.client.net(), &a).ok());
     let mut backoff = sh.s.retry_backoff;

@@ -1640,3 +1640,19 @@ fn a_reconnect_while_sending_is_bounded_by_the_message_timeout() {
     assert_eq!(h[0].3.as_deref(), Some("message timed out (message.timeout.ms)"), "{h:?}");
     assert!(late < Duration::from_millis(1500), "message.timeout.ms=300, reported after {late:?}");
 }
+
+/// A timestamp below 0 is refused at `send`, as Java's producer refuses it; any two others share a
+/// batch however far apart (their delta is never an overflow, which panicked a broker thread
+/// holding the state lock: its batch never reported, the broker never produced to again).
+#[test]
+fn negative_timestamps_are_refused_and_far_apart_ones_share_a_batch() {
+    let (b, logs) = sink(&["o"], 1, no_fault());
+    let p = producer(&b, &[("linger.ms", "50")]);
+    let refused = p.send(Record::to("o").value(b"n").timestamp(-1), 9).unwrap_err();
+    assert!(matches!(refused, (Error::Config(_), 9)), "{refused:?}");
+    p.send(Record::to("o").value(b"a").timestamp(0), 1).unwrap();
+    p.send(Record::to("o").value(b"b").timestamp(i64::MAX), 2).unwrap();
+    let h = heard(&p, 2);
+    assert!(h.iter().all(|o| o.3.is_none()), "{h:?}");
+    assert_eq!(log_of(&logs)[&("o".to_string(), 0)].stamps, [0, i64::MAX]);
+}

@@ -492,7 +492,8 @@ pub fn write(out: &mut Vec<u8>, records: &[Out<'_>], stamp: Stamp, codec: i16, s
     for (i, r) in records.iter().enumerate() {
         rec.clear();
         rec.push(0); // attributes
-        put_var(&mut rec, r.timestamp - base_ts);
+        // wrapping, as `read` adds it back: no timestamps panic, however far apart
+        put_var(&mut rec, r.timestamp.wrapping_sub(base_ts));
         put_var(&mut rec, i as i64);
         for b in [r.key, r.value] {
             match b {
