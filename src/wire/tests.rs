@@ -599,3 +599,12 @@ fn the_primitives_read_as_the_protocol_says() {
     assert!(super::init_producer_id(Cur::new(&ok)).is_err(), "a byte past the response");
     assert_eq!((LATEST, EARLIEST), (-1, -2));
 }
+
+/// A string longer than its i16 length can say is a Config error where it is handed in, not a
+/// panic where it is written.
+#[test]
+fn an_overlong_string_is_refused_before_it_is_written() {
+    check_str("group.id", &"g".repeat(32767)).unwrap();
+    let e = check_str("group.id", &"g".repeat(32768)).unwrap_err();
+    assert!(matches!(&e, Error::Config(m) if m.starts_with("group.id: 32768 bytes")), "{e}");
+}

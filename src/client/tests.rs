@@ -408,3 +408,115 @@ fn calls_are_tried_again_with_a_growing_wait() {
     let e = c.metadata(None, Duration::ZERO).unwrap_err();
     assert!(e.to_string().contains("Metadata within its timeout"), "{e}");
 }
+
+/// A broker whose ListOffsets answer omits a partition it was asked: the client panics.
+#[test]
+fn a_partition_left_out_of_the_answer_is_no_panic() {
+    let b = Broker::start(|r| match r.api {
+        wire::METADATA => Answer::Body(metadata(&[(0, &r.me)], &[("t", &[(0, 0), (1, 0)])])),
+        wire::LIST_OFFSETS => {
+            // answers only partition 0
+            let mut out = vec![];
+            out.i32(0);
+            out.i32(1);
+            out.str("t");
+            out.i32(1);
+            out.i32(0);
+            out.i16(0);
+            out.i64(-1);
+            out.i64(42);
+            Answer::Body(out)
+        }
+        _ => Answer::Drop,
+    });
+    let c = Client::new(&config(&b.addr)).unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.list_offsets(&[("t".into(), 0, -1), ("t".into(), 1, -1)], false, T)
+    }));
+    assert!(r.is_ok(), "list_offsets panicked on a broker's answer");
+}
+
+/// CreateTopics is retried after a timeout: the broker created the topic the first time, the
+/// retry answers TOPIC_ALREADY_EXISTS, and the caller is told its own topic already existed.
+#[test]
+fn create_topics_retried_after_a_lost_answer_reports_its_own_topic_created() {
+    let n = Arc::new(AtomicUsize::new(0));
+    let n2 = n.clone();
+    let b = Broker::start(move |r| match r.api {
+        wire::METADATA => Answer::Body(metadata(&[(0, &r.me)], &[])),
+        wire::CREATE_TOPICS => {
+            if n2.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Answer::Silence; // created, but the answer is lost/slow
+            }
+            let mut out = vec![];
+            out.i32(0);
+            out.i32(1);
+            out.str("new");
+            out.i16(36);
+            out.nstr(None);
+            Answer::Body(out)
+        }
+        _ => Answer::Drop,
+    });
+    let mut cfg = config(&b.addr);
+    cfg.set("socket.timeout.ms", "300");
+    cfg.set("reconnect.backoff.ms", "1");
+    let c = Client::new(&cfg).unwrap();
+    let got = c.create_topics(&[("new".into(), 1, -1)], T).unwrap();
+    assert_eq!(n.load(Ordering::SeqCst), 2, "sent twice");
+    assert_eq!(got[0].1, Ok(()), "the caller's own topic reported as {:?}", got[0].1);
+}
+
+/// partitions() of a topic the cluster does not have spins for the whole timeout.
+#[test]
+fn partitions_of_a_topic_the_cluster_has_not_fail_fast() {
+    let b = Broker::start(|r| match r.api {
+        wire::METADATA => {
+            let mut m = vec![];
+            m.i32(0);
+            m.i32(1);
+            m.i32(0);
+            let (h, p) = r.me.rsplit_once(':').unwrap();
+            m.str(h);
+            m.i32(p.parse().unwrap());
+            m.nstr(None);
+            m.nstr(None);
+            m.i32(0);
+            m.i32(1);
+            m.i16(3);
+            m.str("nope");
+            m.i8(0);
+            m.i32(0);
+            Answer::Body(m)
+        }
+        _ => Answer::Drop,
+    });
+    let c = Client::new(&config(&b.addr)).unwrap();
+    let t0 = Instant::now();
+    let e = c.partitions("nope", Duration::from_secs(3)).unwrap_err();
+    assert!(t0.elapsed() < Duration::from_secs(1), "took {:?}: {e}", t0.elapsed());
+}
+
+/// A group id over 32767 bytes panics inside the library (Put::str's expect).
+#[test]
+fn an_overlong_name_is_refused_not_a_panic() {
+    let b = Broker::start(|_| Answer::Drop);
+    let c = Client::new(&config(&b.addr)).unwrap();
+    let g = "g".repeat(40_000);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.commit(&g, &[("t".into(), 0, 1)], Duration::from_secs(1))
+    }));
+    assert!(r.is_ok(), "commit panicked on a long group id");
+}
+
+/// A caller's "no limit" (Duration::MAX) panics: Instant + Duration overflows.
+#[test]
+fn duration_max_is_no_limit_not_a_panic() {
+    let b = Broker::start(|r| match r.api {
+        wire::METADATA => Answer::Body(metadata(&[(0, &r.me)], &[])),
+        _ => Answer::Drop,
+    });
+    let c = Client::new(&config(&b.addr)).unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.metadata(None, Duration::MAX)));
+    assert!(r.is_ok(), "metadata(None, Duration::MAX) panicked");
+}

@@ -146,7 +146,7 @@ fn tls_presents_the_client_certificate() {
     c.set("ssl.certificate.pem", client.pem()).set("ssl.key.pem", key.serialize_pem());
     let mut conn = Conn::open(&net(&c), &addr).unwrap();
     assert_eq!(conn.call(wire::METADATA, |o| o.extend(b"mtls")).unwrap(), b"mtls");
-    let dir = std::env::temp_dir().join(format!("brrrrr-kafka-tls-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("fastka-tls-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for (f, v) in [("ca.pem", p.ca_pem.clone()), ("c.pem", client.pem()), ("k.pem", key.serialize_pem())] {
         std::fs::write(dir.join(f), v).unwrap();
@@ -386,4 +386,176 @@ fn a_tls_handshake_unanswered_times_out() {
     let e = Conn::open(&net(&c), &addr).unwrap_err();
     assert!(matches!(&e, Error::Timeout(m) if m.contains("TLS handshake")), "{e}");
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+}
+
+/// A TLS broker trickling its answer (a byte every 100 ms) holds a request far past its
+/// timeout: rustls loops inside one `Until::read` until a whole record is in, each socket read
+/// waiting the time left as it was when `Until::read` began.
+#[test]
+fn a_tls_broker_trickling_its_answer_cannot_outlive_the_timeout() {
+    let p = pki(&["localhost"]);
+    let cfg = rustls::ServerConfig::builder_with_provider(crate::testkit::provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![p.cert.clone()], p.key.clone_key())
+        .unwrap();
+    let cfg = Arc::new(cfg);
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut sock, _) = l.accept().unwrap();
+        let mut conn = rustls::ServerConnection::new(cfg).unwrap();
+        let mut n = 0;
+        loop {
+            // read a request
+            let mut s = rustls::Stream::new(&mut conn, &mut sock);
+            let mut size = [0; 4];
+            if s.read_exact(&mut size).is_err() {
+                return;
+            }
+            let mut b = vec![0; i32::from_be_bytes(size) as usize];
+            s.read_exact(&mut b).unwrap();
+            let corr = i32::from_be_bytes(b[4..8].try_into().unwrap());
+            let body = if n == 0 { all_versions() } else { vec![7u8; 200] };
+            let mut out = vec![];
+            out.i32(body.len() as i32 + 4);
+            out.i32(corr);
+            out.extend(body);
+            conn.writer().write_all(&out).unwrap();
+            let mut tls = vec![];
+            while conn.wants_write() {
+                conn.write_tls(&mut tls).unwrap();
+            }
+            if n == 0 {
+                sock.write_all(&tls).unwrap();
+            } else {
+                for byte in tls {
+                    if sock.write_all(&[byte]).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            n += 1;
+        }
+    });
+    let addr = format!("localhost:{port}");
+    let mut c = config(&addr);
+    c.set("security.protocol", "ssl").set("ssl.ca.pem", p.ca_pem.clone());
+    c.set("socket.timeout.ms", "500");
+    let mut conn = Conn::open(&net(&c), &addr).unwrap();
+    let t = Instant::now();
+    let r = conn.call(wire::METADATA, |_| {});
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "socket.timeout.ms=500 but the call took {:?}: {:?}",
+        t.elapsed(),
+        r.map(|v| v.len())
+    );
+}
+
+/// `Conn`'s derived Debug prints `out`, the last request sent: after PLAIN, the password.
+#[test]
+fn debug_never_shows_the_password() {
+    let b = sasl_broker("svc", "s3cret");
+    let mut c = config(&b.addr);
+    c.set("security.protocol", "sasl_plaintext").set("sasl.mechanisms", "PLAIN").set("sasl.username", "svc");
+    c.set("sasl.password", "s3cret");
+    let conn = Conn::open(&net(&c), &b.addr).unwrap();
+    let d = format!("{conn:?}");
+    let pw: String = b"s3cret".iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", ");
+    assert!(!d.contains(&pw), "Debug of Conn holds the password's bytes: {d}");
+}
+
+/// A bootstrap broker answering TLS with garbage (a plaintext listener) is Error::Auth, which
+/// `Client::bootstrap` returns at once, never trying the next (healthy) bootstrap broker.
+#[test]
+fn bootstrap_tries_the_next_broker_after_one_speaking_no_tls() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bad = format!("localhost:{}", l.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let mut s = s.unwrap();
+            let _ = s.write_all(b"\x00\x00\x00\x10garbage-not-tls!!!!!!!!!!");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+    let p = pki(&["localhost"]);
+    let good = tls_broker(&p, None);
+    let good = localhost(&good);
+    let mut c = config(&format!("{bad},{good}"));
+    c.set("security.protocol", "ssl").set("ssl.ca.pem", p.ca_pem.clone());
+    let client = crate::client::Client::new(&c).unwrap();
+    let r = client.metadata(Some(&[]), Duration::from_secs(3));
+    assert!(!matches!(r, Err(Error::Auth(_))), "the second bootstrap broker never tried: {r:?}");
+}
+
+/// The request header carries `client.id`, as the broker's logs and quotas know the client.
+#[test]
+fn requests_carry_the_client_id() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut b = [0; 4];
+        s.read_exact(&mut b).unwrap();
+        let mut b = vec![0; i32::from_be_bytes(b) as usize];
+        s.read_exact(&mut b).unwrap();
+        let mut c = wire::Cur::new(&b[8..]);
+        tx.send(c.nstr().unwrap().map(str::to_string)).unwrap();
+    });
+    let mut c = config(&addr);
+    c.set("client.id", "billing");
+    let _ = Conn::open(&net(&c), &addr);
+    assert_eq!(rx.recv().unwrap().as_deref(), Some("billing"));
+}
+
+/// Connecting has one deadline: SASL's steps share what is left of it, not each a fresh one.
+#[test]
+fn connecting_steps_share_one_deadline() {
+    let b = Broker::start(|r| {
+        std::thread::sleep(Duration::from_millis(600));
+        let mut out = vec![];
+        match r.api {
+            wire::SASL_HANDSHAKE => {
+                out.i16(0);
+                out.count(1);
+                out.str("PLAIN");
+            }
+            _ => {
+                out.i16(0);
+                out.nstr(None);
+                out.bytes(b"");
+            }
+        }
+        Answer::Body(out)
+    });
+    let mut c = config(&b.addr);
+    c.set("security.protocol", "sasl_plaintext").set("sasl.mechanisms", "PLAIN").set("sasl.username", "u");
+    c.set("sasl.password", "p").set("socket.connection.setup.timeout.ms", "1000");
+    let t = Instant::now();
+    let r = Conn::open(&net(&c), &b.addr);
+    assert!(matches!(r, Err(Error::Timeout(_))), "two 600 ms steps within 1000 ms: {r:?}");
+    assert!(t.elapsed() < Duration::from_millis(1300), "{:?}", t.elapsed());
+}
+
+/// A bootstrap broker that does not speak this client's versions is skipped for the next one.
+#[test]
+fn bootstrap_tries_the_next_broker_after_an_unsupported_one() {
+    let mut v = vec![];
+    v.i16(35);
+    v.count(0);
+    let bad = Broker::start_full(None, v, |_| Answer::Drop);
+    let good = Broker::start(|r| match r.api {
+        wire::METADATA => Answer::Body(crate::testkit::metadata(&[(0, &r.me)], &[])),
+        _ => Answer::Drop,
+    });
+    let client = crate::client::Client::new(&config(&format!("{},{}", bad.addr, good.addr))).unwrap();
+    client.metadata(Some(&[]), Duration::from_secs(3)).unwrap();
+    // every one refusing: the refusal, not a transport error
+    let client = crate::client::Client::new(&config(&format!("{},127.0.0.1:1", bad.addr))).unwrap();
+    let r = client.metadata(Some(&[]), Duration::from_secs(1));
+    assert!(matches!(r, Err(Error::Unsupported(_))), "{r:?}");
 }
