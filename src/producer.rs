@@ -5,10 +5,14 @@
 //! `delivery`, on the thread that polls.
 //!
 //! Like librdkafka's idempotent producer: messages are given up `message.timeout.ms` after
-//! `send`, retries included; a DUPLICATE_SEQUENCE_NUMBER is a delivery (its offset unknown). Not
-//! like it: where the broker's sequence may now have a gap (a batch in flight timed out, or
-//! refused for good), librdkafka bumps the epoch and renumbers; this producer is fatal instead
-//! (`fatal_error`): every message after fails, and a new producer is made to go on.
+//! `send`, retries included; a DUPLICATE_SEQUENCE_NUMBER is a delivery (its offset unknown). A
+//! batch that fails (refused for good, or timed out) though no attempt of it may have been
+//! written fails alone: the broker never had its sequence, which the next batch takes. Not like
+//! librdkafka: where the broker's sequence may now have a gap (a batch that may have been written
+//! timed out or refused for good, or a sequence refused), librdkafka bumps the epoch and
+//! renumbers; this producer is fatal instead (`fatal_error`): every message after fails, and a new
+//! producer is made to go on. Each failed delivery says whether it may be on the log
+//! (`Persisted`).
 use crate::client::Client;
 use crate::config::{Config, ProducerSettings};
 use crate::conn::Conn;
@@ -122,11 +126,17 @@ impl<O> Pending<O> {
 struct Sent<O> {
     msgs: Vec<Pending<O>>,
     bytes: Arc<Vec<u8>>,
+    /// its first message's sequence
+    seq: i32,
     /// a broker thread has it in a request now
     sending: bool,
     /// may be sent (again) from then
     retry_at: Instant,
     attempts: u32,
+    /// a request of it was written and its answer never had, or answered with a code a broker
+    /// gives after appending it: the broker may hold its sequence. Until then, every attempt was
+    /// answered "not written", so its sequence may be given to the next batch if it fails.
+    maybe_written: bool,
 }
 
 struct Part<O> {
@@ -644,7 +654,8 @@ fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
 }
 
 /// Messages queued past their deadline given up; a batch in flight past its first message's
-/// deadline too, which makes the producer fatal (the broker may have written it).
+/// deadline too, which makes the producer fatal if the broker may have written it (its sequence
+/// may now have a gap), else gives its sequence to the next batch.
 fn expire<O>(st: &mut State<O>, now: Instant) {
     let mut gone = vec![];
     let mut gap = None;
@@ -665,9 +676,15 @@ fn expire<O>(st: &mut State<O>, now: Instant) {
             let timed_out = part.inflight.as_ref().is_some_and(|s| !s.sending && s.msgs[0].deadline <= now);
             if timed_out {
                 let s = part.inflight.take().expect("in flight");
-                gap = Some(format!("{name}/{id}: a batch timed out in flight (message.timeout.ms)"));
-                let lost = |p| (name.clone(), Some(*id), Error::MessageTimedOut, Persisted::Possibly, p);
-                gone.extend(s.msgs.into_iter().map(lost));
+                let persisted = if s.maybe_written {
+                    gap = Some(format!("{name}/{id}: a batch timed out in flight (message.timeout.ms)"));
+                    Persisted::Possibly
+                } else {
+                    part.seq = s.seq; // never written: the broker's next sequence is still its
+                    Persisted::No
+                };
+                let timed_out = |p| (name.clone(), Some(*id), Error::MessageTimedOut, persisted, p);
+                gone.extend(s.msgs.into_iter().map(timed_out));
             }
         }
     }
@@ -687,8 +704,9 @@ fn fail_queued<O>(st: &mut State<O>) {
         for (id, part) in t.parts.iter_mut() {
             gone.extend(part.queue.drain(..).map(|p| (name.clone(), Some(*id), Persisted::No, p)));
             if part.inflight.as_ref().is_some_and(|s| !s.sending) {
-                let lost = |p| (name.clone(), Some(*id), Persisted::Possibly, p);
-                gone.extend(part.inflight.take().expect("one").msgs.into_iter().map(lost));
+                let s = part.inflight.take().expect("one");
+                let persisted = if s.maybe_written { Persisted::Possibly } else { Persisted::No };
+                gone.extend(s.msgs.into_iter().map(|p| (name.clone(), Some(*id), persisted, p)));
             }
         }
     }
@@ -706,6 +724,34 @@ fn next_deadline<O>(st: &State<O>) -> Option<Instant> {
         })
         .map(|p| p.deadline)
         .min()
+}
+
+/// Whether a retriable answer to a Produce says its batch was not appended: the broker checks for
+/// these before it appends. Any other (REQUEST_TIMED_OUT, NOT_ENOUGH_REPLICAS_AFTER_APPEND, a
+/// leader that moved while waiting for its replicas) may come after the batch was appended.
+fn unwritten(c: Code) -> bool {
+    matches!(
+        c,
+        Code::UNKNOWN_TOPIC_OR_PARTITION
+            | Code::LEADER_NOT_AVAILABLE
+            | Code::NOT_ENOUGH_REPLICAS
+            | Code::FENCED_LEADER_EPOCH
+            | Code::UNKNOWN_LEADER_EPOCH
+            | Code::THROTTLING_QUOTA_EXCEEDED
+    )
+}
+
+/// Whether a refusal is about the producer's sequences or id, not the batch: whatever was sent,
+/// what the broker holds for the partition no longer follows on.
+fn sequence_broken(c: Code) -> bool {
+    matches!(
+        c,
+        Code::OUT_OF_ORDER_SEQUENCE_NUMBER
+            | Code::UNKNOWN_PRODUCER_ID
+            | Code::INVALID_PRODUCER_EPOCH
+            | Code::PRODUCER_FENCED
+            | Code::CLUSTER_AUTHORIZATION_FAILED
+    )
 }
 
 /// What a broker thread sends next: per partition (topic, partition, its batch's bytes, its
@@ -784,11 +830,14 @@ fn take_due<C: Deliveries>(
             match written {
                 Err(e) => failed.push((name.clone(), pnum, msgs, e)),
                 Ok(()) => {
+                    let seq = part.seq;
                     // Kafka's sequences wrap to 0 past i32::MAX
                     part.seq = part.seq.wrapping_add(n as i32) & i32::MAX;
                     let bytes = Arc::new(b);
                     out.push((name.clone(), pnum, bytes.clone(), msgs[0].deadline));
-                    part.inflight = Some(Sent { msgs, bytes, sending: true, retry_at: now, attempts: 1 });
+                    let maybe_written = false;
+                    part.inflight =
+                        Some(Sent { msgs, bytes, seq, sending: true, retry_at: now, attempts: 1, maybe_written });
                     sealed.push((name.clone(), pnum));
                 }
             }
@@ -852,7 +901,7 @@ fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
                     continue;
                 }
             }
-            Err(e) => {
+            Err((e, written)) => {
                 conn = None;
                 // every batch of the request sent again, after a backoff and a metadata refresh
                 let at = Instant::now() + backoff;
@@ -863,6 +912,7 @@ fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
                     {
                         sent.sending = false;
                         sent.retry_at = at;
+                        sent.maybe_written |= written;
                     }
                 }
                 if matches!(e, Error::Auth(_) | Error::Unsupported(_)) {
@@ -883,10 +933,12 @@ fn send<C: Deliveries>(
     id: i32,
     addr: Option<String>,
     req: &Request,
-) -> Result<(Vec<wire::Produced>, i32)> {
+) -> std::result::Result<(Vec<wire::Produced>, i32), (Error, bool)> {
+    // the error, and whether the request may have been written
+    let unsent = |e| (e, false);
     if conn.is_none() {
-        let addr = addr.ok_or_else(|| Error::Transport(format!("broker {id}: no address")))?;
-        *conn = Some(Conn::open(sh.client.net(), &addr)?);
+        let addr = addr.ok_or_else(|| unsent(Error::Transport(format!("broker {id}: no address"))))?;
+        *conn = Some(Conn::open(sh.client.net(), &addr).map_err(unsent)?);
     }
     let c = conn.as_mut().expect("connected");
     // given up at the first message's deadline (message.timeout.ms bounds a request in flight,
@@ -896,17 +948,19 @@ fn send<C: Deliveries>(
     let left = first.saturating_duration_since(Instant::now());
     if left.is_zero() {
         // stalled between taking it and sending it: not sent, given up as timed out
-        return Err(Error::Timeout("past the message timeout before it was sent".into()));
+        return Err(unsent(Error::Timeout("past the message timeout before it was sent".into())));
     }
     let timeout = sh.s.request_timeout.min(left);
     c.set_request_timeout(left.min(sh.s.request_timeout + sh.client.net().request_timeout));
     let batches: Vec<(&str, (i32, &[u8]))> = req.iter().map(|(t, p, b, _)| (t.as_str(), (*p, b.as_slice()))).collect();
     let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX).max(1);
-    let frame = c.call(wire::PRODUCE, |o| wire::produce_request(o, -1, ms, &batches))?;
-    wire::produce(Cur::new(&frame), c.version(wire::PRODUCE))
+    // from here a request may have been written whatever went wrong: the broker may have it
+    let frame = c.call(wire::PRODUCE, |o| wire::produce_request(o, -1, ms, &batches)).map_err(|e| (e, true))?;
+    wire::produce(Cur::new(&frame), c.version(wire::PRODUCE)).map_err(|e| (e, true))
 }
 
-/// A Produce answered: each batch delivered, sent again, or failed (the producer then fatal).
+/// A Produce answered: each batch delivered, sent again, or failed: alone where no attempt of it
+/// may have been written (its sequence then the next batch's), else with the producer fatal.
 fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Request, results: Vec<wire::Produced>) {
     let now = Instant::now();
     let mut done = vec![];
@@ -927,6 +981,7 @@ fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Reque
                 done.push((t.clone(), *p, sent.msgs, Ok(base)));
             }
             c if c.retriable() => {
+                sent.maybe_written |= !unwritten(c);
                 if c.stale_metadata() {
                     part.leader = None;
                     st.metadata_due = true;
@@ -934,7 +989,15 @@ fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Reque
                 sent.retry_at = now + sh.s.retry_backoff * sent.attempts.min(10);
                 part.inflight = Some(sent);
             }
-            c => done.push((t.clone(), *p, sent.msgs, Err((c, why)))),
+            c => {
+                // one batch a partition in flight: refused, and no attempt of it written, no later
+                // sequence was sent, and the broker's next is this batch's
+                let gap = sent.maybe_written || sequence_broken(c);
+                if !gap {
+                    part.seq = sent.seq;
+                }
+                done.push((t.clone(), *p, sent.msgs, Err((c, why, gap, sent.maybe_written))));
+            }
         }
     }
     for (t, p, msgs, r) in done {
@@ -944,11 +1007,15 @@ fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Reque
                     st.report(&t, Some(p), base.map(|b| b + i as i64), None, Persisted::Yes, m);
                 }
             }
-            Err((c, why)) => {
-                // refused for good: the broker's sequence for the partition has a gap now
+            Err((c, why, gap, maybe_written)) => {
+                let persisted = if maybe_written { Persisted::Possibly } else { Persisted::No };
                 for m in msgs {
-                    st.report(&t, Some(p), None, Some(Error::Broker(c, why.clone())), Persisted::No, m);
+                    st.report(&t, Some(p), None, Some(Error::Broker(c, why.clone())), persisted, m);
                 }
+                if !gap {
+                    continue;
+                }
+                // the broker's sequence for the partition may have a gap now
                 st.set_fatal(
                     c,
                     format!(

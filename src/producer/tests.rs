@@ -558,8 +558,15 @@ fn nothing_is_sent_past_its_deadline() {
     let mut part = Part { queue: VecDeque::new(), seq: 0, inflight: None, leader: Some(0) };
     part.queue.push_back(msg(1));
     let mut sent = Part { queue: VecDeque::new(), seq: 1, inflight: None, leader: Some(0) };
-    sent.inflight =
-        Some(Sent { msgs: vec![msg(2)], bytes: Arc::new(vec![]), sending: false, retry_at: past, attempts: 1 });
+    sent.inflight = Some(Sent {
+        msgs: vec![msg(2)],
+        bytes: Arc::new(vec![]),
+        seq: 0,
+        sending: false,
+        retry_at: past,
+        attempts: 1,
+        maybe_written: true, // its answer lost
+    });
     let mut t =
         Topic { partitions: vec![0, 1], sticky: 0, unassigned: VecDeque::new(), parts: HashMap::new(), missing: None };
     t.parts.insert(0, part);
