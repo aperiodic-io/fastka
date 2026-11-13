@@ -31,4 +31,20 @@ exclude_re = [
   "producer\\.rs:.*delete ! in next_deadline$",
   # Equivalent: a throttle of 0 ms (`>` to `>=`) waits until now.
   "producer\\.rs:\\d+:40: replace > with >= in broker$",
+  # Equivalent (from brrrrr-kafka's list): a deadline met at its very nanosecond or just after it
+  # (the lookups' and a broker's backoff, a throttle's end, a Fetch's timeout, an overdue Fetch),
+  # A partition's bytes at exactly its bound (`<` to `<=` at :96) fetching once more is the bound's
+  # last byte, not past it.
+  "consumer\\.rs:\\d+:(16|39|96): replace < with <= in Consumer::(lookups|send|pump)$",
+  "consumer\\.rs:\\d+:(47|28|81): replace > with >= in Consumer::(receive|answered|overdue)$",
+  # Equivalent: a lookup's answer for a partition that has a position (`||` to `&&`) is never in
+  # the partition's own epoch: a position is set only by a lookup's answer or a seek, and a seek
+  # starts a new epoch.
+  "consumer\\.rs:\\d+:44: replace \\|\\| with && in Consumer::found$",
+  # Equivalent: a Fetch pipelined to a broker whose answer had a corrupt batch (`&&` to `||`)
+  # goes on a connection dropped right after, unread.
+  "consumer\\.rs:\\d+:30: replace && with \\|\\| in Consumer::answered$",
+  # Not reached by a test: a Fetch is far smaller than a socket's send buffer, so it is always
+  # written whole and the 1 ms slice for one half written (`<` to `>`) is never taken.
+  "consumer\\.rs:\\d+:93: replace < with > in Consumer::wait_slice$",
 ]
