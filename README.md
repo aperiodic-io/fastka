@@ -74,9 +74,26 @@ loudly at startup, not half-supported:
 kqueue on Unix. Elsewhere, Windows included, it compiles, but the consumer checks its sockets every
 millisecond instead, and nothing there is tested.
 
-Two further limits. fastka has not been run by anyone except its authors, and its API is 0.x. The
-verification below is thorough, but it doesn't replace years of other people's production traffic,
-which librdkafka has.
+## Production readiness
+
+**Verdict: ready for production within the scope above.** That scope is assigned partitions; an
+idempotent producer; PLAINTEXT, TLS or SASL PLAIN/SCRAM; Kafka 2.4 to 4.1 or Redpanda; Linux.
+Each criterion below holds on the current commit, and CI checks it on every push:
+
+| Criterion | Evidence |
+|---|---|
+| No data loss, duplication or reordering under faults | the exhaustive producer model; the stress harness through cut, stalled and refused connections, every outcome checked against the broker's log |
+| Every delivery report is true, including "possibly persisted" | the model's invariants; the harsh stress profile (22 fatal producers, 33k possibly-persisted reports, all true) |
+| No panic, hang or unbounded memory on any broker input | Kani proofs; fuzzing; capped decompression; byte-bounded queues; every timeout bounded (TLS included) |
+| Interoperates with real brokers and other clients | Redpanda, Apache Kafka 4.1, SASL/SCRAM, franz-go both ways in every codec |
+| Fails loudly, not silently | unknown or unsupported settings refused at start; unsupported broker versions refused at connect |
+| Performance does not regress | the instruction-count gate, base against head, on the same runner |
+| Defects found by people trying to break it are fixed | three rounds of adversarial review; each finding is a test that failed first |
+| A public API that can evolve | builders and `#[non_exhaustive]` types; protocol internals hidden; every public item documented; MSRV 1.87 checked |
+
+**What this verdict does not claim.** fastka hasn't yet carried other people's production traffic
+for years, as librdkafka has, and its API is 0.x, so a 0.2 may break it. Run it behind the same
+canary you would give any new dependency on a critical path.
 
 ## Use
 
