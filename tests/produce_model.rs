@@ -1,29 +1,45 @@
 //! Model checking of the idempotent producer's protocol with a broker (`src/producer.rs`): every
 //! state reachable in a small configuration, explored breadth first, each one checked against the
-//! invariants brrrrr rests on (the lease fence, the ledger's offsets, a run loop that stops on a
-//! failed delivery).
+//! invariants an application of an idempotent producer rests on: nothing written twice or out of
+//! the order sent, each message reported at the offset it is at, a message reported failed and
+//! not persisted never on the log, and one written but reported failed only with the producer
+//! fatal (an application that stops on a failed delivery then never loses track of the log).
 //!
 //! The model is one partition: the application sending N messages, their deadlines passing in the
 //! order they were sent (`message.timeout.ms` is the same for every message), the producer's rules,
 //! and a broker keeping Kafka's idempotence state for the producer id. Every interleaving is
 //! explored: a batch sealed of any number of the queued messages; a request or its answer lost (a
-//! connection dropped, a client timeout); a retriable refusal (NOT_LEADER_OR_FOLLOWER and the like);
+//! connection dropped, a client timeout); a retriable refusal, either before the broker appended
+//! the batch (NOT_ENOUGH_REPLICAS) or after (REQUEST_TIMED_OUT, NOT_ENOUGH_REPLICAS_AFTER_APPEND);
+//! a refusal for good of the batch (MESSAGE_TOO_LARGE, TOPIC_AUTHORIZATION_FAILED: never appended);
+//! a refusal for good with a code not known to come before appending, appended or not;
 //! a batch sent again answered either as Kafka does for its last batches (NONE, the offset it was
 //! written at) or as DUPLICATE_SEQUENCE_NUMBER.
 //!
 //! Each action of the model is a rule of the code, named by the function it models:
+//! - `Sent::maybe_written`: a batch may have been written once a request of it was written and its
+//!   answer never had, or it was answered with a code a broker gives after appending it.
 //! - `expire`: queued messages past their deadline time out; a batch neither in a request nor
-//!   answered (`!sending`) past its first message's deadline times out and makes the producer fatal
-//!   (the broker may have written it: its sequence may now have a gap).
+//!   answered (`!sending`) past its first message's deadline times out: if it may have been
+//!   written, the producer is fatal (its sequence may now have a gap); else its sequence is the
+//!   next batch's.
 //! - `fail_queued`: fatal, what is queued fails, and a batch not in a request.
 //! - `take_due`: one batch of a partition at a time; a new one only when none is in flight and the
 //!   producer is not fatal; a batch not answered is sent again with the same sequence.
+//! - `encoded`: a batch sealed is encoded off the lock, then put in its thread's request; or left
+//!   sealed for the next request (past `max.request.size` once encoded), sent then with its
+//!   sequence; or, failing to encode, fails alone (not persisted), its sequence the next batch's.
 //! - `send`: a request is not sent past its first message's deadline (given up as timed out).
 //! - `applied`: NONE or DUPLICATE_SEQUENCE_NUMBER delivers (DUPLICATE at no offset), a retriable
-//!   code sends the batch again, any other code fails it and makes the producer fatal.
+//!   code sends the batch again, a refusal for good fails it: alone, its sequence the next batch's,
+//!   if it may not have been written; else with the producer fatal; a refusal with a code not
+//!   known to come before appending (`refused_before_append`) may have been written, so likewise;
+//!   a refusal of the sequence (OUT_OF_ORDER_SEQUENCE_NUMBER) fails it with the producer fatal.
 //!
 //! What the model leaves out: other partitions and brokers (each partition's batches are
-//! independent in the code: one in flight a partition), the producer id (fixed), leaders moving
+//! independent in the code: one in flight a partition, however many requests `max.in.flight` has
+//! outstanding to a broker, each on its own connection: a request a connection lost and read late
+//! while the batch is sent again on another is a ghost here), the producer id (fixed), leaders moving
 //! (the broker's log and idempotence state are the partition's, whoever leads it), sequences
 //! wrapping past i32::MAX, and time beyond the order of the deadlines.
 #![allow(clippy::unit_arg)] // an action is `Ok(` the state change it makes `)`
@@ -34,16 +50,21 @@ use std::collections::{HashSet, VecDeque};
 enum Outcome {
     /// delivered at this offset, or (DUPLICATE_SEQUENCE_NUMBER) at one the broker did not say
     Delivered(Option<u8>),
-    TimedOut,
-    /// failed for good (a code a retry does not mend, or the producer fatal)
-    Failed,
+    /// timed out; true: reported possibly persisted (`Persisted::Possibly`), false: not
+    TimedOut(bool),
+    /// failed for good (a code a retry does not mend, or the producer fatal); as `TimedOut`
+    Failed(bool),
     /// refused by `send`: the producer was fatal already
     Refused,
 }
 
-/// Where a sealed batch is: to be sent (taken by a broker thread), on the wire, answered.
+/// Where a sealed batch is: being encoded, to be sent (taken by a broker thread), on the wire,
+/// answered.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Wire {
+    /// sealed (its sequence taken), its messages out with the broker thread that encodes them,
+    /// off the lock (`encode`): no other thread touches it
+    Encoding,
     /// taken (`sending`), not yet written: `send` checks the deadline first
     Taken,
     /// written; the broker has not read it
@@ -58,8 +79,14 @@ enum Answer {
     Written(u8),
     /// DUPLICATE_SEQUENCE_NUMBER: written before, its offset not said
     Duplicate,
-    /// a code a retry may mend: not written
+    /// a code a retry may mend, which the broker gives before appending: not written
     Retriable,
+    /// a code a retry may mend, which the broker gives after appending: written
+    RetriableWritten,
+    /// a refusal of the batch for good (MESSAGE_TOO_LARGE and the like): not written
+    Refused,
+    /// a refusal for good with a code not known to come before appending: written or not
+    Unknown,
     /// OUT_OF_ORDER_SEQUENCE_NUMBER: a sequence past the broker's next
     OutOfOrder,
 }
@@ -70,6 +97,8 @@ struct Batch {
     seq: u8,
     /// None: not in a request (`!sending`), to be sent again
     wire: Option<Wire>,
+    /// `Sent::maybe_written`
+    maybe_written: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -144,13 +173,17 @@ impl State {
     fn expire(&mut self) -> Result<(), String> {
         while self.queue.front().is_some_and(|m| *m < self.expired) {
             let m = self.queue.pop_front().unwrap();
-            self.report(m, Outcome::TimedOut)?;
+            self.report(m, Outcome::TimedOut(false))?;
         }
         if self.inflight.as_ref().is_some_and(|b| b.wire.is_none() && b.msgs[0] < self.expired) {
-            for m in self.inflight.take().unwrap().msgs {
-                self.report(m, Outcome::TimedOut)?;
+            let b = self.inflight.take().unwrap();
+            for m in b.msgs {
+                self.report(m, Outcome::TimedOut(b.maybe_written))?;
             }
-            self.fatal = true;
+            match b.maybe_written {
+                true => self.fatal = true,
+                false => self.next_seq = b.seq,
+            }
         }
         Ok(())
     }
@@ -199,11 +232,12 @@ impl State {
         if self.fatal && (!self.queue.is_empty() || self.inflight.as_ref().is_some_and(|b| b.wire.is_none())) {
             go(&mut out, &|s| {
                 while let Some(m) = s.queue.pop_front() {
-                    s.report(m, Outcome::Failed)?;
+                    s.report(m, Outcome::Failed(false))?;
                 }
                 if s.inflight.as_ref().is_some_and(|b| b.wire.is_none()) {
-                    for m in s.inflight.take().unwrap().msgs {
-                        s.report(m, Outcome::Failed)?;
+                    let b = s.inflight.take().unwrap();
+                    for m in b.msgs {
+                        s.report(m, Outcome::Failed(b.maybe_written))?;
                     }
                 }
                 Ok(())
@@ -224,7 +258,7 @@ impl State {
                             let msgs: Vec<u8> = s.queue.drain(..k).collect();
                             let seq = s.next_seq;
                             s.next_seq += k as u8;
-                            s.inflight = Some(Batch { msgs, seq, wire: Some(Wire::Taken) });
+                            s.inflight = Some(Batch { msgs, seq, wire: Some(Wire::Encoding), maybe_written: false });
                             Ok(())
                         });
                     }
@@ -233,6 +267,19 @@ impl State {
         }
         let Some(b) = &self.inflight else { return out };
         match b.wire {
+            // `encoded`: in the request; left sealed for the next; or failed to encode, alone
+            Some(Wire::Encoding) => {
+                go(&mut out, &|s| Ok(s.inflight.as_mut().unwrap().wire = Some(Wire::Taken)));
+                go(&mut out, &|s| Ok(s.inflight.as_mut().unwrap().wire = None));
+                go(&mut out, &|s| {
+                    let b = s.inflight.take().unwrap();
+                    for m in b.msgs {
+                        s.report(m, Outcome::Failed(false))?;
+                    }
+                    s.next_seq = b.seq;
+                    Ok(())
+                });
+            }
             // `send`: past its first message's deadline, not written (given up as timed out)
             Some(Wire::Taken) => go(&mut out, &|s| {
                 let b = s.inflight.as_mut().unwrap();
@@ -247,31 +294,42 @@ impl State {
                 Ok(())
             }),
             Some(Wire::Request) => {
-                // the broker reads it, as Kafka's idempotence keeps a producer's sequences
-                go(&mut out, &|s| {
-                    let (msgs, seq) = (b.msgs.clone(), b.seq);
-                    let answer = s.broker_reads(&msgs, seq);
-                    if answer == Answer::OutOfOrder {
-                        // the producer sends a batch at the broker's next sequence or again at its
-                        // last: never past it, so its own requests never find a gap
-                        return Err(format!("batch {msgs:?} at sequence {seq}: a gap, the broker at {}", s.b_next));
-                    }
-                    s.inflight.as_mut().unwrap().wire = Some(Wire::Answer(answer));
-                    Ok(())
-                });
+                // the broker reads it, as Kafka's idempotence keeps a producer's sequences, and
+                // answers as it wrote it, or with a retriable code it gives after appending, or
+                // with a refusal for good the producer does not know comes before appending
+                for then in [None, Some(Answer::RetriableWritten), Some(Answer::Unknown)] {
+                    go(&mut out, &move |s: &mut State| {
+                        let (msgs, seq) = (b.msgs.clone(), b.seq);
+                        let answer = s.broker_reads(&msgs, seq);
+                        if answer == Answer::OutOfOrder {
+                            // the producer sends a batch at the broker's next sequence or again at
+                            // its last: never past it, so its own requests never find a gap
+                            return Err(format!("batch {msgs:?} at sequence {seq}: a gap, the broker at {}", s.b_next));
+                        }
+                        let answer = then.unwrap_or(answer);
+                        s.inflight.as_mut().unwrap().wire = Some(Wire::Answer(answer));
+                        Ok(())
+                    });
+                }
                 // ... or it answers DUPLICATE_SEQUENCE_NUMBER to a batch written before
                 if self.b_last.is_some_and(|l| l.0 == b.seq) {
                     go(&mut out, &|s| Ok(s.inflight.as_mut().unwrap().wire = Some(Wire::Answer(Answer::Duplicate))));
                 }
-                // ... or refuses it for now, unwritten
-                go(&mut out, &|s| Ok(s.inflight.as_mut().unwrap().wire = Some(Wire::Answer(Answer::Retriable))));
+                // ... or refuses it, unwritten, for now or for good (whatever it wrote before)
+                for a in [Answer::Retriable, Answer::Refused, Answer::Unknown] {
+                    go(&mut out, &move |s: &mut State| Ok(s.inflight.as_mut().unwrap().wire = Some(Wire::Answer(a))));
+                }
                 // ... or the request is lost (the connection dropped, the client timed out)
-                go(&mut out, &|s| Ok(s.inflight.as_mut().unwrap().wire = None));
+                go(&mut out, &|s| {
+                    let b = s.inflight.as_mut().unwrap();
+                    (b.wire, b.maybe_written) = (None, true);
+                    Ok(())
+                });
                 // ... or the client gives up on it (a timeout) while the broker may still read it
                 if self.ghosts.len() < GHOSTS {
                     go(&mut out, &|s| {
                         let b = s.inflight.as_mut().unwrap();
-                        b.wire = None;
+                        (b.wire, b.maybe_written) = (None, true);
                         let ghost = (b.msgs.clone(), b.seq);
                         s.ghosts.push(ghost);
                         Ok(())
@@ -280,7 +338,11 @@ impl State {
             }
             Some(Wire::Answer(a)) => {
                 // the answer is lost
-                go(&mut out, &|s| Ok(s.inflight.as_mut().unwrap().wire = None));
+                go(&mut out, &|s| {
+                    let b = s.inflight.as_mut().unwrap();
+                    (b.wire, b.maybe_written) = (None, true);
+                    Ok(())
+                });
                 // `applied`
                 go(&mut out, &move |s: &mut State| {
                     match a {
@@ -295,9 +357,32 @@ impl State {
                             }
                         }
                         Answer::Retriable => s.inflight.as_mut().unwrap().wire = None,
+                        Answer::RetriableWritten => {
+                            let b = s.inflight.as_mut().unwrap();
+                            (b.wire, b.maybe_written) = (None, true);
+                        }
+                        Answer::Refused => {
+                            let b = s.inflight.take().unwrap();
+                            for m in b.msgs {
+                                s.report(m, Outcome::Failed(b.maybe_written))?;
+                            }
+                            match b.maybe_written {
+                                true => s.fatal = true,
+                                false => s.next_seq = b.seq,
+                            }
+                        }
+                        // `refused_before_append` false: it may have been written
+                        Answer::Unknown => {
+                            let b = s.inflight.take().unwrap();
+                            for m in b.msgs {
+                                s.report(m, Outcome::Failed(true))?;
+                            }
+                            s.fatal = true;
+                        }
                         Answer::OutOfOrder => {
-                            for m in s.inflight.take().unwrap().msgs {
-                                s.report(m, Outcome::Failed)?;
+                            let b = s.inflight.take().unwrap();
+                            for m in b.msgs {
+                                s.report(m, Outcome::Failed(b.maybe_written))?;
                             }
                             s.fatal = true;
                         }
@@ -329,10 +414,14 @@ impl State {
                 Some(Outcome::Delivered(None)) if written.is_none() => {
                     return Err(format!("message {m} reported delivered, not written"));
                 }
-                // written but reported failed: only with the producer fatal (the run loop then stops
-                // and a restart replays it from the last checkpoint)
-                Some(Outcome::TimedOut | Outcome::Failed) if written.is_some() && !self.fatal => {
+                // written but reported failed: only with the producer fatal (an application that
+                // stops on a failed delivery then starts again from what is on the log)
+                Some(Outcome::TimedOut(_) | Outcome::Failed(_)) if written.is_some() && !self.fatal => {
                     return Err(format!("message {m} written, reported failed, the producer not fatal"));
+                }
+                // reported not persisted: not on the log, nor ever (checked in every state after)
+                Some(Outcome::TimedOut(false) | Outcome::Failed(false) | Outcome::Refused) if written.is_some() => {
+                    return Err(format!("message {m} written, reported not persisted"));
                 }
                 _ => {}
             }
@@ -343,13 +432,16 @@ impl State {
 
 /// The hard cases, each reached somewhere (else the model would prove little): a delivery at no
 /// offset, a message written by a request the client gave up on, a message written and reported
-/// timed out (the producer fatal), a batch sent again and answered with its first write's offset.
+/// timed out (the producer fatal), a batch sent again and answered with its first write's offset,
+/// a batch failed alone (refused, or timed out unwritten) and a later message delivered at its
+/// sequence, the producer not fatal.
 #[derive(Default, Debug)]
 struct Witnessed {
     duplicate: bool,
     ghost_written: bool,
     written_timed_out: bool,
     resent_delivered: bool,
+    failed_alone_then_delivered: bool,
 }
 
 /// Every state reachable with `n` messages: how many, and the hard cases reached; or the first
@@ -364,8 +456,12 @@ fn explore(n: u8) -> Result<(usize, Witnessed), String> {
         for (m, o) in s.outcome.iter().enumerate() {
             let written = s.log.contains(&(m as u8));
             w.duplicate |= *o == Some(Outcome::Delivered(None));
-            w.written_timed_out |= written && *o == Some(Outcome::TimedOut);
+            w.written_timed_out |= written && matches!(o, Some(Outcome::TimedOut(_)));
         }
+        // a batch's message failed alone, a later one at the head of the log
+        let alone = |o: &Option<Outcome>| matches!(o, Some(Outcome::Failed(false) | Outcome::TimedOut(false)));
+        w.failed_alone_then_delivered |=
+            !s.fatal && s.log.first().is_some_and(|f| (0..*f as usize).any(|m| alone(&s.outcome[m])));
         w.resent_delivered |= matches!(&s.inflight, Some(b) if b.seq < s.b_next
             && matches!(b.wire, Some(Wire::Answer(Answer::Written(_)))));
         let next = s.next(n);
@@ -391,30 +487,44 @@ fn the_idempotent_protocol_keeps_its_invariants_in_every_state() {
     for n in 1..=5 {
         let (states, w) = explore(n).unwrap_or_else(|e| panic!("{n} messages: {e}"));
         eprintln!("{n} messages: {states} states, each checked; {w:?}");
-        assert!(w.duplicate && w.ghost_written && w.written_timed_out && w.resent_delivered, "{n}: {w:?}");
+        let all = w.duplicate && w.ghost_written && w.written_timed_out && w.resent_delivered;
+        assert!(all && (n < 2 || w.failed_alone_then_delivered), "{n}: {w:?}");
     }
 }
 
-/// The first invariant broken where `next` is replaced by `broken` (3 messages), if one is.
-fn first_broken(broken: impl Fn(&State) -> Vec<Step>) -> Option<String> {
+/// The first invariant broken where `next` is replaced by `broken` (3 messages), if one is: in a
+/// state, or (with `steps`) by an action.
+fn first_broken_in(broken: impl Fn(&State) -> Vec<Step>, steps: bool) -> Option<String> {
     let start = State::new(3);
     let (mut seen, mut todo) = (HashSet::from([start.clone()]), VecDeque::from([start]));
     while let Some(s) = todo.pop_front() {
         if let Err(e) = s.check() {
             return Some(e);
         }
-        for t in broken(&s).into_iter().flatten() {
-            if seen.insert(t.clone()) {
-                todo.push_back(t);
+        for t in broken(&s) {
+            match t {
+                Err(e) if steps => return Some(e),
+                Err(_) => {}
+                Ok(t) => {
+                    if seen.insert(t.clone()) {
+                        todo.push_back(t);
+                    }
+                }
             }
         }
     }
     None
 }
 
+fn first_broken(broken: impl Fn(&State) -> Vec<Step>) -> Option<String> {
+    first_broken_in(broken, false)
+}
+
 /// The checker finds what it checks for. A batch past its deadline given up without making the
 /// producer fatal (the broker may have written it) is caught; so is a batch sent again under a new
-/// sequence rather than its own (written twice).
+/// sequence rather than its own (written twice); so is a batch's sequence given to the next batch
+/// though it may have been written (the producer forgetting `maybe_written`); so is a batch that
+/// failed to encode keeping its sequence (a gap at the broker).
 #[test]
 fn the_checker_catches_a_broken_rule() {
     let e = first_broken(|s| {
@@ -441,4 +551,27 @@ fn the_checker_catches_a_broken_rule() {
         out
     });
     assert!(e.as_deref().is_some_and(|e| e.contains("written twice")), "{e:?}");
+    let e = first_broken(|s| {
+        let mut forgot = s.clone();
+        if let Some(b) = &mut forgot.inflight {
+            b.maybe_written = false;
+        }
+        forgot.next(3)
+    });
+    // a message written then reported failed, whichever invariant sees it first
+    assert!(e.as_deref().is_some_and(|e| e.contains("written, reported")), "{e:?}");
+    // a batch that failed to encode keeping its sequence: the next batch is past the broker's
+    let e = first_broken_in(
+        |s| {
+            let mut out = s.next(3);
+            for t in out.iter_mut().flatten() {
+                if s.inflight.as_ref().is_some_and(|b| b.wire == Some(Wire::Encoding)) && t.inflight.is_none() {
+                    t.next_seq = s.next_seq;
+                }
+            }
+            out
+        },
+        true,
+    );
+    assert!(e.as_deref().is_some_and(|e| e.contains("a gap")), "{e:?}");
 }

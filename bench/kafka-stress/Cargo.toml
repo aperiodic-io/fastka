@@ -1,0 +1,17 @@
+[package]
+name = "kafka-stress"
+description = "fastka's producer against librdkafka's under a top-of-the-hour burst, through a proxy that sees every Produce"
+edition = "2021"
+version = "0.1.0"
+publish = false
+
+# not a member of fastka's build: librdkafka is built here alone (bench/ is excluded from the package)
+[workspace]
+
+[dependencies]
+fastka = { path = "../.." }
+# librdkafka without curl or SASL's C libraries, as bench/compare builds it
+rdkafka = { version = "0.39", default-features = false, features = ["libz", "zstd"] }
+
+[profile.release]
+debug = "line-tables-only"

@@ -1,0 +1,16 @@
+[package]
+name = "fastka-stress"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "fastka's producer and consumer through a fault-injecting proxy, every outcome checked against the broker's log"
+
+[workspace]
+
+[dependencies]
+fastka = { path = ".." }
+
+[profile.release]
+debug = "line-tables-only"
+overflow-checks = true
+debug-assertions = true

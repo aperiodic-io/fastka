@@ -1,0 +1,178 @@
+name: ci
+on:
+  push:
+  workflow_dispatch:
+  pull_request:
+  schedule: [{ cron: "17 3 * * *" }] # nightly: longer fuzzing and stress
+permissions: { contents: read }
+concurrency: { group: "${{ github.workflow }}-${{ github.ref }}", cancel-in-progress: true }
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+      - run: cargo publish --dry-run --allow-dirty
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # unit tests against an in-process broker that drops, stalls, moves leaders, refuses and
+      # corrupts; the protocol checked against kafka-protocol; the producer's exhaustive model
+      - run: cargo test
+      - run: cargo test --release --test produce_model
+
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install "$(grep -oP '^rust-version = "\K[^"]+' Cargo.toml)" --profile minimal
+      - run: cargo +"$(grep -oP '^rust-version = "\K[^"]+' Cargo.toml)" check --lib
+
+  brokers:
+    # Redpanda; rpk (franz-go) both ways in every codec; Apache Kafka 4.1; Redpanda with SASL/SCRAM
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/brokers.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
+      - run: cargo test --test brokers -- --nocapture
+      - if: failure()
+        run: for c in fastka-rp fastka-apache fastka-sasl; do docker logs $c 2>&1 | tail -30; done
+
+  acceptance:
+    # end to end against real brokers (tests/acceptance.rs): Apache Kafka's own Java client as the
+    # reference (its partitioner, its reads and writes, its transactions, quotas, group offsets),
+    # Redpanda, and a 3-node cluster losing a leader while it is produced to and read from
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21" }
+      # six Redpandas and one restarted by a scenario: each takes its share of the kernel's AIO
+      - run: sudo sysctl -w fs.aio-max-nr=1048576
+      - run: scripts/brokers.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
+      - run: scripts/cluster.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
+      - run: scripts/java-oracle.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
+      - run: cargo test --test acceptance -- --test-threads=2 --skip through_a_leader
+      # the 3-node cluster's scenarios alone, one at a time: nothing else starts or stops a broker
+      # on the runner meanwhile
+      - run: cargo test --test acceptance through_a_leader -- --test-threads=1 --nocapture
+      - if: failure()
+        run: for c in fastka-rp fastka-apache fastka-c0 fastka-c1 fastka-c2; do echo "== $c"; docker logs $c 2>&1 | tail -20; done
+
+  stress:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "stress" }
+      - run: STRESS_SECS=${{ github.event_name == 'schedule' && 900 || 90 }} STRESS_SEED=${{ github.run_id }} stress/run.sh
+
+  kani:
+    # the decoders' properties proved for every input up to their bounds (src/proofs.rs)
+    runs-on: ubuntu-24.04
+    env: { RUSTFLAGS: "--cap-lints=warn" } # Kani's macros trip -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: model-checking/kani-github-action@v1
+        with: { args: "-Z stubbing --output-format terse" }
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    strategy: { matrix: { target: [kafka_responses, kafka_records] } }
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal && cargo +nightly install cargo-fuzz --locked
+      - run: cd fuzz && cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${{ github.event_name == 'schedule' && 1800 || 120 }} -rss_limit_mb=2048
+
+  gate:
+    # instruction counts of the hot paths (benches/gate.rs) against the base's, built on the same
+    # runner (the codecs and CRC pick their CPU's instructions at run time: counts are per machine).
+    # The base: a PR's base branch, a push's previous head
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get install -y valgrind
+      - name: head
+        run: cp "$(cargo bench --bench gate --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "gate") | .executable')" /tmp/gate-head
+      - name: base
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2>/dev/null && git worktree add /tmp/base "$base" \
+             && [ -f /tmp/base/benches/gate.rs ]; then
+            (cd /tmp/base && cp "$(cargo bench --bench gate --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "gate") | .executable')" /tmp/gate-base)
+          fi
+      - run: |
+          if [ -f /tmp/gate-base ]; then bench/gate/gate.py /tmp/gate-head --base /tmp/gate-base
+          else bench/gate/gate.py /tmp/gate-head || echo "no base to compare: the counts above are this runner's, against another machine's baseline"; fi
+
+  perf:
+    # end to end against Redpanda (bench/perf-gate): CPU per message, msgs/s and latency of the
+    # real producer and consumer, base against head on this runner, interleaved; a regression fails
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "bench/perf-gate" }
+      - run: scripts/brokers.sh
+      - name: head
+        run: cd bench/perf-gate && cargo build --release && cp target/release/fastka-perf-gate /tmp/perf-head
+      - name: base
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2>/dev/null && git worktree add /tmp/base "$base" \
+             && [ -f /tmp/base/bench/perf-gate/Cargo.toml ]; then
+            (cd /tmp/base/bench/perf-gate && cargo build --release && cp target/release/fastka-perf-gate /tmp/perf-base)
+          fi
+      - run: |
+          accepted="${{ contains(github.event.pull_request.labels.*.name, 'perf-accepted') && '--report-only' || '' }}"
+          if [ -f /tmp/perf-base ]; then bench/perf-gate/gate.py --head /tmp/perf-head --base /tmp/perf-base --rounds 7 $accepted
+          else bench/perf-gate/gate.py --head /tmp/perf-head --rounds 3; fi
+
+  kafka-stress:
+    # bench/kafka-stress (from aperiodic-io/brrrrr#355): fastka (defaults, and librdkafka's request
+    # shape) and librdkafka under top-of-the-hour bursts, answers delayed, then held back past
+    # message.timeout.ms; every run read back, exit 1 on a duplicate, a gap or a reorder. Nightly:
+    # it builds librdkafka and runs for minutes
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "bench/kafka-stress" }
+      - run: |
+          docker run -d --name rp --network host redpandadata/redpanda:v24.2.7 redpanda start \
+            --mode dev-container --smp 1 --memory 1G --reserve-memory 0M --check=false \
+            --kafka-addr direct://0.0.0.0:19092,proxied://0.0.0.0:19094 \
+            --advertise-kafka-addr direct://127.0.0.1:19092,proxied://127.0.0.1:19093
+          timeout 120 bash -c 'until docker exec rp rpk cluster info -X brokers=127.0.0.1:19092 >/dev/null 2>&1; do sleep 1; done'
+      - run: cd bench/kafka-stress && cargo build --release
+      - name: answers at 20 ms
+        run: bench/kafka-stress/run-matrix.sh --producers 1 --duration 25 --period 10 --first 4 --delay-ms 20 | tee out-20.txt
+      - name: answers at 300 ms
+        run: bench/kafka-stress/run-matrix.sh --producers 1 --duration 25 --period 10 --first 4 --delay-ms 300 | tee out-300.txt
+      - name: a 3 s stall
+        run: bench/kafka-stress/run-matrix.sh --producers 1 --duration 25 --period 10 --first 4 --stall 6:3 | tee out-stall.txt
+      - name: fastka's runs exactly once
+        # librdkafka's runs are reported, not gated: its epoch bump can duplicate (the harness's README)
+        run: |
+          for f in out-*.txt; do
+            awk '/^== /{c=$2} /verdict:/{print c": "$0}' "$f"
+            awk '/^== /{c=$2} /verdict:/ && c=="fastka" && !/exactly once, in order/{bad=1} END{exit bad}' "$f"
+          done

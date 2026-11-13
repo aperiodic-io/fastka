@@ -3,4 +3,7 @@ mutants.out*/
 __pycache__/
 /fuzz/corpus/
 /fuzz/artifacts/
-/bench/results/raw/
+
+
+/bench/*/target/
+/stress/target/

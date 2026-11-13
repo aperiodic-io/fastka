@@ -6,45 +6,92 @@ use std::fmt;
 pub struct Code(pub i16);
 
 impl Code {
-    /// librdkafka's local codes (negative, below -1), for what no broker said
+    // librdkafka's local codes (negative, below -1), for what no broker said, come first.
+    /// librdkafka's `_TRANSPORT`: a connection to a broker failed or was lost (local, no broker sent it).
     pub const TRANSPORT: Code = Code(-195);
+    /// librdkafka's `_MSG_TIMED_OUT`: a message not delivered within `message.timeout.ms` (local).
     pub const MSG_TIMED_OUT: Code = Code(-192);
+    /// librdkafka's `_AUTHENTICATION`: TLS or SASL authentication failed (local).
     pub const AUTHENTICATION: Code = Code(-169);
+    /// The broker met an unexpected error; retriable.
     pub const UNKNOWN_SERVER_ERROR: Code = Code(-1);
+    /// No error.
     pub const NONE: Code = Code(0);
+    /// The offset asked for is not in the partition's log (before its start or past its end).
     pub const OFFSET_OUT_OF_RANGE: Code = Code(1);
+    /// A record failed its CRC check or is otherwise corrupt.
     pub const CORRUPT_MESSAGE: Code = Code(2);
+    /// This broker does not host the topic or partition (it may not exist yet).
     pub const UNKNOWN_TOPIC_OR_PARTITION: Code = Code(3);
+    /// The partition has no leader right now (an election is in progress).
     pub const LEADER_NOT_AVAILABLE: Code = Code(5);
+    /// This broker is not the partition's leader (or a follower, for a follower fetch): metadata is stale.
     pub const NOT_LEADER_OR_FOLLOWER: Code = Code(6);
+    /// The broker did not complete the request in time (for a Produce, replication within its timeout).
     pub const REQUEST_TIMED_OUT: Code = Code(7);
+    /// A record batch is larger than the topic's `max.message.bytes`.
     pub const MESSAGE_TOO_LARGE: Code = Code(10);
+    /// The broker's connection to another broker failed while serving the request.
     pub const NETWORK_EXCEPTION: Code = Code(13);
+    /// The group coordinator is still loading the group's state.
     pub const COORDINATOR_LOAD_IN_PROGRESS: Code = Code(14);
+    /// The group coordinator is not available (the offsets topic not ready).
     pub const COORDINATOR_NOT_AVAILABLE: Code = Code(15);
+    /// This broker is not the group's coordinator.
     pub const NOT_COORDINATOR: Code = Code(16);
+    /// The topic name is not valid, or the request may not write to it (an internal topic).
     pub const INVALID_TOPIC_EXCEPTION: Code = Code(17);
+    /// A Produce request's records exceed the broker's segment size.
     pub const RECORD_LIST_TOO_LARGE: Code = Code(18);
+    /// Fewer in-sync replicas than `min.insync.replicas`: the write was refused.
     pub const NOT_ENOUGH_REPLICAS: Code = Code(19);
+    /// The write was appended, but fewer in-sync replicas than `min.insync.replicas` acknowledged it.
     pub const NOT_ENOUGH_REPLICAS_AFTER_APPEND: Code = Code(20);
+    /// A Produce's acks is not one the broker takes (-1, 0 or 1).
+    pub const INVALID_REQUIRED_ACKS: Code = Code(21);
+    /// Not authorized to access the topic.
     pub const TOPIC_AUTHORIZATION_FAILED: Code = Code(29);
+    /// Not authorized to access the consumer group.
     pub const GROUP_AUTHORIZATION_FAILED: Code = Code(30);
+    /// Not authorized for a cluster-level operation.
     pub const CLUSTER_AUTHORIZATION_FAILED: Code = Code(31);
+    /// A record's timestamp is outside what the topic accepts (`message.timestamp.*.ms`).
+    pub const INVALID_TIMESTAMP: Code = Code(32);
+    /// The broker does not enable the SASL mechanism asked for.
     pub const UNSUPPORTED_SASL_MECHANISM: Code = Code(33);
+    /// The broker does not support the version of the API asked for.
     pub const UNSUPPORTED_VERSION: Code = Code(35);
+    /// A topic of that name already exists.
     pub const TOPIC_ALREADY_EXISTS: Code = Code(36);
+    /// The request needs a newer message format than the topic's.
+    pub const UNSUPPORTED_FOR_MESSAGE_FORMAT: Code = Code(43);
+    /// The request breaks a broker-side policy (e.g. a create-topic policy).
     pub const POLICY_VIOLATION: Code = Code(44);
+    /// The idempotent producer's sequence number is not the next the broker expects: records may be lost.
     pub const OUT_OF_ORDER_SEQUENCE_NUMBER: Code = Code(45);
+    /// The broker already has a batch of this sequence number (a duplicate).
     pub const DUPLICATE_SEQUENCE_NUMBER: Code = Code(46);
+    /// The producer's epoch is older than the broker's (another instance has fenced it).
     pub const INVALID_PRODUCER_EPOCH: Code = Code(47);
+    /// A disk error on the broker for this partition's log; retriable on another leader.
     pub const KAFKA_STORAGE_ERROR: Code = Code(56);
+    /// SASL authentication failed (bad credentials).
     pub const SASL_AUTHENTICATION_FAILED: Code = Code(58);
+    /// The broker no longer knows the producer id (its state expired or was removed).
     pub const UNKNOWN_PRODUCER_ID: Code = Code(59);
+    /// The leader epoch in the request is older than the broker's: metadata is stale.
     pub const FENCED_LEADER_EPOCH: Code = Code(74);
+    /// The leader epoch in the request is newer than the broker's: the broker is behind.
     pub const UNKNOWN_LEADER_EPOCH: Code = Code(75);
+    /// The topic's compression does not read the records' (or the request is too old for it).
+    pub const UNSUPPORTED_COMPRESSION_TYPE: Code = Code(76);
+    /// The leader cannot serve the offset yet (its high watermark not caught up after an election).
     pub const OFFSET_NOT_AVAILABLE: Code = Code(78);
+    /// The broker refused a record as invalid (e.g. a compacted topic's record without a key).
     pub const INVALID_RECORD: Code = Code(87);
+    /// A quota on the operation's rate was exceeded; retry later.
     pub const THROTTLING_QUOTA_EXCEEDED: Code = Code(89);
+    /// A newer producer with the same transactional id has fenced this one.
     pub const PRODUCER_FENCED: Code = Code(90);
 
     /// Whether a request that met it may succeed if sent again, to the partition's leader as the
@@ -152,6 +199,7 @@ const NAMES: &[(i16, &str)] = &[
 
 /// What a call of this crate failed of.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Error {
     /// A broker answered with this code (what it was asked, and its message if it gave one).
     Broker(Code, String),
@@ -215,6 +263,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// This crate's result: an [`Error`] on failure.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
