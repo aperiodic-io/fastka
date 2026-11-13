@@ -808,11 +808,15 @@ fn fail_queued<O>(st: &mut State<O>) {
     }
 }
 
+/// The soonest a message is due to be timed out. A batch being sent is not timed out until its
+/// attempt ends (which wakes the waiters), so it is left out: else its deadline, once past, would
+/// be waited for again and again at once.
 fn next_deadline<O>(st: &State<O>) -> Option<Instant> {
     (st.topics.values())
         .flat_map(|t| {
-            let parts =
-                t.parts.values().flat_map(|p| p.queue.front().into_iter().chain(p.inflight.iter().map(|s| &s.msgs[0])));
+            let parts = t.parts.values().flat_map(|p| {
+                p.queue.front().into_iter().chain(p.inflight.iter().filter(|s| !s.sending).map(|s| &s.msgs[0]))
+            });
             t.unassigned.front().into_iter().chain(parts)
         })
         .map(|p| p.deadline)
@@ -1055,18 +1059,23 @@ fn send<C: Deliveries>(
 ) -> std::result::Result<(Vec<wire::Produced>, i32), (Error, bool)> {
     // the error, and whether the request may have been written
     let unsent = |e| (e, false);
-    if conn.is_none() {
-        let addr = addr.ok_or_else(|| unsent(Error::Transport(format!("broker {id}: no address"))))?;
-        *conn = Some(Conn::open(sh.client.net(), &addr).map_err(unsent)?);
-    }
-    let c = conn.as_mut().expect("connected");
     // given up at the first message's deadline (message.timeout.ms bounds a request in flight,
-    // as librdkafka bounds it): the broker is asked to answer by then, and the connection is
-    // dropped if it has not
+    // as librdkafka bounds it): a reconnect is given no longer, the broker is asked to answer by
+    // then, and the connection is dropped if it has not
     let first = req.iter().map(|r| r.3).min().expect("a batch");
     let left = first.saturating_duration_since(Instant::now());
     if left.is_zero() {
         // stalled between taking it and sending it: not sent, given up as timed out
+        return Err(unsent(Error::Timeout("past the message timeout before it was sent".into())));
+    }
+    if conn.is_none() {
+        let addr = addr.ok_or_else(|| unsent(Error::Transport(format!("broker {id}: no address"))))?;
+        *conn = Some(Conn::open_within(sh.client.net(), &addr, left).map_err(unsent)?);
+    }
+    let c = conn.as_mut().expect("connected");
+    // what the connecting took
+    let left = first.saturating_duration_since(Instant::now());
+    if left.is_zero() {
         return Err(unsent(Error::Timeout("past the message timeout before it was sent".into())));
     }
     let timeout = sh.s.request_timeout.min(left);

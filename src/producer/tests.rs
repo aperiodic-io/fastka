@@ -1596,3 +1596,47 @@ fn retries_back_off_exponentially_to_the_max() {
     assert_eq!(waits, [100, 200, 400, 800, 1000, 1000]);
     assert_eq!(super::retry_wait(&s, u32::MAX).as_millis(), 1000, "no overflow");
 }
+
+/// A reconnect in a broker thread, its batches already taken (`sending`: `poll` cannot time them
+/// out meanwhile), is given what is left of their message.timeout.ms, not the whole
+/// socket.connection.setup.timeout.ms: they are reported timed out on time.
+#[test]
+fn a_reconnect_while_sending_is_bounded_by_the_message_timeout() {
+    use std::net::TcpListener;
+    // the leader: its first connection closed at once, the next ones accepted and never answered
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let leader = l.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let mut held = vec![];
+        for (n, s) in l.incoming().enumerate() {
+            let s = s.unwrap();
+            if n == 0 {
+                drop(s);
+            } else {
+                held.push(s);
+            }
+        }
+    });
+    let leader2 = leader.clone();
+    let b = Broker::start(move |r| match r.api {
+        wire::METADATA => Answer::Body(metadata(&[(0, &r.me), (1, &leader2)], &[("o", &[(0, 1)])])),
+        wire::INIT_PRODUCER_ID => {
+            let mut out = vec![];
+            out.i32(0);
+            out.i16(0);
+            out.i64(1000);
+            out.i16(0);
+            Answer::Body(out)
+        }
+        _ => Answer::Drop,
+    });
+    let p = producer(&b, &[("message.timeout.ms", "300"), ("socket.connection.setup.timeout.ms", "4000")]);
+    // wait for the producer id and the leader's thread to have failed its first connection
+    std::thread::sleep(Duration::from_millis(300));
+    let t = Instant::now();
+    send(&p, "o", "x", 1);
+    let h = heard(&p, 1);
+    let late = t.elapsed();
+    assert_eq!(h[0].3.as_deref(), Some("message timed out (message.timeout.ms)"), "{h:?}");
+    assert!(late < Duration::from_millis(1500), "message.timeout.ms=300, reported after {late:?}");
+}
