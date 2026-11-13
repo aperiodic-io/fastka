@@ -24,7 +24,42 @@ use crate::conn::Conn;
 use crate::error::{Code, Error, Result};
 use crate::records::{self, Out, Stamp};
 use crate::wire::{self, Cur};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// The producer's maps, looked up for every record: keyed by the application's topic names and
+/// the brokers' partition and node ids, nothing an adversary chooses, so FxHash's few
+/// instructions rather than SipHash's (SipHash was 7% of a keyed send's instructions).
+#[derive(Default)]
+struct Fx(u64);
+impl Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        for c in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            self.write_u64(u64::from_le_bytes(w));
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.write_u64(v as u64)
+    }
+    fn write_i32(&mut self, v: i32) {
+        self.write_u64(v as u32 as u64)
+    }
+    fn write_u8(&mut self, v: u8) {
+        self.write_u64(v as u64)
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64)
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<Fx>>;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -183,10 +218,11 @@ struct Topic<O> {
 
 /// An outcome for `poll` to hand over: topic, partition, offset, error, whether it is on the log,
 /// the message's opaque.
-type Report<O> = (String, Option<i32>, Option<i64>, Option<Error>, Persisted, O);
+type Report<O> = (Arc<str>, Option<i32>, Option<i64>, Option<Error>, Persisted, O);
 
 struct State<O> {
-    topics: HashMap<String, Topic<O>>,
+    /// by name; the name shared with every report of the topic's messages (no copy a report)
+    topics: HashMap<Arc<str>, Topic<O>>,
     pid: Option<(i64, i16)>,
     fatal: Option<(Code, String)>,
     /// brokers' addresses
@@ -256,10 +292,10 @@ impl<C: Deliveries> Producer<C> {
         let client = Client::new(cfg)?;
         let seed = now_ms() as u64 ^ (std::process::id() as u64) << 32;
         let state = State {
-            topics: HashMap::new(),
+            topics: HashMap::default(),
             pid: None,
             fatal: None,
-            brokers: HashMap::new(),
+            brokers: HashMap::default(),
             threads: vec![],
             next_thread: 0,
             outstanding: 0,
@@ -368,22 +404,31 @@ impl<C: Deliveries> Producer<C> {
         st.outstanding += 1;
         st.queued += 1;
         st.queued_bytes += size;
-        let t = st.topics.entry(r.topic.to_string()).or_insert_with(|| Topic {
-            partitions: vec![],
-            sticky: 0,
-            unassigned: VecDeque::new(),
-            parts: HashMap::new(),
-            missing: None,
-        });
+        // looked up by the name given, no copy of it made but for a topic not seen before
+        if !st.topics.contains_key(r.topic) {
+            let t = Topic {
+                partitions: vec![],
+                sticky: 0,
+                unassigned: VecDeque::new(),
+                parts: HashMap::default(),
+                missing: None,
+            };
+            st.topics.insert(Arc::from(r.topic), t);
+        }
+        let t = st.topics.get_mut(r.topic).expect("inserted");
         // the threads woken only when something is due sooner than they wait for: a partition's
         // first message (its linger starts), a batch filled, a topic to look up
         let mut wake = true;
         let sticky = r.partition.is_none() && r.key.is_none();
         match t.route(r.partition, r.key) {
             Ok(Some(part)) => {
-                let q = &mut t.parts.get_mut(&part).expect("a partition of the topic").queue;
+                let pt = t.parts.get_mut(&part).expect("a partition of the topic");
+                let q = &mut pt.queue;
                 q.push_back(p);
-                wake = q.len() == 1 || q.len().is_multiple_of(sh.s.batch_messages);
+                // not while the partition has a batch in flight: it cannot send another until that
+                // one is answered, and its thread looks at what is due when it is (under keyed
+                // load, most sends; each wake a futex and a thread's context switch)
+                wake = pt.inflight.is_none() && (q.len() == 1 || q.len().is_multiple_of(sh.s.batch_messages));
                 // a batch's worth on this partition: the next keyless go to another (KIP-480's
                 // sticky partitioner, as librdkafka's)
                 if sticky && q.len().is_multiple_of(sh.s.batch_messages) {
@@ -393,7 +438,7 @@ impl<C: Deliveries> Producer<C> {
             Ok(None) => t.unassigned.push_back(p), // a topic without partitions is looked up
             Err(()) => {
                 let e = Error::Broker(Code::UNKNOWN_TOPIC_OR_PARTITION, format!("{}/{:?}", r.topic, r.partition));
-                st.report(r.topic, r.partition, None, Some(e), Persisted::No, p);
+                st.report(&Arc::from(r.topic), r.partition, None, Some(e), Persisted::No, p);
                 drop(guard);
                 sh.reported.notify_all();
                 return Ok(());
@@ -529,7 +574,7 @@ impl<C: Deliveries> Shared<C> {
 impl<O> State<O> {
     fn report(
         &mut self,
-        topic: &str,
+        topic: &Arc<str>,
         partition: Option<i32>,
         offset: Option<i64>,
         error: Option<Error>,
@@ -538,7 +583,7 @@ impl<O> State<O> {
     ) {
         self.queued -= 1;
         self.queued_bytes -= p.size();
-        self.reports.push_back((topic.to_string(), partition, offset, error, persisted, p.opaque));
+        self.reports.push_back((topic.clone(), partition, offset, error, persisted, p.opaque));
     }
 
     fn set_fatal(&mut self, code: Code, why: String) {
@@ -644,7 +689,7 @@ fn manage<C: Deliveries>(sh: &Arc<Shared<C>>) {
             continue;
         }
         st.metadata_due = false;
-        let asked: Vec<String> = st.topics.keys().cloned().collect();
+        let asked: Vec<String> = st.topics.keys().map(|k| k.to_string()).collect();
         drop(st);
         // not cut short by a message's deadline (`poll` and the broker threads time messages out
         // meanwhile): a lookup given less than a broker's answer takes fails again and again
@@ -910,12 +955,12 @@ fn sequence_broken(c: Code) -> bool {
 
 /// What a broker thread sends next: per partition (topic, partition, its batch's bytes, its
 /// first message's deadline).
-type Request = Vec<(String, i32, Arc<Vec<u8>>, Instant)>;
+type Request = Vec<(Arc<str>, i32, Arc<Vec<u8>>, Instant)>;
 
 /// A batch sealed, for the broker thread that took it to encode off the lock: topic, partition,
 /// its messages, its stamp. Its `Sent` waits in the partition, `sending`, its messages out until
 /// they come back (`encoded`).
-type Fresh<O> = Vec<(String, i32, Vec<Pending<O>>, Stamp)>;
+type Fresh<O> = Vec<(Arc<str>, i32, Vec<Pending<O>>, Stamp)>;
 
 /// The batches broker `id` leads that are due, taken by its thread `by` (marked sending): sealed
 /// from their queues where none is in flight (once lingered, or full; `Fresh`, to encode), sent
@@ -942,7 +987,7 @@ fn take_due<C: Deliveries>(
     let Some((pid, epoch)) = st.pid else { return (out, fresh, None, false) };
     // what is due: since when, its partition, how many messages to seal (0: one to send again),
     // its bytes (a batch to seal: as `size_of` counts them, which its encoding does not pass)
-    let mut due: Vec<(Instant, String, i32, usize, usize)> = vec![];
+    let mut due: Vec<(Instant, Arc<str>, i32, usize, usize)> = vec![];
     for (name, t) in st.topics.iter() {
         for (&pnum, part) in t.parts.iter().filter(|(_, p)| p.leader == Some(id)) {
             if let Some(sent) = &part.inflight {
@@ -1237,7 +1282,7 @@ fn send<C: Deliveries>(
     }
     let timeout = sh.s.request_timeout.min(left);
     c.set_request_timeout(left.min(sh.s.request_timeout + sh.client.net().request_timeout));
-    let batches: Vec<(&str, (i32, &[u8]))> = req.iter().map(|(t, p, b, _)| (t.as_str(), (*p, b.as_slice()))).collect();
+    let batches: Vec<(&str, (i32, &[u8]))> = req.iter().map(|(t, p, b, _)| (&**t, (*p, b.as_slice()))).collect();
     let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX).max(1);
     // from here a request may have been written whatever went wrong: the broker may have it
     let frame = c.call(wire::PRODUCE, |o| wire::produce_request(o, -1, ms, &batches)).map_err(|e| (e, true))?;
@@ -1250,7 +1295,7 @@ fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Reque
     let now = Instant::now();
     let (mut done, mut moved) = (vec![], vec![]);
     for (t, p, _, _) in req {
-        let r = results.iter().find(|r| r.topic == *t && r.partition == *p);
+        let r = results.iter().find(|r| *r.topic == **t && r.partition == *p);
         let Some(part) = st.topics.get_mut(t).and_then(|x| x.parts.get_mut(p)) else { continue };
         let Some(mut sent) = part.inflight.take() else { continue };
         sent.sending = false;

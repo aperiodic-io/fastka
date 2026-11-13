@@ -88,9 +88,9 @@ Each criterion below holds on the current commit, and CI checks it on every push
 | No data loss, duplication or reordering under faults | the exhaustive producer model; the stress harness through cut, stalled and refused connections, every outcome checked against the broker's log |
 | Every delivery report is true, including "possibly persisted" | the model's invariants; the harsh stress profile (22 fatal producers, 33k possibly-persisted reports, all true) |
 | No panic, hang or unbounded memory on any broker input | Kani proofs; fuzzing; capped decompression; byte-bounded queues; every timeout bounded (TLS included) |
-| Interoperates with real brokers and other clients | Redpanda, Apache Kafka 4.1, SASL/SCRAM, franz-go both ways in every codec |
+| Interoperates with real brokers and other clients | Apache Kafka's Java client as the reference (partitioner, reads both ways, transactions, quotas, group offsets); Redpanda, Apache Kafka 4.1, SASL/SCRAM, franz-go both ways in every codec; a 3-node cluster losing a leader |
 | Fails loudly, not silently | unknown or unsupported settings refused at start; unsupported broker versions refused at connect |
-| Performance does not regress | the instruction-count gate, base against head, on the same runner |
+| Performance does not regress | on every pull request: the end-to-end gate (CPU per message, throughput, latency against Redpanda) and the instruction-count gate, base against head on the same runner |
 | Defects found by people trying to break it are fixed | three rounds of adversarial review; each finding is a test that failed first |
 | A public API that can evolve | builders and `#[non_exhaustive]` types; protocol internals hidden; every public item documented; MSRV 1.87 checked |
 
@@ -172,6 +172,27 @@ Every claim below is a test in this repository that CI runs.
     skipped the way Kafka's `CompletedFetch` skips them, and LZ4 frames of the kind Kafka's
     reader accepts.
   - SCRAM reproduces RFC 7677's exchange byte for byte.
+- **Acceptance against Apache Kafka's own Java client** (`tests/acceptance.rs`,
+  `tests/java/Oracle.java`, CI's `acceptance` job). Where the Java client (kafka-clients 4.1) is the
+  reference, fastka is checked against it:
+  - keyed records land on the partitions the Java client puts them on;
+  - each reads what the other writes, exactly, in every codec: keys, tombstones, empty values,
+    headers (one with no value), timestamps, at the offsets reported;
+  - `read_committed` and `read_uncommitted` give the Java consumer's records at its offsets, over
+    transactions the Java producer committed and aborted;
+  - a transaction it holds open holds `read_committed` at the transaction's start;
+  - a broker quota (on `client.id`) throttles fastka, and nothing fails;
+  - offsets fastka commits are the group's offsets as the Java admin client sees them.
+
+  Against Redpanda: where a partition is read from (its end, an offset, past its end under each
+  `auto.offset.reset`, `seek`); records at the broker's size limit; 48 partitions of 3 topics with
+  one paused; partitions added while producing.
+
+  On a 3-node cluster (`scripts/cluster.sh`), the leader of a partition is stopped until the
+  partition is led elsewhere, then started again:
+  - while producing, each delivery is in the log once, where it was reported, and a key's order
+    is kept;
+  - while reading, every record is read once.
 - **Real brokers** (`tests/brokers.rs`, CI's `brokers` job):
   - Redpanda 24.2;
   - Apache Kafka 4.1 (KRaft);
@@ -222,7 +243,16 @@ Every claim below is a test in this repository that CI runs.
     runs for 90 s on every PR and for 15 minutes nightly, with a new seed each run. The last
     local run sent 31M messages; 22 producers went fatal in the harsh profile and 33k reports
     said "possibly persisted", and every invariant held.
-- **The benchmark gate** (`benches/gate.rs`, `bench/gate/gate.py`).
+- **The end-to-end performance gate** (`bench/perf-gate/`, CI's `perf` job, on every pull request).
+  - What it runs: fastka's real producer and consumer against Redpanda (keyless, lz4 and keyed
+    producing; consuming in two codecs; produce-to-consume latency).
+  - How it compares: base and head are built on the same runner and run interleaved. It compares
+    the best round of each side: CPU per message (every thread), msgs/s, and latency p50/p99.
+  - When it fails: past +10% CPU, −10% throughput, or +25% latency. A pull request a reviewer has
+    labelled `perf-accepted` gets the report without the failure.
+  - Calibration: the same binary against itself stays within 7%. Putting back an old 1 ms sleep
+    in the consumer fails the gate, with p50 latency +335%.
+- **The instruction-count gate** (`benches/gate.rs`, `bench/gate/gate.py`).
   - What it measures: the hot paths (reading records in every codec, writing batches, decoding
     a Fetch).
   - How: counted in instructions under Valgrind, which is deterministic to well below 0.1%.

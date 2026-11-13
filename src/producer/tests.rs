@@ -569,8 +569,13 @@ fn nothing_is_sent_past_its_deadline() {
         attempts: 1,
         maybe_written: true, // its answer lost
     });
-    let mut t =
-        Topic { partitions: vec![0, 1], sticky: 0, unassigned: VecDeque::new(), parts: HashMap::new(), missing: None };
+    let mut t = Topic {
+        partitions: vec![0, 1],
+        sticky: 0,
+        unassigned: VecDeque::new(),
+        parts: HashMap::default(),
+        missing: None,
+    };
     t.parts.insert(0, part);
     t.parts.insert(1, sent);
     st.topics.insert("o".into(), t);
@@ -622,7 +627,7 @@ fn a_fatal_producer_takes_nothing_to_send() {
         enqueued: early,
     });
     let mut t =
-        Topic { partitions: vec![0], sticky: 0, unassigned: VecDeque::new(), parts: HashMap::new(), missing: None };
+        Topic { partitions: vec![0], sticky: 0, unassigned: VecDeque::new(), parts: HashMap::default(), missing: None };
     t.parts.insert(0, part);
     st.topics.insert("o".into(), t);
     (st.outstanding, st.queued, st.queued_bytes) = (1, 1, 16);
@@ -858,7 +863,7 @@ fn rotation_moves_to_another_partition() {
             partitions: (0..n).collect(),
             sticky: 0,
             unassigned: VecDeque::new(),
-            parts: HashMap::new(),
+            parts: HashMap::default(),
             missing: None,
         };
         let mut seen = std::collections::HashSet::new();
@@ -1911,7 +1916,7 @@ fn a_request_takes_batches_up_to_max_request_size_exactly() {
             partitions: vec![0, 1],
             sticky: 0,
             unassigned: VecDeque::new(),
-            parts: HashMap::new(),
+            parts: HashMap::default(),
             missing: None,
         };
         for (q, o) in [(0, 2), (1, 1)] {
@@ -1969,7 +1974,7 @@ fn a_batch_that_fails_to_encode_gives_its_sequence_back() {
         enqueued: Instant::now() - Duration::from_secs(1),
     });
     let mut t =
-        Topic { partitions: vec![0], sticky: 0, unassigned: VecDeque::new(), parts: HashMap::new(), missing: None };
+        Topic { partitions: vec![0], sticky: 0, unassigned: VecDeque::new(), parts: HashMap::default(), missing: None };
     t.parts.insert(0, part);
     st.topics.insert("o".into(), t);
     (st.outstanding, st.queued, st.queued_bytes) = (1, 1, size_of(None, Some(&[1]), &[]));

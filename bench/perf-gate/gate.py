@@ -9,14 +9,17 @@ the most msgs/s; latency by its median round:
   msgs/s                                           fails past -TOL_RATE
   latency p50 / p99                                fails past +TOL_LAT (and an absolute slack)
 
-  gate.py --head BIN [--base BIN] [--brokers 127.0.0.1:19092] [--rpk fastka-rp] [--rounds 5]
+  gate.py --head BIN [--base BIN] [--brokers 127.0.0.1:19092] [--rpk fastka-rp] [--rounds 5] [--report-only]
 
-Without --base it measures head alone (a table, no verdict). Exit 1 on a regression.
+Without --base it measures head alone (a table, no verdict). Exit 1 on a regression, unless
+--report-only (CI passes it for a pull request labelled `perf-accepted`: a regression a reviewer
+has weighed and accepted, its reason in the pull request).
 """
 import argparse, json, statistics, subprocess, sys, uuid
 
 TOL_CPU, TOL_RATE, TOL_LAT, LAT_SLACK_US = 0.10, 0.10, 0.25, 150
-N = {"latency": 10_000}
+N = {"latency": 10_000, "produce_none": 3_000_000, "produce_lz4": 3_000_000, "produce_keyed": 3_000_000}
+# a produce run of 1M messages is ~0.5 s: too short to measure the producer's threads steadily
 N_DEFAULT = 1_000_000
 
 
@@ -44,6 +47,7 @@ def main():
     ap.add_argument("--brokers", default="127.0.0.1:19092")
     ap.add_argument("--rpk", default="fastka-rp")
     ap.add_argument("--rounds", type=int, default=5)
+    ap.add_argument("--report-only", action="store_true")
     a = ap.parse_args()
     workloads = subprocess.run([a.head, "list"], capture_output=True, text=True, check=True).stdout.split()
     if a.base:
@@ -89,6 +93,9 @@ def main():
             print(f"{w:<15}{label:<16}{b:>12,.2f}{h:>12,.2f}{d:>+9.1%}{'  REGRESSION' if bad else ''}")
             if bad:
                 failed.append(f"{w} {label}")
+    if failed and a.report_only:
+        print(f"\nperf gate: {', '.join(failed)} regressed, accepted by the `perf-accepted` label")
+        return
     if failed:
         sys.exit(f"\nperf gate: {', '.join(failed)} regressed")
     print("\nperf gate: ok" if a.base else "\nperf gate: head measured (no base to compare)")
