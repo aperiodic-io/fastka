@@ -232,7 +232,7 @@ fn a_lost_answer_is_retried_and_written_once() {
     assert!(p.fatal_error().is_none());
 }
 
-/// librdkafka's duplicate (live-ingestion's staging, 2026-11-12): a batch written but its answer
+/// librdkafka's duplicate: a batch written but its answer
 /// lost, and another message timing out before the batch's retry. On any timeout librdkafka's
 /// idempotent producer bumps its epoch and numbers what is queued from 0 again, the retry
 /// included, and the broker writes it again as new: twice, both reported delivered. Here a
@@ -275,8 +275,8 @@ fn a_batch_written_unanswered_is_written_once_though_another_message_times_out_b
 
 /// The same batch written, its answer lost, and its own timeout passing before a retry is
 /// answered: it is reported failed, not delivered, and the producer is fatal (the broker may have
-/// written it, and a gap may follow). It is on the log once: brrrrr's read-back after a failed
-/// delivery finds it there and sends it no more (`dual::Leg::recovered`, or a restart's).
+/// written it, and a gap may follow), possibly persisted. It is on the log once: an application
+/// reading the log back after a failed delivery finds it there.
 #[test]
 fn a_batch_written_unanswered_past_its_timeout_fails_and_is_on_the_log_once() {
     let fault: Fault = Box::new(|r, i, logs| {
@@ -296,7 +296,7 @@ fn a_batch_written_unanswered_past_its_timeout_fails_and_is_on_the_log_once() {
     let h = heard(&p, 2);
     let at = |o: u64| h.iter().position(|x| x.5 == o).unwrap();
     assert_eq!(h[at(1)].3.as_deref(), Some("message timed out (message.timeout.ms)"), "{h:?}");
-    assert_eq!(h[at(1)].2, None, "not delivered");
+    assert_eq!((h[at(1)].2, h[at(1)].6), (None, Persisted::Possibly), "not delivered, maybe written");
     assert!(h[at(2)].3.is_some(), "{h:?}");
     assert_eq!(p.fatal_error().map(|f| f.0), Some(Code::MSG_TIMED_OUT));
     assert_eq!(values(&logs, "o", 0), ["a"], "written once though failed; b never");
@@ -304,8 +304,8 @@ fn a_batch_written_unanswered_past_its_timeout_fails_and_is_on_the_log_once() {
 
 /// At a batch's timeout its request still unanswered is given up: the connection it went on is
 /// closed by then, and nothing is sent after (a fatal producer sends nothing). A request the
-/// broker read before may still be written after, by the broker: what the lease's `2 × fence`
-/// allows for past the message timeout (`run::producer_config`).
+/// broker read before may still be written after, by the broker: what an application fencing on
+/// the message timeout must allow for past it.
 #[test]
 fn at_its_timeout_a_request_unanswered_is_given_up_and_its_connection_closed() {
     let closed = Arc::new(Mutex::new(None));
@@ -392,7 +392,7 @@ fn without_a_broker_messages_time_out() {
     p.send(Record::to("o").value(b"y"), 2).unwrap();
     let h = heard(&p, 2);
     assert!(h.iter().all(|x| x.3.as_deref() == Some("message timed out (message.timeout.ms)")), "{h:?}");
-    assert_eq!(h[0].1, None, "never given a partition");
+    assert_eq!((h[0].1, h[0].6), (None, Persisted::No), "never given a partition, never sent");
     assert!(t.elapsed() >= Duration::from_millis(300) && t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     assert!(p.fatal_error().is_none());
 }
@@ -405,7 +405,7 @@ fn a_batch_in_flight_that_times_out_is_fatal() {
     let p = producer(&b, &[("message.timeout.ms", "400"), ("request.timeout.ms", "100"), ("socket.timeout.ms", "100")]);
     send(&p, "o", "x", 1);
     let h = heard(&p, 1);
-    assert_eq!(h[0].3.as_deref(), Some("message timed out (message.timeout.ms)"));
+    assert_eq!((h[0].3.as_deref(), h[0].6), (Some("message timed out (message.timeout.ms)"), Persisted::Possibly));
     assert_eq!(p.fatal_error().map(|f| f.0), Some(Code::MSG_TIMED_OUT));
 }
 
@@ -536,8 +536,8 @@ fn under_repeated_faults_each_message_lands_once_in_order() {
 /// A producer whose threads did not run past its messages' deadline (the process stopped, then
 /// resumed: SIGSTOP, a host stalled) sends none of them after, whichever of its threads runs
 /// first: a broker thread takes no batch due past its first message's deadline, sealed now or
-/// sent before. brrrrr's lease rests on it: nothing a holder sent lands once a standby may have
-/// taken over (the acceptance suite's frozen holder).
+/// sent before. A fence on the message timeout rests on it: nothing a stalled producer sent lands
+/// once another may have taken over.
 #[test]
 fn nothing_is_sent_past_its_deadline() {
     let p = Producer::new(config("127.0.0.1:1").set("linger.ms", "0"), Heard::default()).unwrap();
@@ -632,8 +632,7 @@ fn log_of<'a>(logs: &'a Logs) -> std::sync::MutexGuard<'a, HashMap<(String, i32)
     logs.lock().unwrap()
 }
 
-/// Each record's timestamp is when it was sent (CreateTime, ms): what brrrrr's read-backs and
-/// the lease's step-down read as when a record was written.
+/// Each record's timestamp is when it was sent (CreateTime, ms), unless the record gives its own.
 #[test]
 fn records_carry_the_time_they_were_sent() {
     let (b, logs) = sink(&["o"], 1, no_fault());
@@ -1359,13 +1358,14 @@ fn poll_and_flush_take_a_timeout_of_forever() {
 /// would time out while another partition is up).
 #[test]
 fn keyless_messages_avoid_a_partition_without_a_leader() {
-    let b = Broker::start(move |r| match r.api {
-        wire::METADATA => Answer::Body(metadata(&[(0, &r.me)], &[("o", &[(0, 0), (1, -1)])])),
-        wire::INIT_PRODUCER_ID => pid_answer(),
-        wire::PRODUCE => Answer::Body(produce(r, &Logs::default())),
-        _ => Answer::Drop,
-    });
     for _ in 0..8 {
+        let logs: Logs = Arc::default();
+        let b = Broker::start(move |r| match r.api {
+            wire::METADATA => Answer::Body(metadata(&[(0, &r.me)], &[("o", &[(0, 0), (1, -1)])])),
+            wire::INIT_PRODUCER_ID => pid_answer(),
+            wire::PRODUCE => Answer::Body(produce(r, &logs)),
+            _ => Answer::Drop,
+        });
         let p = producer(&b, &[("message.timeout.ms", "2000"), ("batch.num.messages", "2")]);
         for i in 0..5 {
             send(&p, "o", "x", i);
@@ -1554,4 +1554,33 @@ fn the_metadata_is_refreshed_periodically() {
     p.send(Record::to("o").value(b"b").partition(1), 2).unwrap();
     let h = heard(&p, 8);
     assert_eq!((h[7].1, h[7].3.as_ref()), (Some(1), None), "{h:?}");
+}
+
+/// A lookup started near another message's deadline is given the time a broker takes to answer,
+/// not cut to what that message has left: else it fails, and is made again, until that message
+/// is gone.
+#[test]
+fn a_lookup_near_another_messages_deadline_is_given_time_to_answer() {
+    let logs: Logs = Arc::default();
+    let l2 = logs.clone();
+    let slow = |r: &Req| r.body.windows(4).any(|w| w == b"slow");
+    let b = Broker::start(move |r| match r.api {
+        wire::METADATA => {
+            if slow(r) {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            Answer::Body(metadata(&[(0, &r.me)], &[("slow", &[(0, 0)])]))
+        }
+        wire::INIT_PRODUCER_ID => pid_answer(),
+        wire::PRODUCE => Answer::Body(produce(r, &l2)),
+        _ => Answer::Drop,
+    });
+    let p = producer(&b, &[("message.timeout.ms", "1000"), ("retry.backoff.ms", "50"), ("retry.backoff.max.ms", "50")]);
+    p.send(Record::to("nope").value(b"x"), 1).unwrap(); // looked up every 50 ms till its timeout
+    std::thread::sleep(Duration::from_millis(850));
+    send(&p, "slow", "y", 2); // looked up with 150 ms left of "nope"'s
+    let h = heard(&p, 2);
+    assert!(h.iter().any(|x| x.5 == 2 && x.3.is_none()), "{h:?}");
+    let asked = b.requests(wire::METADATA).iter().filter(|r| slow(r)).count();
+    assert_eq!(asked, 1, "looked up once");
 }

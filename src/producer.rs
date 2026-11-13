@@ -175,6 +175,8 @@ struct State<O> {
     queued_bytes: usize,
     reports: VecDeque<Report<O>>,
     metadata_due: bool,
+    /// the metadata last applied then (`topic.metadata.refresh.interval.ms` from it)
+    refreshed: Instant,
     closing: bool,
     rng: u64,
 }
@@ -222,6 +224,7 @@ impl<C: Deliveries> Producer<C> {
             queued_bytes: 0,
             reports: VecDeque::new(),
             metadata_due: false,
+            refreshed: Instant::now(),
             closing: false,
             rng: seed | 1,
         };
@@ -235,7 +238,7 @@ impl<C: Deliveries> Producer<C> {
         });
         let m = shared.clone();
         std::thread::Builder::new()
-            .name("brrrrr-kafka-producer".into())
+            .name("fastka-producer".into())
             .spawn(move || manage(&m))
             .map_err(|e| Error::Transport(format!("a thread for the producer: {e}")))?;
         Ok(Producer { shared })
@@ -263,6 +266,9 @@ impl<C: Deliveries> Producer<C> {
         }
         if st.closing {
             return Err((Error::Transport("the producer is closing".into()), opaque));
+        }
+        if r.topic.is_empty() {
+            return Err((Error::Config("a record without a topic".into()), opaque));
         }
         let size = size_of(r.key, r.value, r.headers);
         // what no wait would ever take: refused for what it is, not QueueFull
@@ -497,12 +503,22 @@ impl<O> Topic<O> {
         }
     }
 
-    /// Keyless messages go to another partition from now on (`r` picks which), if there is one.
+    /// Whether the `i`th partition has a leader.
+    fn led(&self, i: usize) -> bool {
+        self.partitions.get(i).and_then(|p| self.parts.get(p)).is_some_and(|p| p.leader.is_some())
+    }
+
+    /// Keyless messages go to another partition from now on (`r` picks which): one with a leader
+    /// if another has one (else they stay on theirs if it has one), else any other.
     fn rotate(&mut self, r: u64) {
         let n = self.partitions.len();
-        if n > 1 {
-            self.sticky = (self.sticky + 1 + (r % (n as u64 - 1)) as usize) % n;
-        }
+        let others = || (0..n).filter(|&i| i != self.sticky && self.led(i));
+        self.sticky = match others().count() {
+            0 if self.led(self.sticky) => self.sticky,
+            0 if n > 1 => (self.sticky + 1 + (r % (n as u64 - 1)) as usize) % n,
+            0 => 0,
+            k => others().nth((r % k as u64) as usize).expect("one of them"),
+        };
     }
 }
 
@@ -519,8 +535,13 @@ fn manage<C: Deliveries>(sh: &Arc<Shared<C>>) {
         if st.fatal.is_some() {
             fail_queued(&mut st);
         }
+        // a topic never resolved with nothing queued (unknown, its messages gone) is asked for no
+        // more; one resolved is kept: its partitions' sequences go on
+        st.topics.retain(|_, t| !t.parts.is_empty() || !t.unassigned.is_empty());
         sh.reported.notify_all();
-        let need_metadata = st.metadata_due || unresolved(&st);
+        // periodically too: partitions added are used, leaders moved found before a send fails
+        let stale = sh.s.metadata_refresh.is_some_and(|i| st.refreshed.elapsed() >= i) && !st.topics.is_empty();
+        let need_metadata = st.metadata_due || stale || unresolved(&st);
         // at once, not at the first message (librdkafka's idempotent producer too): the first
         // message then waits on the metadata and its leader's connection alone
         let need_pid = st.pid.is_none() && st.fatal.is_none();
@@ -532,11 +553,10 @@ fn manage<C: Deliveries>(sh: &Arc<Shared<C>>) {
         }
         st.metadata_due = false;
         let asked: Vec<String> = st.topics.keys().cloned().collect();
-        // a lookup never holds back a message's timeout by more than its last 100 ms
-        let until_due =
-            next_deadline(&st).map_or(Duration::from_secs(5), |d| d.saturating_duration_since(Instant::now()));
         drop(st);
-        let timeout = sh.s.request_timeout.min(Duration::from_secs(5)).min(until_due).max(Duration::from_millis(100));
+        // not cut short by a message's deadline (`poll` and the broker threads time messages out
+        // meanwhile): a lookup given less than a broker's answer takes fails again and again
+        let timeout = sh.s.request_timeout.min(Duration::from_secs(5));
         let mut failed = false;
         if need_metadata {
             let names: Vec<&str> = asked.iter().map(String::as_str).collect();
@@ -569,9 +589,11 @@ fn manage<C: Deliveries>(sh: &Arc<Shared<C>>) {
     }
 }
 
-/// Whether a topic has no partitions known yet, or a partition no leader.
+/// Whether messages wait on the metadata: sent to a topic whose partitions are not known yet, or
+/// to a partition without a leader.
 fn unresolved<O>(st: &State<O>) -> bool {
-    st.topics.values().any(|t| t.partitions.is_empty() || t.parts.values().any(|p| p.leader.is_none()))
+    let waits = |p: &Part<O>| p.leader.is_none() && (!p.queue.is_empty() || p.inflight.is_some());
+    st.topics.values().any(|t| !t.unassigned.is_empty() || t.parts.values().any(waits))
 }
 
 fn init_producer_id(client: &Client, timeout: Duration) -> Result<(i64, i16)> {
@@ -594,13 +616,19 @@ fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
         let Some(m) = md.topic(name) else { continue };
         if m.error != Code::NONE {
             t.missing = Some(m.error);
+            if matches!(m.error, Code::INVALID_TOPIC_EXCEPTION | Code::TOPIC_AUTHORIZATION_FAILED) {
+                // for good: its messages fail now, not at their timeout
+                let e = || Error::Broker(m.error, format!("topic {name}"));
+                gone.extend(t.unassigned.drain(..).map(|p| (name.clone(), None, e(), p)));
+            }
             continue;
         }
         t.missing = None;
         let mut ps: Vec<i32> = m.partitions.iter().map(|p| p.id).collect();
         ps.sort_unstable();
         if t.partitions.is_empty() && !ps.is_empty() {
-            t.sticky = (st.rng % ps.len() as u64) as usize;
+            // a producer's first partition drawn at random: producers spread
+            t.sticky = (xorshift(&mut st.rng) % ps.len() as u64) as usize;
         }
         t.partitions = ps;
         for p in &m.partitions {
@@ -614,6 +642,10 @@ fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
             if p.leader >= 0 && !st.threads.contains(&p.leader) && !new_leaders.contains(&p.leader) {
                 new_leaders.push(p.leader);
             }
+        }
+        // keyless messages stick to no partition without a leader, nor one now gone
+        if !t.led(t.sticky) || t.sticky >= t.partitions.len() {
+            t.rotate(xorshift(&mut st.rng));
         }
         // what was sent before the topic's partitions were known, each to its partition; the
         // keyless a batch's worth a partition
@@ -641,11 +673,11 @@ fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
     for (t, p, e, m) in gone {
         st.report(&t, p, None, Some(e), Persisted::No, m);
     }
+    st.refreshed = Instant::now();
     for id in new_leaders {
         st.threads.push(id);
         let sh = sh.clone();
-        let spawned =
-            std::thread::Builder::new().name(format!("brrrrr-kafka-broker-{id}")).spawn(move || broker(&sh, id));
+        let spawned = std::thread::Builder::new().name(format!("fastka-broker-{id}")).spawn(move || broker(&sh, id));
         if spawned.is_err() {
             st.threads.retain(|t| *t != id); // tried again at the next metadata
         }
@@ -989,7 +1021,7 @@ fn send<C: Deliveries>(
 /// may have been written (its sequence then the next batch's), else with the producer fatal.
 fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Request, results: Vec<wire::Produced>) {
     let now = Instant::now();
-    let mut done = vec![];
+    let (mut done, mut moved) = (vec![], vec![]);
     for (t, p, _, _) in req {
         let r = results.iter().find(|r| r.topic == *t && r.partition == *p);
         let Some(part) = st.topics.get_mut(t).and_then(|x| x.parts.get_mut(p)) else { continue };
@@ -1011,6 +1043,7 @@ fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Reque
                 if c.stale_metadata() {
                     part.leader = None;
                     st.metadata_due = true;
+                    moved.push((t.clone(), *p));
                 }
                 sent.retry_at = now + sh.s.retry_backoff * sent.attempts.min(10);
                 part.inflight = Some(sent);
@@ -1024,6 +1057,13 @@ fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Reque
                 }
                 done.push((t.clone(), *p, sent.msgs, Err((c, why, gap, sent.maybe_written))));
             }
+        }
+    }
+    // keyless messages off a partition whose leader moved, till the metadata says where
+    for (name, p) in moved {
+        let t = st.topics.get_mut(&name).expect("the topic");
+        if t.partitions.get(t.sticky) == Some(&p) {
+            t.rotate(xorshift(&mut st.rng));
         }
     }
     for (t, p, msgs, r) in done {

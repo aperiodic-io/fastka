@@ -103,6 +103,7 @@ const KEYS: &[&str] = &[
     "compression.codec",
     "compression.level",
     "sticky.partitioning.linger.ms",
+    "topic.metadata.refresh.interval.ms",
 ];
 
 fn int(k: &str, v: &str, lo: i64, hi: i64) -> Result<i64> {
@@ -189,8 +190,10 @@ pub struct ProducerSettings {
     pub retry_backoff: Duration,
     pub retry_backoff_max: Duration,
     pub codec: i16,
-    /// the largest batch a broker takes (`message.max.bytes`)
+    /// the largest batch a broker takes (`message.max.bytes`), and the most a Produce request holds
     pub max_batch: usize,
+    /// the metadata looked up again this often (`topic.metadata.refresh.interval.ms`; -1: never)
+    pub metadata_refresh: Option<Duration>,
 }
 
 impl Config {
@@ -336,7 +339,7 @@ impl Config {
     pub fn producer(&self) -> Result<ProducerSettings> {
         self.check()?;
         let g = |k, d| self.get(k).unwrap_or(d);
-        // every producer of this client is idempotent: what brrrrr's ordering rests on
+        // every producer of this client is idempotent: its ordering and once-only writes rest on it
         if let Some(v) = self.get("enable.idempotence") {
             if !boolean("enable.idempotence", v)? {
                 return Err(Error::Config("enable.idempotence=false: this producer is always idempotent".into()));
@@ -402,6 +405,15 @@ impl Config {
             retry_backoff_max: ms("retry.backoff.max.ms", g("retry.backoff.max.ms", "1000"), 1, 300_000)?,
             codec,
             max_batch: int("message.max.bytes", g("message.max.bytes", "1000000"), 1000, 1_000_000_000)? as usize,
+            metadata_refresh: match int(
+                "topic.metadata.refresh.interval.ms",
+                g("topic.metadata.refresh.interval.ms", "300000"),
+                -1,
+                3_600_000,
+            )? {
+                -1 => None,
+                ms => Some(Duration::from_millis(ms.max(10) as u64)), // at least 10 ms apart
+            },
         })
     }
 }
@@ -437,6 +449,9 @@ mod tests {
             (p.linger, p.message_timeout, p.queue_messages),
             (Duration::from_millis(5), Duration::from_secs(300), 100_000)
         );
+        assert_eq!(p.metadata_refresh, Some(Duration::from_secs(300)));
+        let p = cfg(&[("topic.metadata.refresh.interval.ms", "-1")]).producer().unwrap();
+        assert_eq!(p.metadata_refresh, None, "-1: never");
         let p = cfg(&[("queue.buffering.max.ms", "20"), ("delivery.timeout.ms", "1500")]).producer().unwrap();
         assert_eq!(
             (p.linger, p.message_timeout),
