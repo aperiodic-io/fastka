@@ -1064,7 +1064,7 @@ fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
                     continue;
                 }
             }
-            Err((e, written)) => {
+            Err((_, written)) => {
                 conn = None;
                 // every batch of the request sent again, after a backoff and a metadata refresh
                 let at = Instant::now() + backoff;
@@ -1078,9 +1078,8 @@ fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
                         sent.maybe_written |= written;
                     }
                 }
-                if matches!(e, Error::Auth(_) | Error::Unsupported(_)) {
-                    st.set_fatal(Code::AUTHENTICATION, format!("broker {id}: {e}"));
-                }
+                // an authentication refused (credentials reach a broker late) or versions not
+                // spoken (a broker mid-upgrade) too: retried until the messages' deadline
                 st.metadata_due = true;
             }
         }

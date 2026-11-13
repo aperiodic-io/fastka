@@ -1680,3 +1680,57 @@ fn a_batch_refused_with_a_code_not_known_before_append_is_fatal() {
         assert_eq!(p.fatal_error().map(|f| f.0), Some(Code(code)), "{code}");
     }
 }
+
+/// A leader's connection refused by SASL (credentials not yet propagated to it) is retried as a
+/// lost one, until the messages' deadline: not fatal, the message delivered once it authenticates.
+#[test]
+fn a_leader_refusing_authentication_for_a_while_is_retried() {
+    let logs: Logs = Arc::default();
+    // refuses its first `refusals` authentications; leads o/0 as broker 1 at `leader`
+    let start = |refusals: usize, leader: Option<String>, logs: Logs| {
+        let n = AtomicUsize::new(0);
+        Broker::start(move |r| {
+            let mut out = vec![];
+            match r.api {
+                wire::SASL_HANDSHAKE => {
+                    out.i16(0);
+                    out.count(1);
+                    out.str("PLAIN");
+                }
+                wire::SASL_AUTHENTICATE => {
+                    let ok = n.fetch_add(1, Ordering::SeqCst) >= refusals;
+                    out.i16(if ok { 0 } else { 58 });
+                    out.nstr(Some(if ok { "" } else { "not yet" }));
+                    out.bytes(b"");
+                }
+                wire::METADATA => {
+                    let l = leader.clone().unwrap_or_else(|| r.me.clone());
+                    out = metadata(&[(0, &r.me), (1, &l)], &[("o", &[(0, 1)])]);
+                }
+                wire::INIT_PRODUCER_ID => {
+                    out.i32(0);
+                    out.i16(0);
+                    out.i64(1000);
+                    out.i16(0);
+                }
+                wire::PRODUCE => out = produce(r, &logs),
+                _ => return Answer::Drop,
+            }
+            Answer::Body(out)
+        })
+    };
+    let leader = start(2, None, logs.clone());
+    let b = start(0, Some(leader.addr.clone()), logs.clone());
+    let sasl = [
+        ("security.protocol", "sasl_plaintext"),
+        ("sasl.mechanisms", "PLAIN"),
+        ("sasl.username", "u"),
+        ("sasl.password", "p"),
+    ];
+    let p = producer(&b, &sasl);
+    send(&p, "o", "x", 1);
+    let h = heard(&p, 1);
+    assert_eq!((h[0].3.as_deref(), h[0].6), (None, Persisted::Yes), "{h:?}");
+    assert_eq!(p.fatal_error(), None);
+    assert_eq!(values(&logs, "o", 0), ["x"]);
+}
