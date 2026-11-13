@@ -104,10 +104,11 @@ struct Pending<O> {
     enqueued: Instant,
 }
 
-/// What a message counts for against `queue.buffering.max.kbytes`: its key, value and headers,
-/// and a record's overhead.
+/// What a message counts for against `queue.buffering.max.kbytes` and in a batch: its key, value
+/// and headers, a record's overhead, and each header's framing (its two lengths, at most 5 bytes
+/// each: else many small headers would pass `message.max.bytes` unseen).
 fn size_of(key: Option<&[u8]>, value: Option<&[u8]>, headers: &[(String, Option<Vec<u8>>)]) -> usize {
-    let hs = headers.iter().map(|(k, v)| k.len() + v.as_ref().map_or(0, Vec::len)).sum::<usize>();
+    let hs = headers.iter().map(|(k, v)| 10 + k.len() + v.as_ref().map_or(0, Vec::len)).sum::<usize>();
     key.map_or(0, <[u8]>::len) + value.map_or(0, <[u8]>::len) + hs + 16
 }
 
@@ -156,9 +157,10 @@ struct State<O> {
     /// brokers with a thread of their own, and their addresses
     brokers: HashMap<i32, String>,
     threads: Vec<i32>,
-    /// messages sent, not yet reported to `poll`
+    /// messages sent whose outcome `poll` has not handed over (what `queue.buffering.max.messages`
+    /// bounds: a report holds its opaque until then)
     outstanding: usize,
-    /// of those, still in a queue or a batch (what `queue.buffering.max.*` bounds)
+    /// of those, still in a queue or a batch, and their bytes (what `.kbytes` bounds)
     queued: usize,
     queued_bytes: usize,
     reports: VecDeque<Report<O>>,
@@ -253,11 +255,16 @@ impl<C: Deliveries> Producer<C> {
             return Err((Error::Transport("the producer is closing".into()), opaque));
         }
         let size = size_of(r.key, r.value, r.headers);
-        if st.queued >= sh.s.queue_messages || st.queued_bytes + size > sh.s.queue_bytes {
-            return Err((Error::QueueFull, opaque));
-        }
+        // what no wait would ever take: refused for what it is, not QueueFull
         if size + records::HEADER > sh.s.max_batch {
             return Err((Error::Broker(Code::MESSAGE_TOO_LARGE, format!("a message of {size} bytes")), opaque));
+        }
+        if size > sh.s.queue_bytes {
+            let why = format!("a message of {size} bytes, past queue.buffering.max.kbytes");
+            return Err((Error::Config(why), opaque));
+        }
+        if st.outstanding >= sh.s.queue_messages || st.queued_bytes + size > sh.s.queue_bytes {
+            return Err((Error::QueueFull, opaque));
         }
         let now = Instant::now();
         let p = Pending {
@@ -316,24 +323,40 @@ impl<C: Deliveries> Producer<C> {
     /// may be in a lookup, or waiting out its backoff.
     pub fn poll(&self, timeout: Duration) -> usize {
         let sh = &*self.shared;
-        let until = Instant::now() + timeout;
+        // None: forever (a timeout past what an Instant holds)
+        let until = Instant::now().checked_add(timeout);
         let mut st = sh.lock();
         loop {
             let now = Instant::now();
             expire(&mut st, now);
-            if !st.reports.is_empty() || now >= until {
+            if !st.reports.is_empty() || until.is_some_and(|u| now >= u) {
                 break;
             }
             // a batch being sent past its deadline is not timed out here: its answer is waited for
-            let wake = next_deadline(&st).map_or(until, |d| d.max(now + Duration::from_millis(1)).min(until));
-            st = sh.reported.wait_timeout(st, wake.saturating_duration_since(now)).unwrap_or_else(|p| p.into_inner()).0;
+            let wake = next_deadline(&st).map(|d| d.max(now + Duration::from_millis(1)));
+            let wait = match (wake, until) {
+                (Some(w), Some(u)) => w.min(u),
+                (w, u) => w.or(u).unwrap_or(now + Duration::from_secs(1)), // forever, a second a wait
+            };
+            st = sh.reported.wait_timeout(st, wait.saturating_duration_since(now)).unwrap_or_else(|p| p.into_inner()).0;
         }
-        let ready: Vec<_> = st.reports.drain(..).collect();
+        let mut ready = std::mem::take(&mut st.reports).into_iter();
         drop(st);
         let n = ready.len();
-        for (topic, partition, offset, error, persisted, opaque) in ready {
-            sh.ctx.delivery(&Delivery { topic: &topic, partition, offset, error: error.as_ref(), persisted }, opaque);
-            sh.lock().outstanding -= 1;
+        while let Some((topic, partition, offset, error, persisted, opaque)) = ready.next() {
+            let d = Delivery { topic: &topic, partition, offset, error: error.as_ref(), persisted };
+            let heard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sh.ctx.delivery(&d, opaque)));
+            let mut st = sh.lock();
+            st.outstanding -= 1;
+            if let Err(panic) = heard {
+                // the application's panic is its own: the reports after it are handed over at the
+                // next poll, none left counted forever
+                for r in ready.rev() {
+                    st.reports.push_front(r);
+                }
+                drop(st);
+                std::panic::resume_unwind(panic);
+            }
         }
         n
     }
@@ -345,9 +368,9 @@ impl<C: Deliveries> Producer<C> {
 
     /// Polls until every message's outcome is handed over, within `timeout`.
     pub fn flush(&self, timeout: Duration) -> Result<()> {
-        let until = Instant::now() + timeout;
+        let until = Instant::now().checked_add(timeout);
         while self.in_flight_count() > 0 {
-            let left = until.saturating_duration_since(Instant::now());
+            let left = until.map_or(Duration::MAX, |u| u.saturating_duration_since(Instant::now()));
             if left.is_zero() {
                 return Err(Error::Timeout(format!("{} messages not delivered", self.in_flight_count())));
             }

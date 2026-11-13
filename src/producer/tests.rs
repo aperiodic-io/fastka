@@ -356,10 +356,10 @@ fn transient_refusals_are_retried() {
     assert!(b.requests(wire::METADATA).len() >= 2, "looked up again after NOT_LEADER_OR_FOLLOWER");
 }
 
-/// A batch refused for good fails its messages with the broker's code, and the producer is
+/// A batch refused as out of order fails its messages with the broker's code, and the producer is
 /// fatal: its partition's sequence has a gap the broker would refuse every later batch for.
 #[test]
-fn a_refused_batch_fails_and_the_producer_is_fatal() {
+fn a_batch_out_of_order_fails_and_the_producer_is_fatal() {
     let fault: Fault = Box::new(|r, _, _| {
         let mut c = Cur::new(&r.body);
         c.nstr().unwrap();
@@ -367,17 +367,17 @@ fn a_refused_batch_fails_and_the_producer_is_fatal() {
         c.i32().unwrap();
         c.i32().unwrap();
         let t = c.str().unwrap().to_string();
-        Some(Answer::Body(refusal(&t, 0, 10))) // MESSAGE_TOO_LARGE
+        Some(Answer::Body(refusal(&t, 0, 45))) // OUT_OF_ORDER_SEQUENCE_NUMBER
     });
     let (b, _) = sink(&["o"], 1, fault);
     let p = producer(&b, &[]);
-    send(&p, "o", "big", 1);
+    send(&p, "o", "x", 1);
     let h = heard(&p, 1);
-    assert_eq!((h[0].1, h[0].4), (Some(0), Some(Code::MESSAGE_TOO_LARGE)));
-    assert_eq!(p.fatal_error().unwrap().0, Code::MESSAGE_TOO_LARGE);
+    assert_eq!((h[0].1, h[0].4), (Some(0), Some(Code::OUT_OF_ORDER_SEQUENCE_NUMBER)));
+    assert_eq!(p.fatal_error().unwrap().0, Code::OUT_OF_ORDER_SEQUENCE_NUMBER);
     assert!(h[0].3.as_ref().unwrap().contains("the broker's reason"), "{h:?}");
     let (e, o) = p.send(Record::to("o").value(b"after"), 2).unwrap_err();
-    assert!(matches!(e, Error::Fatal(Code::MESSAGE_TOO_LARGE, _)) && o == 2, "{e}");
+    assert!(matches!(e, Error::Fatal(Code::OUT_OF_ORDER_SEQUENCE_NUMBER, _)) && o == 2, "{e}");
 }
 
 /// Without a broker, nothing is sent and every message times out (`message.timeout.ms`), not
@@ -640,9 +640,9 @@ fn records_carry_the_time_they_were_sent() {
     assert!((before..=after).contains(&t), "{before} <= {t} <= {after}");
 }
 
-/// `queue.buffering.max.kbytes` bounds what is queued by its size (value, headers, 16 bytes of a
-/// record's overhead): a message that fills it exactly is taken, one byte more is refused, and
-/// what a purge gives back is taken again.
+/// `queue.buffering.max.kbytes` bounds what is queued by its size (key, value, headers and their
+/// framing, 16 bytes of a record's overhead): a message that fills it exactly is taken, one byte
+/// more is refused, and what a purge gives back is taken again.
 #[test]
 fn the_queue_is_bounded_by_bytes_and_gives_them_back() {
     let mut c = config("127.0.0.1:1");
@@ -655,8 +655,9 @@ fn the_queue_is_bounded_by_bytes_and_gives_them_back() {
     p.send(Record::to("o").value(&[0u8; 1024 - 16]), 3).unwrap(); // what the purge gave back
     p.purge_queue();
     heard(&p, 2);
-    // headers count: 496 + 496 + 16 = 1008, so 16 bytes are left, a message with no value
-    let h = vec![("k".repeat(496), Some(vec![0u8; 496]))];
+    // headers count, with their framing: 491 + 491 + 10 + 16 = 1008, so 16 bytes are left, a
+    // message with no value
+    let h = vec![("k".repeat(491), Some(vec![0u8; 491]))];
     p.send(Record::to("o").value(b"").headers(&h), 4).unwrap();
     assert_eq!(p.send(Record::to("o").value(b"x"), 5).unwrap_err().0, Error::QueueFull);
     p.send(Record::to("o").value(b""), 6).unwrap();
@@ -1034,7 +1035,7 @@ fn fatal_spares_a_batch_in_flight_elsewhere() {
             c.i32().unwrap();
             // late: both batches in flight by then
             std::thread::sleep(Duration::from_millis(300));
-            Answer::Body(refusal(&t, c.i32().unwrap(), 10)) // MESSAGE_TOO_LARGE: fatal
+            Answer::Body(refusal(&t, c.i32().unwrap(), 45)) // OUT_OF_ORDER_SEQUENCE_NUMBER: fatal
         }),
         Box::new(|_, _| Answer::Silence),
     ]);
@@ -1043,7 +1044,7 @@ fn fatal_spares_a_batch_in_flight_elsewhere() {
     send(&p, "o", "a", 1);
     send(&p, "o", "b", 2); // a batch a partition: the other partition, the other broker
     let h = heard(&p, 1);
-    assert_eq!(h[0].4, Some(Code::MESSAGE_TOO_LARGE), "{h:?}");
+    assert_eq!(h[0].4, Some(Code::OUT_OF_ORDER_SEQUENCE_NUMBER), "{h:?}");
     let h = heard(&p, 2);
     assert!(t.elapsed() >= Duration::from_millis(900), "the other in flight until its timeout: {h:?}");
     assert_eq!(h[1].3.as_deref(), Some("message timed out (message.timeout.ms)"), "{h:?}");
@@ -1237,4 +1238,313 @@ fn a_partition_the_topic_has_not_fails_its_record() {
     let h = heard(&p, 3);
     assert_eq!(h.iter().find(|x| x.5 == 2).unwrap().4, Some(Code::UNKNOWN_TOPIC_OR_PARTITION), "{h:?}");
     assert_eq!(h.iter().find(|x| x.5 == 3).unwrap().1, Some(1), "{h:?}");
+}
+
+/// A broker answering InitProducerId with id 1000, epoch 0.
+fn pid_answer() -> Answer {
+    let mut out = vec![];
+    out.i32(0);
+    out.i16(0);
+    out.i64(1000);
+    out.i16(0);
+    Answer::Body(out)
+}
+
+/// Delivery reports nobody polls count against `queue.buffering.max.messages` until `poll` hands
+/// them over (librdkafka counts a message until its report is served): the reports held are
+/// bounded too.
+#[test]
+fn unpolled_reports_count_against_the_queue_bound() {
+    let (b, _) = sink(&["o"], 1, no_fault());
+    let p = producer(&b, &[("queue.buffering.max.messages", "1")]);
+    let mut accepted = 0;
+    let until = Instant::now() + Duration::from_secs(1);
+    while accepted < 50 && Instant::now() < until {
+        if p.send(Record::to("o").value(b"x"), accepted).is_ok() {
+            accepted += 1;
+        } else {
+            std::thread::sleep(Duration::from_millis(2)); // never polled
+        }
+    }
+    assert_eq!(p.in_flight_count(), 1, "with a queue bound of 1");
+    assert_eq!(heard(&p, 1).len(), 1);
+    p.send(Record::to("o").value(b"x"), 99).unwrap(); // its place given back by poll
+}
+
+/// A Produce request holds the due batches of a broker's partitions up to `message.max.bytes` in
+/// all (at least one batch), the rest in the next request.
+#[test]
+fn a_produce_request_holds_at_most_message_max_bytes() {
+    let big = Arc::new(AtomicUsize::new(0));
+    let b2 = big.clone();
+    let (b, logs) = sink(
+        &["o"],
+        8,
+        Box::new(move |r, i, _| {
+            b2.fetch_max(r.body.len(), Ordering::SeqCst);
+            if i == 0 {
+                std::thread::sleep(Duration::from_millis(300)); // the others due meanwhile
+            }
+            None
+        }),
+    );
+    let p = producer(&b, &[("message.max.bytes", "100000"), ("batch.num.messages", "1")]);
+    for i in 0..8 {
+        p.send(Record::to("o").value(&[7u8; 40_000]), i).unwrap();
+    }
+    let h = heard(&p, 8);
+    assert!(h.iter().all(|x| x.3.is_none()), "{h:?}");
+    let max = big.load(Ordering::SeqCst);
+    assert!(max <= 100_000 + 200, "a Produce request of {max} bytes with message.max.bytes=100000");
+    assert!(max > 80_000, "two batches a request still: {max}");
+    assert_eq!((0..8).map(|q| values(&logs, "o", q).len()).sum::<usize>(), 8);
+}
+
+/// A header's framing (its key's and value's lengths, up to 5 bytes each) counts toward a
+/// message's size: many empty headers are no free ride past `message.max.bytes`.
+#[test]
+fn header_framing_counts_against_message_max_bytes() {
+    let big = Arc::new(AtomicUsize::new(0));
+    let b2 = big.clone();
+    let (b, _) = sink(
+        &["o"],
+        1,
+        Box::new(move |r, _, _| {
+            b2.fetch_max(r.body.len(), Ordering::SeqCst);
+            None
+        }),
+    );
+    let p = producer(&b, &[("message.max.bytes", "1000")]);
+    let hs: Vec<(String, Option<Vec<u8>>)> = (0..600).map(|_| (String::new(), None)).collect();
+    match p.send(Record::to("o").headers(&hs), 1) {
+        Err((e, _)) => assert_eq!(e.code(), Some(Code::MESSAGE_TOO_LARGE), "{e}"),
+        Ok(()) => {
+            heard(&p, 1);
+            let max = big.load(Ordering::SeqCst);
+            panic!("taken: a request of {max} bytes holding one batch, message.max.bytes=1000");
+        }
+    }
+}
+
+/// A message larger than the whole queue (`queue.buffering.max.kbytes`) is refused for what it
+/// is, not QueueFull: polling and sending it again would never help.
+#[test]
+fn a_message_past_the_queue_bytes_is_refused_not_queue_full() {
+    let p = Producer::new(config("127.0.0.1:1").set("queue.buffering.max.kbytes", "1"), Heard::default()).unwrap();
+    let (e, _) = p.send(Record::to("o").value(&[0u8; 2000]), 1).unwrap_err();
+    assert_eq!(p.in_flight_count(), 0);
+    assert!(matches!(e, Error::Config(_)), "{e:?}");
+}
+
+/// `poll` and `flush` take a timeout of forever (Duration::MAX).
+#[test]
+fn poll_and_flush_take_a_timeout_of_forever() {
+    let p = Producer::new(config("127.0.0.1:1").set("message.timeout.ms", "100"), Heard::default()).unwrap();
+    p.send(Record::to("o").value(b"x"), 1).unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.poll(Duration::MAX)));
+    assert_eq!(r.ok(), Some(1), "poll(Duration::MAX) panicked or heard nothing");
+    p.send(Record::to("o").value(b"x"), 2).unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.flush(Duration::MAX)));
+    assert!(r.is_ok_and(|r| r.is_ok()), "flush(Duration::MAX)");
+}
+
+/// Keyless messages go to a partition with a leader: none sticks to one without (its messages
+/// would time out while another partition is up).
+#[test]
+fn keyless_messages_avoid_a_partition_without_a_leader() {
+    let b = Broker::start(move |r| match r.api {
+        wire::METADATA => Answer::Body(metadata(&[(0, &r.me)], &[("o", &[(0, 0), (1, -1)])])),
+        wire::INIT_PRODUCER_ID => pid_answer(),
+        wire::PRODUCE => Answer::Body(produce(r, &Logs::default())),
+        _ => Answer::Drop,
+    });
+    for _ in 0..8 {
+        let p = producer(&b, &[("message.timeout.ms", "2000"), ("batch.num.messages", "2")]);
+        for i in 0..5 {
+            send(&p, "o", "x", i);
+        }
+        let h = heard(&p, 5);
+        assert!(h.iter().all(|x| x.3.is_none() && x.1 == Some(0)), "{h:?}");
+    }
+}
+
+/// A batch never written to a socket (its leader unreachable) that times out fails as timed out,
+/// not persisted, and the producer is not fatal: no sequence of it reached a broker, and the next
+/// batch takes its sequence.
+#[test]
+fn a_batch_never_written_times_out_without_making_the_producer_fatal() {
+    let b = Broker::start(move |r| match r.api {
+        wire::METADATA => Answer::Body(metadata(&[(0, &r.me), (1, "127.0.0.1:1")], &[("o", &[(0, 1)])])),
+        wire::INIT_PRODUCER_ID => pid_answer(),
+        _ => Answer::Drop,
+    });
+    let p = producer(&b, &[("message.timeout.ms", "500")]);
+    send(&p, "o", "x", 1);
+    let h = heard(&p, 1);
+    assert_eq!((h[0].3.as_deref(), h[0].6), (Some("message timed out (message.timeout.ms)"), Persisted::No));
+    assert_eq!(p.fatal_error(), None, "fatal though no byte of the batch was ever written to a socket");
+    let st = p.shared.lock();
+    assert_eq!(st.topics["o"].parts[&0].seq, 0, "its sequence given back");
+}
+
+/// A topic with nothing queued is not looked up again and again (an unknown one's messages long
+/// timed out): only the periodic refresh asks for it.
+#[test]
+fn a_topic_with_nothing_queued_is_not_looked_up_again() {
+    let (b, _) = sink(&["o"], 1, no_fault());
+    let p = producer(&b, &[("message.timeout.ms", "200"), ("retry.backoff.max.ms", "100")]);
+    p.send(Record::to("nope").value(b"x"), 1).unwrap();
+    heard(&p, 1);
+    let before = b.requests(wire::METADATA).len();
+    std::thread::sleep(Duration::from_secs(1));
+    let after = b.requests(wire::METADATA).len();
+    assert!(after - before < 3, "{} metadata requests in 1 s for a topic with nothing queued", after - before);
+}
+
+/// A delivery callback that panics strands nothing: the reports after it are handed over at the
+/// next poll, and its own counted as handed over.
+#[test]
+fn a_panicking_delivery_callback_strands_nothing() {
+    struct Boom(AtomicUsize);
+    impl Deliveries for Boom {
+        type Opaque = u64;
+        fn delivery(&self, _: &Delivery<'_>, o: u64) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if o == 0 {
+                panic!("the application's bug");
+            }
+        }
+    }
+    let c = config("127.0.0.1:1").set("message.timeout.ms", "100").set("linger.ms", "0").clone();
+    let p = Producer::new(&c, Boom(AtomicUsize::new(0))).unwrap();
+    for i in 0..3 {
+        p.send(Record::to("o").value(b"x"), i).map_err(|e| e.0).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.poll(Duration::from_secs(1))));
+    assert!(r.is_err(), "the callback's panic goes on to poll's caller");
+    assert!(p.flush(Duration::from_secs(1)).is_ok(), "in flight {} forever", p.in_flight_count());
+    assert_eq!(p.context().0.load(Ordering::SeqCst), 3, "each handed over once");
+}
+
+/// A batch the broker refuses for good (MESSAGE_TOO_LARGE), answered at each attempt, fails alone:
+/// it was not written, no later sequence was sent, so the next batch takes its sequence and the
+/// producer goes on.
+#[test]
+fn a_batch_refused_for_good_fails_alone_and_its_sequence_is_used_again() {
+    let fault: Fault = Box::new(|r, i, _| {
+        (i < 2).then(|| {
+            let mut c = Cur::new(&r.body);
+            c.nstr().unwrap();
+            c.i16().unwrap();
+            c.i32().unwrap();
+            c.i32().unwrap();
+            // NOT_ENOUGH_REPLICAS (not appended), then MESSAGE_TOO_LARGE
+            Answer::Body(refusal(c.str().unwrap(), 0, if i == 0 { 19 } else { 10 }))
+        })
+    });
+    let (b, logs) = sink(&["o"], 1, fault);
+    let p = producer(&b, &[]);
+    send(&p, "o", "big", 1);
+    let h = heard(&p, 1);
+    assert_eq!((h[0].4, h[0].6), (Some(Code::MESSAGE_TOO_LARGE), Persisted::No), "{h:?}");
+    assert_eq!(p.fatal_error(), None);
+    send(&p, "o", "next", 2);
+    let h = heard(&p, 2);
+    assert_eq!((h[1].2, h[1].3.as_ref()), (Some(0), None), "at the refused batch's sequence: {h:?}");
+    assert_eq!(values(&logs, "o", 0), ["next"]);
+}
+
+/// A batch refused for good after an attempt that may have been written (its answer lost, or a
+/// code a broker gives after appending it) makes the producer fatal: the broker may hold its
+/// sequence, and a batch at it again would be taken as a duplicate.
+#[test]
+fn a_batch_refused_after_an_attempt_that_may_have_been_written_is_fatal() {
+    for first in [None, Some(20)] {
+        let fault: Fault = Box::new(move |r, i, _| {
+            let mut c = Cur::new(&r.body);
+            c.nstr().unwrap();
+            c.i16().unwrap();
+            c.i32().unwrap();
+            c.i32().unwrap();
+            let t = c.str().unwrap().to_string();
+            match (i, first) {
+                (0, None) => Some(Answer::Drop),
+                (0, Some(code)) => Some(Answer::Body(refusal(&t, 0, code))),
+                _ => Some(Answer::Body(refusal(&t, 0, 29))), // TOPIC_AUTHORIZATION_FAILED
+            }
+        });
+        let (b, _) = sink(&["o"], 1, fault);
+        let p = producer(&b, &[]);
+        send(&p, "o", "x", 1);
+        let h = heard(&p, 1);
+        assert_eq!((h[0].4, h[0].6), (Some(Code::TOPIC_AUTHORIZATION_FAILED), Persisted::Possibly), "{first:?}");
+        assert_eq!(p.fatal_error().map(|f| f.0), Some(Code::TOPIC_AUTHORIZATION_FAILED), "{first:?}");
+    }
+}
+
+/// A topic the metadata refuses for good (TOPIC_AUTHORIZATION_FAILED, INVALID_TOPIC_EXCEPTION)
+/// fails its messages at once, not at their timeout; an empty topic name is refused by `send`.
+#[test]
+fn a_topic_refused_for_good_fails_its_messages_at_once() {
+    let b = Broker::start(move |r| match r.api {
+        wire::METADATA => {
+            let me: &[(i32, &str)] = &[(0, &r.me)];
+            let mut m = metadata(me, &[("o", &[])]);
+            let at = metadata(me, &[]).len();
+            m[at..at + 2].copy_from_slice(&29i16.to_be_bytes());
+            Answer::Body(m)
+        }
+        wire::INIT_PRODUCER_ID => pid_answer(),
+        _ => Answer::Drop,
+    });
+    let p = producer(&b, &[("message.timeout.ms", "30000")]);
+    let t = Instant::now();
+    send(&p, "o", "x", 1);
+    let h = heard(&p, 1);
+    assert_eq!((h[0].4, h[0].6), (Some(Code::TOPIC_AUTHORIZATION_FAILED), Persisted::No), "{h:?}");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    let (e, _) = p.send(Record::to("").value(b"x"), 2).unwrap_err();
+    assert!(matches!(e, Error::Config(_)), "{e:?}");
+}
+
+/// The metadata is looked up again every `topic.metadata.refresh.interval.ms`: partitions added
+/// are used; partitions gone (the sticky one past the end) are not.
+#[test]
+fn the_metadata_is_refreshed_periodically() {
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let n2 = lookups.clone();
+    let logs: Logs = Arc::default();
+    let l2 = logs.clone();
+    let b = Broker::start(move |r| match r.api {
+        wire::METADATA => {
+            // 3 partitions, then 1, then 2
+            let ps: &[(i32, i32)] = match n2.fetch_add(1, Ordering::SeqCst) {
+                0 => &[(0, 0), (1, 0), (2, 0)],
+                1..4 => &[(0, 0)],
+                _ => &[(0, 0), (1, 0)],
+            };
+            Answer::Body(metadata(&[(0, &r.me)], &[("o", ps)]))
+        }
+        wire::INIT_PRODUCER_ID => pid_answer(),
+        wire::PRODUCE => Answer::Body(produce(r, &l2)),
+        _ => Answer::Drop,
+    });
+    let p = producer(&b, &[("topic.metadata.refresh.interval.ms", "100"), ("batch.num.messages", "1")]);
+    p.send(Record::to("o").value(b"a").partition(2), 1).unwrap();
+    assert_eq!(heard(&p, 1)[0].1, Some(2));
+    while lookups.load(Ordering::SeqCst) < 2 {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for i in 0..6 {
+        send(&p, "o", "k", 10 + i); // keyless, one partition left
+    }
+    let h = heard(&p, 7);
+    assert!(h[1..].iter().all(|x| x.1 == Some(0) && x.3.is_none()), "{h:?}");
+    while lookups.load(Ordering::SeqCst) < 5 {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    p.send(Record::to("o").value(b"b").partition(1), 2).unwrap();
+    let h = heard(&p, 8);
+    assert_eq!((h[7].1, h[7].3.as_ref()), (Some(1), None), "{h:?}");
 }
