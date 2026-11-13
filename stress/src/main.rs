@@ -42,6 +42,10 @@ impl Rng {
 /// The proxy's faults, switched on and off between phases.
 struct Chaos {
     on: AtomicBool,
+    /// per million chunks: a cut, a stall; a stall's longest (ms)
+    cut_ppm: AtomicU64,
+    stall_ppm: AtomicU64,
+    stall_ms: AtomicU64,
     seed: AtomicU64,
     cuts: AtomicU64,
     stalls: AtomicU64,
@@ -83,15 +87,15 @@ fn pipe(mut from: TcpStream, mut to: TcpStream, chaos: &Chaos, rng: &mut Rng) {
             Ok(n) => n,
         };
         if chaos.on.load(Relaxed) {
-            if rng.chance(3_000) {
+            if rng.chance(chaos.cut_ppm.load(Relaxed)) {
                 chaos.cuts.fetch_add(1, Relaxed);
                 // part of the chunk, then nothing: a frame cut short
                 let _ = to.write_all(&buf[..(rng.next() as usize % n)]);
                 break;
             }
-            if rng.chance(1_000) {
+            if rng.chance(chaos.stall_ppm.load(Relaxed)) {
                 chaos.stalls.fetch_add(1, Relaxed);
-                std::thread::sleep(Duration::from_millis(rng.next() % 3000));
+                std::thread::sleep(Duration::from_millis(rng.next() % chaos.stall_ms.load(Relaxed).max(1)));
             } else if rng.chance(20_000) {
                 std::thread::sleep(Duration::from_millis(rng.next() % 20));
             }
@@ -114,10 +118,12 @@ struct Sent {
 
 #[derive(Default)]
 struct Ledger(Mutex<Vec<Sent>>);
-impl Deliveries for Arc<Ledger> {
+/// The ledger as the producer's context (shared with the harness).
+struct Reports(Arc<Ledger>);
+impl Deliveries for Reports {
     type Opaque = usize;
     fn delivery(&self, d: &Delivery<'_>, id: usize) {
-        let mut l = self.0.lock().unwrap();
+        let mut l = self.0 .0.lock().unwrap();
         let s = &mut l[id];
         assert!(s.outcome.is_none(), "message {id}: a second delivery report");
         s.outcome = Some((d.partition, d.offset, d.error.map(Error::to_string), d.persisted));
@@ -138,6 +144,9 @@ fn main() {
     let seed: u64 = env("STRESS_SEED", 0x5eed);
     let chaos = Arc::new(Chaos {
         on: AtomicBool::new(false),
+        cut_ppm: AtomicU64::new(env("STRESS_CUT_PPM", 3_000)),
+        stall_ppm: AtomicU64::new(env("STRESS_STALL_PPM", 1_000)),
+        stall_ms: AtomicU64::new(env("STRESS_STALL_MS", 3_000)),
         seed: AtomicU64::new(seed),
         cuts: AtomicU64::new(0),
         stalls: AtomicU64::new(0),
@@ -168,7 +177,7 @@ fn main() {
     let ledger = Arc::new(Ledger::default());
     let until = Instant::now() + Duration::from_secs(secs);
     let (mut generation, mut fatal_producers) = (0u32, 0);
-    let mut p = Producer::new(&cfg, ledger.clone()).unwrap();
+    let mut p = Producer::new(&cfg, Reports(ledger.clone())).unwrap();
     let mut rng = Rng(seed | 1);
     while Instant::now() < until {
         let id = ledger.0.lock().unwrap().len();
@@ -189,7 +198,7 @@ fn main() {
                     p.flush(Duration::from_secs(60)).expect("a fatal producer reports every message");
                     (generation, fatal_producers) = (generation + 1, fatal_producers + 1);
                     ledger.0.lock().unwrap()[o].generation = generation;
-                    p = Producer::new(&cfg, ledger.clone()).unwrap();
+                    p = Producer::new(&cfg, Reports(ledger.clone())).unwrap();
                     opaque = o;
                 }
                 Err((e, _)) => panic!("send: {e}"),
@@ -208,6 +217,11 @@ fn main() {
     // ---- read the log back without faults, then through them ----
     chaos.on.store(false, Relaxed);
     let clean = read_all(&cfg, &topic, parts, Duration::from_secs(120));
+    // the read through the faults at the default rates: at the harsh ones a Fetch of
+    // fetch.max.bytes (~800 chunks) would almost never arrive whole, on any client
+    chaos.cut_ppm.store(3_000, Relaxed);
+    chaos.stall_ppm.store(1_000, Relaxed);
+    chaos.stall_ms.store(3_000, Relaxed);
     chaos.on.store(true, Relaxed);
     chaos.seed.store(seed ^ 0xc0ffee, Relaxed);
     let chaotic = read_all(&cfg, &topic, parts, Duration::from_secs(300));
@@ -315,8 +329,11 @@ fn read_all(cfg: &Config, topic: &str, parts: i32, limit: Duration) -> Vec<Vec<(
     let mut ends = HashSet::new();
     let until = Instant::now() + limit;
     while ends.len() < parts as usize {
-        assert!(Instant::now() < until, "reading back: {} of {parts} partitions at their end", ends.len());
-        match c.next_event(Duration::from_millis(100), &mut |_| {}) {
+        if Instant::now() >= until {
+            let at: Vec<_> = (0..parts as usize).map(|i| (c.position(i), logs[i].len())).collect();
+            panic!("reading back: {} of {parts} partitions at their end; (position, records read): {at:?}", ends.len());
+        }
+        match c.next_event(Duration::from_millis(100), &mut |n| eprintln!("stress: reading back: {n}")) {
             Ok(Some((i, Polled::Msg(m)))) => {
                 let log: &mut Vec<(i64, String, usize)> = &mut logs[i];
                 if let Some(&(last, _, _)) = log.last() {
