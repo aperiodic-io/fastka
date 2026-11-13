@@ -1,0 +1,6 @@
+target/
+mutants.out*/
+__pycache__/
+/fuzz/corpus/
+/fuzz/artifacts/
+/bench/results/raw/

@@ -1,0 +1,53 @@
+[package]
+name = "fastka"
+description = "A synchronous, pure-Rust Kafka client: Fetch on the caller's thread, an idempotent producer, metadata and admin. No C, no async runtime."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aperiodic-io/fastka"
+readme = "README.md"
+keywords = ["kafka", "redpanda", "consumer", "producer", "client"]
+categories = ["network-programming", "database"]
+exclude = ["/bench", "/stress", "/fuzz", "/.github", "/verification"]
+
+[lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[dependencies]
+# the record batches' checksum (Kafka's CRC-32C, hardware accelerated)
+crc32c = "0.6"
+# the record batches' codecs, in Rust but for zstd
+flate2 = "1"
+lz4_flex = "0.14"
+snap = "1"
+zstd = { version = "0.13", default-features = false }
+# TLS (ring: no C toolchain beyond the one zstd needs), the system's roots
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+# SCRAM's HMAC, PBKDF2, digests and nonce
+ring = "0.17"
+base64 = "0.22"
+
+[dev-dependencies]
+# a conformance oracle only: generated from Apache Kafka's message schemas, so every request
+# this crate encodes and every response it decodes is checked against the spec's own codec
+kafka-protocol = { version = "0.18", default-features = false, features = ["client", "broker", "gzip", "snappy", "lz4", "zstd"] }
+bytes = "1"
+indexmap = "2"
+proptest = "1.11"
+# a CA and the brokers' certificates for the TLS tests
+rcgen = "0.13"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"

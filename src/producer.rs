@@ -1,0 +1,816 @@
+//! The idempotent producer. `send` queues a message and returns; a thread a broker sends each
+//! partition's batches to its leader, one batch of a partition in flight at a time, so a
+//! partition keeps its messages in the order sent; a retry sends the same batch with the same
+//! sequence, which the broker writes once. `poll` hands the outcomes to the context's
+//! `delivery`, on the thread that polls.
+//!
+//! Like librdkafka's idempotent producer: messages are given up `message.timeout.ms` after
+//! `send`, retries included; a DUPLICATE_SEQUENCE_NUMBER is a delivery (its offset unknown). Not
+//! like it: where the broker's sequence may now have a gap (a batch in flight timed out, or
+//! refused for good), librdkafka bumps the epoch and renumbers; this producer is fatal instead
+//! (`fatal_error`): every message after fails, and a new producer is made to go on.
+use crate::client::Client;
+use crate::config::{Config, ProducerSettings};
+use crate::conn::Conn;
+use crate::error::{Code, Error, Result};
+use crate::records::{self, Out, Stamp};
+use crate::wire::{self, Cur};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime};
+
+/// A message's outcome, to `Deliveries::delivery`.
+#[derive(Debug)]
+pub struct Delivery<'a> {
+    pub topic: &'a str,
+    /// None: never given a partition
+    pub partition: Option<i32>,
+    /// None: not delivered, or delivered at an offset the broker did not say
+    pub offset: Option<i64>,
+    pub error: Option<&'a Error>,
+}
+
+/// What hears the deliveries (librdkafka's delivery report callback).
+pub trait Deliveries: Send + Sync + 'static {
+    type Opaque: Send + 'static;
+    fn delivery(&self, d: &Delivery<'_>, opaque: Self::Opaque);
+}
+
+struct Pending<O> {
+    value: Vec<u8>,
+    headers: Vec<(String, Option<Vec<u8>>)>,
+    timestamp: i64,
+    opaque: O,
+    deadline: Instant,
+    enqueued: Instant,
+}
+
+/// What a message counts for against `queue.buffering.max.kbytes`: its value and headers, and a
+/// record's overhead.
+fn size_of(value: &[u8], headers: &[(String, Option<Vec<u8>>)]) -> usize {
+    value.len() + headers.iter().map(|(k, v)| k.len() + v.as_ref().map_or(0, Vec::len)).sum::<usize>() + 16
+}
+
+impl<O> Pending<O> {
+    fn size(&self) -> usize {
+        size_of(&self.value, &self.headers)
+    }
+}
+
+/// A partition's batch sent (or to send again): its messages, its encoded bytes.
+struct Sent<O> {
+    msgs: Vec<Pending<O>>,
+    bytes: Arc<Vec<u8>>,
+    /// a broker thread has it in a request now
+    sending: bool,
+    /// may be sent (again) from then
+    retry_at: Instant,
+    attempts: u32,
+}
+
+struct Part<O> {
+    queue: VecDeque<Pending<O>>,
+    seq: i32,
+    inflight: Option<Sent<O>>,
+    leader: Option<i32>,
+}
+
+struct Topic<O> {
+    partitions: Vec<i32>,
+    /// the partition keyless messages go to now (librdkafka's sticky partitioner)
+    sticky: usize,
+    unassigned: VecDeque<Pending<O>>,
+    parts: HashMap<i32, Part<O>>,
+    /// the metadata said the topic does not exist
+    missing: Option<Code>,
+}
+
+/// An outcome for `poll` to hand over: topic, partition, offset, error, the message's opaque.
+type Report<O> = (String, Option<i32>, Option<i64>, Option<Error>, O);
+
+struct State<O> {
+    topics: HashMap<String, Topic<O>>,
+    pid: Option<(i64, i16)>,
+    fatal: Option<(Code, String)>,
+    /// brokers with a thread of their own, and their addresses
+    brokers: HashMap<i32, String>,
+    threads: Vec<i32>,
+    /// messages sent, not yet reported to `poll`
+    outstanding: usize,
+    /// of those, still in a queue or a batch (what `queue.buffering.max.*` bounds)
+    queued: usize,
+    queued_bytes: usize,
+    reports: VecDeque<Report<O>>,
+    metadata_due: bool,
+    closing: bool,
+    rng: u64,
+}
+
+struct Shared<C: Deliveries> {
+    ctx: C,
+    s: ProducerSettings,
+    client: Client,
+    state: Mutex<State<C::Opaque>>,
+    /// a batch may be ready, metadata is due, or it closes
+    work: Condvar,
+    /// a report is ready
+    reported: Condvar,
+}
+
+/// An idempotent producer of `C`'s messages.
+pub struct Producer<C: Deliveries> {
+    shared: Arc<Shared<C>>,
+}
+
+impl<C: Deliveries> std::fmt::Debug for Producer<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Producer").field("in_flight", &self.in_flight_count()).finish_non_exhaustive()
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+impl<C: Deliveries> Producer<C> {
+    /// A producer of `cfg`'s cluster; it connects at its first message.
+    pub fn new(cfg: &Config, ctx: C) -> Result<Producer<C>> {
+        let s = cfg.producer()?;
+        let client = Client::new(cfg)?;
+        let seed = now_ms() as u64 ^ (std::process::id() as u64) << 32;
+        let state = State {
+            topics: HashMap::new(),
+            pid: None,
+            fatal: None,
+            brokers: HashMap::new(),
+            threads: vec![],
+            outstanding: 0,
+            queued: 0,
+            queued_bytes: 0,
+            reports: VecDeque::new(),
+            metadata_due: false,
+            closing: false,
+            rng: seed | 1,
+        };
+        let shared = Arc::new(Shared {
+            ctx,
+            s,
+            client,
+            state: Mutex::new(state),
+            work: Condvar::new(),
+            reported: Condvar::new(),
+        });
+        let m = shared.clone();
+        std::thread::Builder::new()
+            .name("brrrrr-kafka-producer".into())
+            .spawn(move || manage(&m))
+            .map_err(|e| Error::Transport(format!("a thread for the producer: {e}")))?;
+        Ok(Producer { shared })
+    }
+
+    pub fn context(&self) -> &C {
+        &self.shared.ctx
+    }
+
+    /// Its cluster's control plane (metadata, offsets), on connections of its own.
+    pub fn client(&self) -> &Client {
+        &self.shared.client
+    }
+
+    /// Queues `value` (with `headers`) for `topic`, to a partition this producer picks (no key);
+    /// its outcome to `delivery` with `opaque`. QueueFull: the queue is at its bound
+    /// (`queue.buffering.max.messages`, `.kbytes`): `poll` and send it again. Fatal: the producer
+    /// can deliver nothing more.
+    pub fn send(
+        &self,
+        topic: &str,
+        value: &[u8],
+        headers: &[(String, Option<Vec<u8>>)],
+        opaque: C::Opaque,
+    ) -> std::result::Result<(), (Error, C::Opaque)> {
+        let sh = &*self.shared;
+        let mut guard = sh.lock();
+        let st = &mut *guard;
+        if let Some((c, m)) = &st.fatal {
+            return Err((Error::Fatal(*c, m.clone()), opaque));
+        }
+        if st.closing {
+            return Err((Error::Transport("the producer is closing".into()), opaque));
+        }
+        let size = size_of(value, headers);
+        if st.queued >= sh.s.queue_messages || st.queued_bytes + size > sh.s.queue_bytes {
+            return Err((Error::QueueFull, opaque));
+        }
+        if size + records::HEADER > sh.s.max_batch {
+            return Err((Error::Broker(Code::MESSAGE_TOO_LARGE, format!("a message of {size} bytes")), opaque));
+        }
+        let now = Instant::now();
+        let p = Pending {
+            value: value.to_vec(),
+            headers: headers.to_vec(),
+            timestamp: now_ms(),
+            opaque,
+            deadline: now + sh.s.message_timeout,
+            enqueued: now,
+        };
+        st.outstanding += 1;
+        st.queued += 1;
+        st.queued_bytes += size;
+        let t = st.topics.entry(topic.to_string()).or_insert_with(|| Topic {
+            partitions: vec![],
+            sticky: 0,
+            unassigned: VecDeque::new(),
+            parts: HashMap::new(),
+            missing: None,
+        });
+        // the threads woken only when something is due sooner than they wait for: a partition's
+        // first message (its linger starts), a batch filled, a topic to look up
+        let mut wake = true;
+        match t.partitions.get(t.sticky) {
+            Some(&part) => {
+                let q = &mut t.parts.get_mut(&part).expect("a partition of the topic").queue;
+                q.push_back(p);
+                wake = q.len() == 1 || q.len().is_multiple_of(sh.s.batch_messages);
+                // a batch's worth on this partition: the next go to another (KIP-480's sticky
+                // partitioner, as librdkafka's)
+                if q.len().is_multiple_of(sh.s.batch_messages) {
+                    t.rotate(xorshift(&mut st.rng));
+                }
+            }
+            None => t.unassigned.push_back(p), // a topic without partitions is looked up
+        }
+        drop(guard);
+        if wake {
+            sh.work.notify_all();
+        }
+        Ok(())
+    }
+
+    /// Hands the outcomes ready to the context's `delivery`, waiting up to `timeout` for one:
+    /// how many. What is past `message.timeout.ms` is timed out here too, when due: the threads
+    /// may be in a lookup, or waiting out its backoff.
+    pub fn poll(&self, timeout: Duration) -> usize {
+        let sh = &*self.shared;
+        let until = Instant::now() + timeout;
+        let mut st = sh.lock();
+        loop {
+            let now = Instant::now();
+            expire(&mut st, now);
+            if !st.reports.is_empty() || now >= until {
+                break;
+            }
+            // a batch being sent past its deadline is not timed out here: its answer is waited for
+            let wake = next_deadline(&st).map_or(until, |d| d.max(now + Duration::from_millis(1)).min(until));
+            st = sh.reported.wait_timeout(st, wake.saturating_duration_since(now)).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        let ready: Vec<_> = st.reports.drain(..).collect();
+        drop(st);
+        let n = ready.len();
+        for (topic, partition, offset, error, opaque) in ready {
+            sh.ctx.delivery(&Delivery { topic: &topic, partition, offset, error: error.as_ref() }, opaque);
+            sh.lock().outstanding -= 1;
+        }
+        n
+    }
+
+    /// The messages sent whose outcome `poll` has not handed over yet (librdkafka's outq_len).
+    pub fn in_flight_count(&self) -> usize {
+        self.shared.lock().outstanding
+    }
+
+    /// Polls until every message's outcome is handed over, within `timeout`.
+    pub fn flush(&self, timeout: Duration) -> Result<()> {
+        let until = Instant::now() + timeout;
+        while self.in_flight_count() > 0 {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Error::Timeout(format!("{} messages not delivered", self.in_flight_count())));
+            }
+            self.poll(left.min(Duration::from_millis(100)));
+        }
+        Ok(())
+    }
+
+    /// Fails every message not yet in a request (Purged): what is in flight may still land.
+    pub fn purge_queue(&self) {
+        let mut st = self.shared.lock();
+        let st = &mut *st;
+        for (name, t) in st.topics.iter_mut() {
+            let mut gone: Vec<(Option<i32>, Pending<C::Opaque>)> = t.unassigned.drain(..).map(|p| (None, p)).collect();
+            for (id, part) in t.parts.iter_mut() {
+                gone.extend(part.queue.drain(..).map(|p| (Some(*id), p)));
+            }
+            for (partition, p) in gone {
+                st.queued -= 1;
+                st.queued_bytes -= p.size();
+                st.reports.push_back((name.clone(), partition, None, Some(Error::Purged), p.opaque));
+            }
+        }
+        self.shared.reported.notify_all();
+    }
+
+    /// The error that made the producer fatal, if one did.
+    pub fn fatal_error(&self) -> Option<(Code, String)> {
+        self.shared.lock().fatal.clone()
+    }
+}
+
+impl<C: Deliveries> Drop for Producer<C> {
+    /// Its threads end after their request in flight; what is queued is not sent.
+    fn drop(&mut self) {
+        self.purge_queue();
+        self.shared.lock().closing = true;
+        self.shared.work.notify_all();
+    }
+}
+
+impl<C: Deliveries> Shared<C> {
+    fn lock(&self) -> MutexGuard<'_, State<C::Opaque>> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl<O> State<O> {
+    fn report(
+        &mut self,
+        topic: &str,
+        partition: Option<i32>,
+        offset: Option<i64>,
+        error: Option<Error>,
+        p: Pending<O>,
+    ) {
+        self.queued -= 1;
+        self.queued_bytes -= p.size();
+        self.reports.push_back((topic.to_string(), partition, offset, error, p.opaque));
+    }
+
+    fn set_fatal(&mut self, code: Code, why: String) {
+        if self.fatal.is_none() {
+            self.fatal = Some((code, why));
+        }
+    }
+}
+
+/// The next of a xorshift sequence: which partition a keyless batch goes to need not be
+/// unpredictable, only spread.
+fn xorshift(rng: &mut u64) -> u64 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    *rng
+}
+
+impl<O> Topic<O> {
+    /// Keyless messages go to another partition from now on (`r` picks which), if there is one.
+    fn rotate(&mut self, r: u64) {
+        let n = self.partitions.len();
+        if n > 1 {
+            self.sticky = (self.sticky + 1 + (r % (n as u64 - 1)) as usize) % n;
+        }
+    }
+}
+
+/// The producer's own thread: the metadata, the producer id, messages given up, a thread for each
+/// broker leading a partition.
+fn manage<C: Deliveries>(sh: &Arc<Shared<C>>) {
+    let mut backoff = sh.s.retry_backoff;
+    loop {
+        let mut st = sh.lock();
+        if st.closing {
+            return;
+        }
+        expire(&mut st, Instant::now());
+        if st.fatal.is_some() {
+            fail_queued(&mut st);
+        }
+        sh.reported.notify_all();
+        let need_metadata = st.metadata_due || unresolved(&st);
+        // at once, not at the first message (librdkafka's idempotent producer too): the first
+        // message then waits on the metadata and its leader's connection alone
+        let need_pid = st.pid.is_none() && st.fatal.is_none();
+        if !need_metadata && !need_pid {
+            let wait =
+                next_deadline(&st).map_or(Duration::from_millis(100), |d| d.saturating_duration_since(Instant::now()));
+            let _ = sh.work.wait_timeout(st, wait.clamp(Duration::from_millis(1), Duration::from_millis(100)));
+            continue;
+        }
+        st.metadata_due = false;
+        let asked: Vec<String> = st.topics.keys().cloned().collect();
+        // a lookup never holds back a message's timeout by more than its last 100 ms
+        let until_due =
+            next_deadline(&st).map_or(Duration::from_secs(5), |d| d.saturating_duration_since(Instant::now()));
+        drop(st);
+        let timeout = sh.s.request_timeout.min(Duration::from_secs(5)).min(until_due).max(Duration::from_millis(100));
+        let mut failed = false;
+        if need_metadata {
+            let names: Vec<&str> = asked.iter().map(String::as_str).collect();
+            match sh.client.metadata(Some(&names), timeout) {
+                Ok(md) => {
+                    apply_metadata(sh, &md);
+                    // a topic still without partitions or a leader (being created, a leader
+                    // elected) is looked up again after the backoff, not at once
+                    failed = unresolved(&sh.lock());
+                }
+                Err(_) => failed = true,
+            }
+        }
+        if need_pid {
+            match init_producer_id(&sh.client, timeout) {
+                Ok(pid) => {
+                    sh.lock().pid = Some(pid);
+                    sh.work.notify_all();
+                }
+                Err(Error::Broker(c, _)) if !c.retriable() => sh.lock().set_fatal(c, "InitProducerId refused".into()),
+                Err(_) => failed = true,
+            }
+        }
+        if failed {
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(sh.s.retry_backoff_max);
+        } else {
+            backoff = sh.s.retry_backoff;
+        }
+    }
+}
+
+/// Whether a topic has no partitions known yet, or a partition no leader.
+fn unresolved<O>(st: &State<O>) -> bool {
+    st.topics.values().any(|t| t.partitions.is_empty() || t.parts.values().any(|p| p.leader.is_none()))
+}
+
+fn init_producer_id(client: &Client, timeout: Duration) -> Result<(i64, i16)> {
+    let frame = client.call_any(wire::INIT_PRODUCER_ID, &wire::init_producer_id_request, timeout)?;
+    match wire::init_producer_id(Cur::new(&frame))? {
+        (Code::NONE, pid, epoch) => Ok((pid, epoch)),
+        (c, _, _) => Err(Error::Broker(c, "InitProducerId".into())),
+    }
+}
+
+/// The partitions and leaders the metadata names; a thread started for each new leader.
+fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
+    let mut st = sh.lock();
+    let st = &mut *st;
+    for b in &md.brokers {
+        st.brokers.insert(b.id, format!("{}:{}", b.host, b.port));
+    }
+    let mut new_leaders = vec![];
+    for (name, t) in st.topics.iter_mut() {
+        let Some(m) = md.topic(name) else { continue };
+        if m.error != Code::NONE {
+            t.missing = Some(m.error);
+            continue;
+        }
+        t.missing = None;
+        let mut ps: Vec<i32> = m.partitions.iter().map(|p| p.id).collect();
+        ps.sort_unstable();
+        if t.partitions.is_empty() && !ps.is_empty() {
+            t.sticky = (st.rng % ps.len() as u64) as usize;
+        }
+        t.partitions = ps;
+        for p in &m.partitions {
+            let part = t.parts.entry(p.id).or_insert_with(|| Part {
+                queue: VecDeque::new(),
+                seq: 0,
+                inflight: None,
+                leader: None,
+            });
+            part.leader = (p.leader >= 0).then_some(p.leader);
+            if p.leader >= 0 && !st.threads.contains(&p.leader) && !new_leaders.contains(&p.leader) {
+                new_leaders.push(p.leader);
+            }
+        }
+        // what was sent before the topic's partitions were known: a batch's worth a partition
+        while !t.unassigned.is_empty() && !t.partitions.is_empty() {
+            let part = t.partitions[t.sticky % t.partitions.len()];
+            let n = t.unassigned.len().min(sh.s.batch_messages);
+            let moved: Vec<_> = t.unassigned.drain(..n).collect();
+            t.parts.get_mut(&part).expect("a partition").queue.extend(moved);
+            if n == sh.s.batch_messages {
+                t.rotate(xorshift(&mut st.rng));
+            }
+        }
+    }
+    for id in new_leaders {
+        st.threads.push(id);
+        let sh = sh.clone();
+        let spawned =
+            std::thread::Builder::new().name(format!("brrrrr-kafka-broker-{id}")).spawn(move || broker(&sh, id));
+        if spawned.is_err() {
+            st.threads.retain(|t| *t != id); // tried again at the next metadata
+        }
+    }
+    sh.work.notify_all();
+}
+
+/// Messages queued past their deadline given up; a batch in flight past its first message's
+/// deadline too, which makes the producer fatal (the broker may have written it).
+fn expire<O>(st: &mut State<O>, now: Instant) {
+    let mut gone = vec![];
+    let mut gap = None;
+    for (name, t) in st.topics.iter_mut() {
+        let missing = t.missing;
+        let why = || match missing {
+            Some(c) => Error::Broker(c, format!("topic {name}")),
+            None => Error::MessageTimedOut,
+        };
+        while t.unassigned.front().is_some_and(|p| p.deadline <= now) {
+            gone.push((name.clone(), None, why(), t.unassigned.pop_front().expect("one")));
+        }
+        for (id, part) in t.parts.iter_mut() {
+            while part.queue.front().is_some_and(|p| p.deadline <= now) {
+                gone.push((name.clone(), Some(*id), Error::MessageTimedOut, part.queue.pop_front().expect("one")));
+            }
+            let timed_out = part.inflight.as_ref().is_some_and(|s| !s.sending && s.msgs[0].deadline <= now);
+            if timed_out {
+                let s = part.inflight.take().expect("in flight");
+                gap = Some(format!("{name}/{id}: a batch timed out in flight (message.timeout.ms)"));
+                gone.extend(s.msgs.into_iter().map(|p| (name.clone(), Some(*id), Error::MessageTimedOut, p)));
+            }
+        }
+    }
+    for (t, p, e, m) in gone {
+        st.report(&t, p, None, Some(e), m);
+    }
+    if let Some(why) = gap {
+        st.set_fatal(Code::MSG_TIMED_OUT, why);
+    }
+}
+
+fn fail_queued<O>(st: &mut State<O>) {
+    let (c, m) = st.fatal.clone().expect("fatal");
+    let mut gone = vec![];
+    for (name, t) in st.topics.iter_mut() {
+        gone.extend(t.unassigned.drain(..).map(|p| (name.clone(), None, p)));
+        for (id, part) in t.parts.iter_mut() {
+            gone.extend(part.queue.drain(..).map(|p| (name.clone(), Some(*id), p)));
+            if part.inflight.as_ref().is_some_and(|s| !s.sending) {
+                gone.extend(part.inflight.take().expect("one").msgs.into_iter().map(|p| (name.clone(), Some(*id), p)));
+            }
+        }
+    }
+    for (t, p, msg) in gone {
+        st.report(&t, p, None, Some(Error::Fatal(c, m.clone())), msg);
+    }
+}
+
+fn next_deadline<O>(st: &State<O>) -> Option<Instant> {
+    (st.topics.values())
+        .flat_map(|t| {
+            let parts =
+                t.parts.values().flat_map(|p| p.queue.front().into_iter().chain(p.inflight.iter().map(|s| &s.msgs[0])));
+            t.unassigned.front().into_iter().chain(parts)
+        })
+        .map(|p| p.deadline)
+        .min()
+}
+
+/// What a broker thread sends next: per partition (topic, partition, its batch's bytes, its
+/// first message's deadline).
+type Request = Vec<(String, i32, Arc<Vec<u8>>, Instant)>;
+
+/// The batches broker `id` leads that are due, taken (marked sending): sealed from their queues
+/// where none is in flight (once lingered, or full), sent again where one is.
+fn take_due<C: Deliveries>(
+    sh: &Shared<C>,
+    st: &mut State<C::Opaque>,
+    id: i32,
+    now: Instant,
+) -> (Request, Option<Instant>) {
+    let s = &sh.s;
+    let mut out: Request = vec![];
+    let mut next: Option<Instant> = None;
+    // what is past its deadline is given up here, whichever thread runs first after a stall:
+    // nothing is sent past `message.timeout.ms` (a lease fence rests on it)
+    expire(st, now);
+    if st.fatal.is_some() {
+        // nothing more is sent: what is queued fails with the fatal error (`fail_queued`)
+        fail_queued(st);
+        return (out, None);
+    }
+    let Some((pid, epoch)) = st.pid else { return (out, None) };
+    let (mut sealed, mut failed) = (vec![], vec![]);
+    for (name, t) in st.topics.iter_mut() {
+        for (&pnum, part) in t.parts.iter_mut().filter(|(_, p)| p.leader == Some(id)) {
+            if let Some(sent) = &mut part.inflight {
+                if !sent.sending && sent.retry_at <= now {
+                    sent.sending = true;
+                    sent.attempts += 1;
+                    out.push((name.clone(), pnum, sent.bytes.clone(), sent.msgs[0].deadline));
+                } else if !sent.sending {
+                    next = Some(next.map_or(sent.retry_at, |n| n.min(sent.retry_at)));
+                }
+                continue;
+            }
+            let Some(first) = part.queue.front() else { continue };
+            let ready = first.enqueued + s.linger;
+            let (mut n, mut bytes, limit) = (0, records::HEADER, s.batch_bytes.min(s.max_batch));
+            for p in &part.queue {
+                if n == s.batch_messages || (n > 0 && bytes + p.size() > limit) {
+                    break;
+                }
+                n += 1;
+                bytes += p.size();
+            }
+            // full: a message left for the next batch, as many as a batch takes, or no room for
+            // even an empty record (`size_of`)
+            let full = n < part.queue.len() || n == s.batch_messages || bytes + size_of(&[], &[]) > limit;
+            if ready > now && !full {
+                next = Some(next.map_or(ready, |x| x.min(ready)));
+                continue; // lingering: more may join the batch
+            }
+            let msgs: Vec<_> = part.queue.drain(..n).collect();
+            let outs: Vec<Out<'_>> = msgs
+                .iter()
+                .map(|p| Out { timestamp: p.timestamp, key: None, value: Some(&p.value), headers: &p.headers })
+                .collect();
+            let mut b = vec![];
+            let written = records::write(
+                &mut b,
+                &outs,
+                Stamp { producer_id: pid, epoch, base_sequence: part.seq },
+                s.codec,
+                &mut vec![],
+            );
+            drop(outs);
+            match written {
+                Err(e) => failed.push((name.clone(), pnum, msgs, e)),
+                Ok(()) => {
+                    // Kafka's sequences wrap to 0 past i32::MAX
+                    part.seq = part.seq.wrapping_add(n as i32) & i32::MAX;
+                    let bytes = Arc::new(b);
+                    out.push((name.clone(), pnum, bytes.clone(), msgs[0].deadline));
+                    part.inflight = Some(Sent { msgs, bytes, sending: true, retry_at: now, attempts: 1 });
+                    sealed.push((name.clone(), pnum));
+                }
+            }
+        }
+    }
+    for (name, pnum, msgs, e) in failed {
+        for m in msgs {
+            st.report(&name, Some(pnum), None, Some(e.clone()), m);
+        }
+    }
+    // the next keyless messages go to another partition: a partition a batch (librdkafka's sticky
+    // partitioner)
+    for (name, pnum) in sealed {
+        let t = st.topics.get_mut(&name).expect("the topic");
+        if t.partitions.get(t.sticky) == Some(&pnum) {
+            t.rotate(xorshift(&mut st.rng));
+        }
+    }
+    (out, next)
+}
+
+/// A broker's thread: its partitions' batches sent as they are due, the answers applied. It
+/// connects at once, before its first batch is due.
+fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
+    let addr = sh.lock().brokers.get(&id).cloned();
+    let mut conn: Option<Conn> = addr.and_then(|a| Conn::open(sh.client.net(), &a).ok());
+    let mut backoff = sh.s.retry_backoff;
+    loop {
+        let mut st = sh.lock();
+        let req = loop {
+            if st.closing || !st.topics.values().any(|t| t.parts.values().any(|p| p.leader == Some(id))) {
+                st.threads.retain(|t| *t != id);
+                return;
+            }
+            let now = Instant::now();
+            let (req, next) = take_due(sh, &mut st, id, now);
+            sh.reported.notify_all();
+            if !req.is_empty() {
+                break req;
+            }
+            let wait = next.map_or(Duration::from_millis(100), |n| n.saturating_duration_since(now));
+            st = sh
+                .work
+                .wait_timeout(st, wait.clamp(Duration::from_micros(200), Duration::from_millis(100)))
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        };
+        let addr = st.brokers.get(&id).cloned();
+        drop(st);
+        let answer = send(sh, &mut conn, id, addr, &req);
+        let mut st = sh.lock();
+        match answer {
+            Ok((results, throttle_ms)) => {
+                backoff = sh.s.retry_backoff;
+                applied(sh, &mut st, &req, results);
+                if throttle_ms > 0 {
+                    // the broker asked for the wait before the next request (KIP-219)
+                    drop(st);
+                    sh.reported.notify_all();
+                    std::thread::sleep(Duration::from_millis(throttle_ms as u64).min(Duration::from_secs(30)));
+                    continue;
+                }
+            }
+            Err(e) => {
+                conn = None;
+                // every batch of the request sent again, after a backoff and a metadata refresh
+                let at = Instant::now() + backoff;
+                backoff = (backoff * 2).min(sh.s.retry_backoff_max);
+                for (t, p, _, _) in &req {
+                    if let Some(sent) =
+                        st.topics.get_mut(t).and_then(|t| t.parts.get_mut(p)).and_then(|p| p.inflight.as_mut())
+                    {
+                        sent.sending = false;
+                        sent.retry_at = at;
+                    }
+                }
+                if matches!(e, Error::Auth(_) | Error::Unsupported(_)) {
+                    st.set_fatal(Code::AUTHENTICATION, format!("broker {id}: {e}"));
+                }
+                st.metadata_due = true;
+            }
+        }
+        drop(st);
+        sh.work.notify_all();
+        sh.reported.notify_all();
+    }
+}
+
+fn send<C: Deliveries>(
+    sh: &Shared<C>,
+    conn: &mut Option<Conn>,
+    id: i32,
+    addr: Option<String>,
+    req: &Request,
+) -> Result<(Vec<wire::Produced>, i32)> {
+    if conn.is_none() {
+        let addr = addr.ok_or_else(|| Error::Transport(format!("broker {id}: no address")))?;
+        *conn = Some(Conn::open(sh.client.net(), &addr)?);
+    }
+    let c = conn.as_mut().expect("connected");
+    // given up at the first message's deadline (message.timeout.ms bounds a request in flight,
+    // as librdkafka bounds it): the broker is asked to answer by then, and the connection is
+    // dropped if it has not
+    let first = req.iter().map(|r| r.3).min().expect("a batch");
+    let left = first.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        // stalled between taking it and sending it: not sent, given up as timed out
+        return Err(Error::Timeout("past the message timeout before it was sent".into()));
+    }
+    let timeout = sh.s.request_timeout.min(left);
+    c.set_request_timeout(left.min(sh.s.request_timeout + sh.client.net().request_timeout));
+    let batches: Vec<(&str, (i32, &[u8]))> = req.iter().map(|(t, p, b, _)| (t.as_str(), (*p, b.as_slice()))).collect();
+    let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX).max(1);
+    let frame = c.call(wire::PRODUCE, |o| wire::produce_request(o, -1, ms, &batches))?;
+    wire::produce(Cur::new(&frame), c.version(wire::PRODUCE))
+}
+
+/// A Produce answered: each batch delivered, sent again, or failed (the producer then fatal).
+fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Request, results: Vec<wire::Produced>) {
+    let now = Instant::now();
+    let mut done = vec![];
+    for (t, p, _, _) in req {
+        let r = results.iter().find(|r| r.topic == *t && r.partition == *p);
+        let Some(part) = st.topics.get_mut(t).and_then(|x| x.parts.get_mut(p)) else { continue };
+        let Some(mut sent) = part.inflight.take() else { continue };
+        sent.sending = false;
+        // a partition the answer left out: as a broker that failed it
+        let code = r.map_or(Code::UNKNOWN_SERVER_ERROR, |r| r.error);
+        // what the broker said, if it said more than its code (the topic and partition are the
+        // delivery's own)
+        let why = r.and_then(|r| r.message.clone()).unwrap_or_default();
+        match code {
+            Code::NONE | Code::DUPLICATE_SEQUENCE_NUMBER => {
+                // a duplicate: written before, its answer lost (librdkafka: delivered, offset unknown)
+                let base = r.map(|r| r.base_offset).filter(|o| *o >= 0 && code == Code::NONE);
+                done.push((t.clone(), *p, sent.msgs, Ok(base)));
+            }
+            c if c.retriable() => {
+                if c.stale_metadata() {
+                    part.leader = None;
+                    st.metadata_due = true;
+                }
+                sent.retry_at = now + sh.s.retry_backoff * sent.attempts.min(10);
+                part.inflight = Some(sent);
+            }
+            c => done.push((t.clone(), *p, sent.msgs, Err((c, why)))),
+        }
+    }
+    for (t, p, msgs, r) in done {
+        match r {
+            Ok(base) => {
+                for (i, m) in msgs.into_iter().enumerate() {
+                    st.report(&t, Some(p), base.map(|b| b + i as i64), None, m);
+                }
+            }
+            Err((c, why)) => {
+                // refused for good: the broker's sequence for the partition has a gap now
+                for m in msgs {
+                    st.report(&t, Some(p), None, Some(Error::Broker(c, why.clone())), m);
+                }
+                st.set_fatal(
+                    c,
+                    format!(
+                        "a batch to {t}/{p} refused{}",
+                        if why.is_empty() { String::new() } else { format!(": {why}") }
+                    ),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
