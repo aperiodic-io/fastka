@@ -1,5 +1,7 @@
 //! Record batches, magic v2 (Kafka 0.11+, `DefaultRecordBatch.java`, `DefaultRecord.java`):
-//! read where they lie in a Fetch response, and written for a Produce request.
+//! read where they lie in a Fetch response (every codec, read_committed), and written for a
+//! Produce request. Low level: the consumer and producer use it; it is public for tools that
+//! handle a Fetch's bytes themselves.
 //!
 //! A batch: base offset (8), length (4), partition leader epoch (4), magic (1), CRC-32C (4) of
 //! what follows it, attributes (2: bits 0-2 the codec, 3 LogAppendTime, 4 transactional,
@@ -7,6 +9,9 @@
 //! base sequence (4), the record count (4), then the records, compressed as a whole.
 //! A record: its length, attributes (1), timestamp delta, offset delta, key, value and headers,
 //! lengths as zigzag varints, -1 for null.
+//!
+//! Reading: [`batches`] and [`scan`] walk the headers, [`read`] gives each [`Record`]. Writing:
+//! [`write()`] makes one batch of [`Out`] records.
 use crate::error::{Error, Result};
 use crate::wire::{put_var, Cur, Put};
 use std::io::{BufRead, Read, Write};
@@ -15,10 +20,15 @@ use std::io::{BufRead, Read, Write};
 pub const HEADER: usize = 61;
 const CRC_FROM: usize = 21; // the CRC covers the attributes onwards
 
+/// Codec 0: records not compressed (a batch's attributes, bits 0-2).
 pub const NONE: i16 = 0;
+/// Codec 1: gzip.
 pub const GZIP: i16 = 1;
+/// Codec 2: snappy.
 pub const SNAPPY: i16 = 2;
+/// Codec 3: lz4 (frames).
 pub const LZ4: i16 = 3;
+/// Codec 4: zstd.
 pub const ZSTD: i16 = 4;
 
 const LOG_APPEND_TIME: i16 = 0x08;
@@ -28,18 +38,27 @@ const CONTROL: i16 = 0x20;
 /// A batch's header, its records not read yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Batch<'a> {
+    /// Its first record's offset (at least 0).
     pub base_offset: i64,
+    /// Its last record's offset, less `base_offset` (at least 0).
     pub last_offset_delta: i32,
+    /// Its attributes: bits 0-2 the codec, 3 LogAppendTime, 4 transactional, 5 control.
     pub attributes: i16,
+    /// Its first record's timestamp, ms since the Unix epoch.
     pub base_timestamp: i64,
+    /// Its latest record's timestamp, ms (the broker's, with LogAppendTime).
     pub max_timestamp: i64,
+    /// The producer id of an idempotent or transactional producer; -1 for none.
     pub producer_id: i64,
+    /// Its record count, as its header says it.
     pub count: i32,
+    /// The CRC-32C of `checked`, as its header says it (not checked by [`batches`]).
     pub crc: u32,
-    /// attributes onwards: what the CRC covers
+    /// Attributes onwards: what the CRC covers.
     pub checked: &'a [u8],
-    /// the records, compressed if the attributes say
+    /// The records, compressed if the attributes say.
     pub records: &'a [u8],
+    /// The magic byte: always 2 (an older one is refused).
     pub magic: i8,
 }
 
@@ -48,12 +67,15 @@ impl Batch<'_> {
     pub fn next_offset(&self) -> i64 {
         self.base_offset + self.last_offset_delta as i64 + 1
     }
+    /// Its records' codec ([`NONE`], [`GZIP`], [`SNAPPY`], [`LZ4`] or [`ZSTD`]).
     pub fn codec(&self) -> i16 {
         self.attributes & 7
     }
+    /// Whether a transactional producer wrote it.
     pub fn transactional(&self) -> bool {
         self.attributes & TRANSACTIONAL != 0
     }
+    /// Whether it is a control batch (a transaction's commit or abort marker), not data.
     pub fn control(&self) -> bool {
         self.attributes & CONTROL != 0
     }
@@ -151,17 +173,21 @@ fn check_crc(b: &Batch<'_>, check: bool) -> Result<()> {
 /// decompressed records).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record<'a> {
+    /// Its offset in the partition.
     pub offset: i64,
-    /// ms: the producer's (CreateTime) or the broker's (LogAppendTime)
+    /// ms since the Unix epoch: the producer's (CreateTime) or the broker's (LogAppendTime).
     pub timestamp: i64,
+    /// Its key; None for null.
     pub key: Option<&'a [u8]>,
+    /// Its value; None for null (a tombstone).
     pub value: Option<&'a [u8]>,
     headers: &'a [u8],
     header_count: usize,
 }
 
 impl<'a> Record<'a> {
-    /// Its headers: (key, value or None for null).
+    /// Its headers in order: (key, value or None for null). A header that cannot be read (cut
+    /// short, a key not UTF-8) ends them.
     pub fn headers(&self) -> impl Iterator<Item = (&'a str, Option<&'a [u8]>)> + 'a {
         let mut c = Cur::new(self.headers);
         (0..self.header_count).map_while(move |_| {
@@ -174,7 +200,7 @@ impl<'a> Record<'a> {
             Some((k, v))
         })
     }
-    /// The value of its first header named `key`.
+    /// The value of its first header named `key`; None if there is none, or its value is null.
     pub fn header(&self, key: &str) -> Option<&'a [u8]> {
         self.headers().find(|(k, _)| *k == key).and_then(|(_, v)| v)
     }
@@ -184,13 +210,19 @@ impl<'a> Record<'a> {
 /// aborted transactions of the Fetch's answer, (producer id, first offset), are skipped).
 #[derive(Clone, Debug)]
 pub struct ReadOpts<'a> {
+    /// The first offset given: records before it (a batch starts before the offset asked) are
+    /// skipped.
     pub from: i64,
+    /// Read committed: control batches and aborted transactions' records skipped.
     pub committed: bool,
+    /// The Fetch response's aborted transactions, (producer id, first offset); used only when
+    /// `committed`.
     pub aborted: &'a [(i64, i64)],
-    /// a batch whose CRC-32C does not match is refused (`check.crcs`, on by default here)
+    /// A batch whose CRC-32C does not match is refused (`check.crcs`; off in `Default`, on by
+    /// default in the consumer's settings).
     pub check_crcs: bool,
-    /// the most a batch's records may decompress to: a few KB of zstd from any producer to the
-    /// topic can be gigabytes (`DEFAULT_MAX_DECOMPRESSED` by default)
+    /// The most a batch's records may decompress to, bytes: a few KB of zstd from any producer
+    /// to the topic can be gigabytes ([`DEFAULT_MAX_DECOMPRESSED`] by default).
     pub max_decompressed: usize,
 }
 
@@ -420,22 +452,37 @@ pub fn compress(codec: i16, plain: &[u8], out: &mut Vec<u8>) -> Result<()> {
 /// A record to write: its timestamp (ms), key, value and headers.
 #[derive(Clone, Copy, Debug)]
 pub struct Out<'a> {
+    /// ms since the Unix epoch (CreateTime).
     pub timestamp: i64,
+    /// Its key; None for null.
     pub key: Option<&'a [u8]>,
+    /// Its value; None for null (a tombstone).
     pub value: Option<&'a [u8]>,
+    /// Its headers in order: (key, value; None for null).
     pub headers: &'a [(String, Option<Vec<u8>>)],
 }
 
 /// The idempotent producer's stamp on a batch: its id, epoch and the first record's sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
+    /// The producer id (InitProducerId's); -1 for none.
     pub producer_id: i64,
+    /// The producer's epoch; -1 for none.
     pub epoch: i16,
+    /// The batch's first record's sequence number; -1 for none.
     pub base_sequence: i32,
 }
 
 /// A batch of `records` (at least one) into `out`, base offset 0 (the broker assigns it), its
-/// records compressed by `codec`; `scratch` is reused.
+/// records compressed by `codec`; `scratch` is reused. `out` is cleared first.
+///
+/// # Errors
+///
+/// [`Error::Config`]: a `codec` Kafka does not read, compression failing, or a batch over 2 GiB.
+///
+/// # Panics
+///
+/// If `records` is empty.
 pub fn write(out: &mut Vec<u8>, records: &[Out<'_>], stamp: Stamp, codec: i16, scratch: &mut Vec<u8>) -> Result<()> {
     assert!(!records.is_empty(), "a batch holds a record");
     let base_ts = records[0].timestamp;

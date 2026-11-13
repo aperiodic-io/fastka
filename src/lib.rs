@@ -8,8 +8,6 @@ pub mod error;
 pub mod producer;
 #[cfg(kani)]
 mod proofs;
-/// Record batches v2: read (every codec, read_committed) and written. Low level: the consumer
-/// and producer use it; it is public for tools that handle a Fetch's bytes themselves.
 pub mod records;
 pub(crate) mod sasl;
 #[cfg(test)]

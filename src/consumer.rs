@@ -25,9 +25,12 @@ use std::time::{Duration, Instant};
 /// Where a partition is read from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Offset {
+    /// The partition's first offset (its log start), looked up when the partition is resolved.
     Beginning,
+    /// The partition's end (the last stable offset with `isolation.level=read_committed`, else
+    /// the high watermark), looked up when the partition is resolved: only later records are read.
     End,
-    /// at least 0
+    /// This offset; at least 0, or [`Consumer::new`] and [`Consumer::seek`] refuse it.
     At(i64),
 }
 
@@ -42,16 +45,21 @@ fn checked(t: &str, p: i32, o: Offset) -> Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct Message {
+    /// Its offset in the partition.
     pub offset: i64,
-    /// ms
+    /// Its timestamp, ms since the Unix epoch: the producer's (CreateTime) or the broker's
+    /// (LogAppendTime), as the topic's `message.timestamp.type` says.
     pub timestamp: i64,
+    /// Its key; None for a null key.
     pub key: Option<Vec<u8>>,
-    /// None: a tombstone
+    /// Its value; None for a null value (a tombstone, on a compacted topic).
     pub value: Option<Vec<u8>>,
+    /// Its headers in order, (name, value; None for a null value). A name may repeat.
     pub headers: Vec<(String, Option<Vec<u8>>)>,
 }
 
 impl Message {
+    /// The value of its first header named `k`; None if there is none, or its value is null.
     pub fn header(&self, k: &str) -> Option<&[u8]> {
         self.headers.iter().find(|(n, _)| n == k).and_then(|(_, v)| v.as_deref())
     }
@@ -61,11 +69,12 @@ impl Message {
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Polled {
+    /// The partition's next message.
     Msg(Message),
     /// The partition's end: every record it held when it was fetched last has been given
     /// (with `enable.partition.eof`).
     Eof,
-    /// nothing yet (or the partition is paused)
+    /// Nothing yet (or the partition is paused).
     Empty,
 }
 
@@ -79,6 +88,8 @@ pub struct Assignment {
 }
 
 impl Assignment {
+    /// Partition `partition` of `topic`, read from `offset`, not paused. An offset below 0 is
+    /// refused by [`Consumer::new`], not here.
     pub fn new(topic: impl Into<String>, partition: i32, offset: Offset) -> Assignment {
         Assignment { topic: topic.into(), partition, offset, paused: false }
     }
@@ -94,7 +105,16 @@ impl Assignment {
 pub enum Notice {
     /// The partition's offset `from` was out of range: read on from `to` (`auto.offset.reset`).
     /// The records between are not given.
-    Reset { topic: String, partition: i32, from: i64, to: i64 },
+    Reset {
+        /// The partition's topic.
+        topic: String,
+        /// The partition's number.
+        partition: i32,
+        /// The offset found out of range.
+        from: i64,
+        /// The offset read on from.
+        to: i64,
+    },
     /// Something tried again (a connection lost, a leader moved, a lookup failed): no record is
     /// lost or given twice for it.
     Retrying(String),
@@ -196,6 +216,11 @@ struct Part {
 }
 
 /// The Fetch of the partitions assigned it, on the caller's thread.
+///
+/// Made with [`Consumer::from_config`] (or [`Consumer::new`] on a shared [`Client`]). Drive it
+/// with [`next_event`](Consumer::next_event), or with [`pump`](Consumer::pump) and then
+/// [`poll`](Consumer::poll) / [`next_any`](Consumer::next_any). Partitions are named by their
+/// index in the assignment ([`partitions`](Consumer::partitions)).
 pub struct Consumer {
     client: Arc<Client>,
     net: Arc<Net>,
@@ -229,8 +254,12 @@ impl std::fmt::Debug for Consumer {
 }
 
 impl Consumer {
-    /// A consumer of `parts` on `client`'s cluster. An error: a partition assigned twice, or an
-    /// offset below 0.
+    /// A consumer of `parts` on `client`'s cluster, with settings `s` (from
+    /// [`Config::consumer`]). Nothing is sent until it is pumped.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`]: a partition assigned twice, or an [`Offset::At`] below 0.
     pub fn new(client: Arc<Client>, s: ConsumerSettings, parts: Vec<Assignment>) -> Result<Consumer> {
         for (i, a) in parts.iter().enumerate() {
             checked(&a.topic, a.partition, a.offset)?;
@@ -277,6 +306,12 @@ impl Consumer {
     }
 
     /// A consumer of `parts`, its client and settings made of `cfg`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`]: a setting unknown or invalid (see [`Config::net`] and
+    /// [`Config::consumer`]), TLS material that cannot be loaded, or what [`Consumer::new`]
+    /// refuses. No broker is contacted.
     pub fn from_config(cfg: &Config, parts: Vec<Assignment>) -> Result<Consumer> {
         Consumer::new(Arc::new(Client::new(cfg)?), cfg.consumer()?, parts)
     }
@@ -291,9 +326,12 @@ impl Consumer {
         self.parts.iter().map(|p| (p.topic.as_str(), p.partition))
     }
 
-    /// The next offset partition `i` gives (None: not resolved yet), past what is queued.
+    /// The next offset partition `i` gives: its first queued message's, else the next to fetch.
+    /// None while its [`Offset::Beginning`] or [`Offset::End`] is not resolved yet.
     ///
-    /// Panics if `i` is not an index of `partitions`.
+    /// # Panics
+    ///
+    /// If `i` is not an index of [`partitions`](Consumer::partitions).
     pub fn position(&self, i: usize) -> Option<i64> {
         let p = &self.parts[i];
         p.queue.front().map(|m| m.offset).or(p.next)
@@ -301,9 +339,14 @@ impl Consumer {
 
     /// Partition `i` read from `offset` on: what is queued of it, and what a Fetch in flight
     /// brings of it, dropped. After `auto.offset.reset=error`'s error, where to go on from.
-    /// An error: an offset below 0 (nothing changed).
     ///
-    /// Panics if `i` is not an index of `partitions`.
+    /// # Errors
+    ///
+    /// [`Error::Config`]: an [`Offset::At`] below 0 (nothing changed).
+    ///
+    /// # Panics
+    ///
+    /// If `i` is not an index of [`partitions`](Consumer::partitions).
     pub fn seek(&mut self, i: usize, offset: Offset) -> Result<()> {
         let p = &mut self.parts[i];
         checked(&p.topic, p.partition, offset)?;
@@ -320,11 +363,13 @@ impl Consumer {
         Ok(())
     }
 
-    /// Partitions that `which` names fetched and given again, or no longer (what is queued of a
-    /// paused partition is kept for its resume).
+    /// Partitions that `which` names (topic, partition) fetched and given again after
+    /// [`pause`](Consumer::pause) or [`Assignment::paused`].
     pub fn resume(&mut self, which: impl Fn(&str, i32) -> bool) {
         self.parts.iter_mut().filter(|p| which(&p.topic, p.partition)).for_each(|p| p.paused = false);
     }
+    /// Partitions that `which` names (topic, partition) no longer fetched nor given: what is
+    /// queued of them is kept for their [`resume`](Consumer::resume).
     pub fn pause(&mut self, which: impl Fn(&str, i32) -> bool) {
         self.parts.iter_mut().filter(|p| which(&p.topic, p.partition)).for_each(|p| p.paused = true);
     }
@@ -575,7 +620,9 @@ impl Consumer {
     /// Reads what has arrived and sends the Fetches due, without blocking; `notice` hears what
     /// is mended. Whether a response arrived.
     ///
-    /// An error is one a retry did not mend: a partition's (an offset out of range with
+    /// # Errors
+    ///
+    /// One a retry did not mend: a partition's (an offset out of range with
     /// `auto.offset.reset=error`, a topic not authorized), or a broker's records that cannot be
     /// read (a corrupt batch, fetched again `CORRUPT_RETRIES` times first). The consumer stays
     /// usable after one, and no record is lost or skipped for it: the other partitions' records
@@ -843,9 +890,12 @@ impl Consumer {
         }
     }
 
-    /// Partition `i`'s next message, its end once, or nothing yet (nothing while it is paused).
+    /// Partition `i`'s next message, its end once (with `enable.partition.eof`), or nothing yet
+    /// (nothing while it is paused). Takes only what is queued: [`pump`](Consumer::pump) fetches.
     ///
-    /// Panics if `i` is not an index of `partitions`.
+    /// # Panics
+    ///
+    /// If `i` is not an index of [`partitions`](Consumer::partitions).
     pub fn poll(&mut self, i: usize) -> Polled {
         let p = &mut self.parts[i];
         if p.paused {
@@ -859,7 +909,9 @@ impl Consumer {
     }
 
     /// The next message of any partition not paused: a partition's run, up to `RUN` messages,
-    /// then the next's, so no partition waits on another's whole backlog.
+    /// then the next's, so no partition waits on another's whole backlog. Its partition's index
+    /// with it; None if nothing is queued. Takes only what is queued: [`pump`](Consumer::pump)
+    /// fetches.
     pub fn next_any(&mut self) -> Option<(usize, Message)> {
         let n = self.parts.len();
         if n == 0 {
@@ -916,9 +968,13 @@ impl Consumer {
     }
 
     /// The next event of any partition not paused (a message, or an end), waiting up to
-    /// `timeout` for one (`Duration::MAX`: until one comes).
+    /// `timeout` for one (`Duration::MAX`: until one comes), with its partition's index; None if
+    /// none came in time. It pumps at least once, even with a zero `timeout`; `notice` hears what
+    /// is mended.
     ///
-    /// An error is `pump`'s: the consumer stays usable, and no record is lost or skipped for it.
+    /// # Errors
+    ///
+    /// [`pump`](Consumer::pump)'s: the consumer stays usable, and no record is lost or skipped for it.
     pub fn next_event(&mut self, timeout: Duration, notice: &mut dyn FnMut(Notice)) -> Result<Option<(usize, Polled)>> {
         let until = Instant::now().checked_add(timeout);
         let ready = |p: &Part| !p.paused && (!p.queue.is_empty() || p.eof);

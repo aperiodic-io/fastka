@@ -2,6 +2,10 @@
 //! offsets committed. Each call is blocking, retried within its timeout where a retry can mend
 //! it (a connection lost, a leader moved, a coordinator loading), as librdkafka retries; its
 //! requests serialized on one connection a broker. `Sync`: any thread may call.
+//!
+//! The entry point is [`Client::new`]. A [`Consumer`](crate::consumer::Consumer) may share one
+//! through an `Arc`; a [`Producer`](crate::producer::Producer) holds its own
+//! ([`Producer::client`](crate::producer::Producer::client)).
 use crate::config::{Config, Net};
 use crate::conn::{deadline_in, Conn};
 use crate::error::{Code, Error, Result};
@@ -10,6 +14,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+/// A blocking client of a cluster's control plane, made with [`Client::new`]. It holds one
+/// connection to each broker it has called, opened at need and dropped once lost.
 pub struct Client {
     net: Arc<Net>,
     inner: Mutex<Inner>,
@@ -37,10 +43,16 @@ enum To {
 
 impl Client {
     /// A client of `cfg`'s cluster; it connects at its first call.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`]: what [`Config::net`] refuses (a setting unknown or invalid, TLS
+    /// material that cannot be loaded). No broker is contacted.
     pub fn new(cfg: &Config) -> Result<Client> {
         Ok(Client { net: Arc::new(cfg.net()?), inner: Mutex::new(Inner::default()) })
     }
 
+    /// How it reaches the cluster: the settings [`Config::net`] made of its config.
     pub fn net(&self) -> &Arc<Net> {
         &self.net
     }
@@ -137,18 +149,33 @@ impl Client {
     }
 
     /// A request of `api` answered by any broker (InitProducerId), retried as the others are.
+    /// Low level: `body` writes the request's body; the response frame is returned undecoded.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`] (or the last transient error) if `timeout` passes first;
+    /// [`Error::Transport`], [`Error::Auth`] or [`Error::Unsupported`] if no broker can be
+    /// reached or spoken to; [`Error::Broker`] for a code a retry does not mend.
     pub fn call_any(&self, api: i16, body: &dyn Fn(&mut Vec<u8>), timeout: Duration) -> Result<Vec<u8>> {
         self.retried(timeout, |inner, deadline| self.call(inner, To::Any, deadline, api, body))
     }
 
     /// The cluster's metadata: of `topics`, or of every topic (`None`). A topic the cluster has
     /// not is in it with its error (UNKNOWN_TOPIC_OR_PARTITION); asking never creates one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`] (or the last transient error) if `timeout` passes first;
+    /// [`Error::Transport`], [`Error::Auth`] or [`Error::Unsupported`] if no broker can be
+    /// reached or spoken to; [`Error::Broker`] for a code a retry does not mend.
+    /// [`Error::Config`]: a topic name over 32767 bytes.
     pub fn metadata(&self, topics: Option<&[&str]>, timeout: Duration) -> Result<Metadata> {
         names("topic", topics.unwrap_or_default().iter().copied())?;
         self.retried(timeout, |inner, deadline| self.refresh(inner, deadline, topics))
     }
 
-    /// The cluster's id, if it has one.
+    /// The cluster's id; None if it has none (Kafka before 0.10.1), or if the metadata could
+    /// not be had within `timeout` (the error is dropped).
     pub fn cluster_id(&self, timeout: Duration) -> Option<String> {
         self.metadata(Some(&[]), timeout).ok().and_then(|m| m.cluster_id)
     }
@@ -156,6 +183,14 @@ impl Client {
     /// `topic`'s partitions, in order; an error if the cluster has no such topic. A topic the
     /// cluster has not (UNKNOWN_TOPIC_OR_PARTITION) is asked about once more, not until the
     /// timeout: once, as one just created may not be in every broker's metadata yet.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`] (or the last transient error) if `timeout` passes first;
+    /// [`Error::Transport`], [`Error::Auth`] or [`Error::Unsupported`] if no broker can be
+    /// reached or spoken to; [`Error::Broker`] for a code a retry does not mend.
+    /// [`Error::Broker`] with [`Code::UNKNOWN_TOPIC_OR_PARTITION`] if there is no such topic;
+    /// [`Error::Config`]: a topic name over 32767 bytes.
     pub fn partitions(&self, topic: &str, timeout: Duration) -> Result<Vec<i32>> {
         names("topic", [topic])?;
         let mut asked = 0;
@@ -177,7 +212,14 @@ impl Client {
     }
 
     /// `topic`'s partitions' leaders (partition, broker id: those with one) and the brokers'
-    /// addresses (id, host:port).
+    /// addresses (id, host:port). A partition without a leader is left out.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`] (or the last transient error) if `timeout` passes first;
+    /// [`Error::Transport`], [`Error::Auth`] or [`Error::Unsupported`] if no broker can be
+    /// reached or spoken to; [`Error::Broker`] for a code a retry does not mend.
+    /// [`Error::Broker`] with the topic's error if its metadata has one (e.g. no such topic).
     pub fn leaders(&self, topic: &str, timeout: Duration) -> Result<Leaders> {
         names("topic", [topic])?;
         let md = self.metadata(Some(&[topic]), timeout)?;
@@ -192,6 +234,17 @@ impl Client {
 
     /// ListOffsets of `parts` (topic, partition, timestamp ms or `wire::LATEST`/`EARLIEST`), each
     /// to its leader: per partition, its offset (`None`: no record that recent) or its error.
+    /// With `committed`, read_committed: `LATEST` is the last stable offset, not the high
+    /// watermark. A partition without a leader yet, or not in the metadata yet, is asked again
+    /// until `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`] (or the last transient error) if `timeout` passes first;
+    /// [`Error::Transport`], [`Error::Auth`] or [`Error::Unsupported`] if no broker can be
+    /// reached or spoken to; [`Error::Broker`] for a code a retry does not mend.
+    /// [`Error::Config`]: a partition named twice, or a topic name over 32767 bytes. A
+    /// partition's own error is in its [`Listed`], not here.
     pub fn list_offsets(
         &self,
         parts: &[(String, i32, i64)],
@@ -273,6 +326,14 @@ impl Client {
     }
 
     /// A partition's (log start, high watermark; the last stable offset reading `committed`).
+    /// `timeout` covers both lookups.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`] (or the last transient error) if `timeout` passes first;
+    /// [`Error::Transport`], [`Error::Auth`] or [`Error::Unsupported`] if no broker can be
+    /// reached or spoken to; [`Error::Broker`] for a code a retry does not mend.
+    /// The partition's own error, as [`list_offsets`](Client::list_offsets) gives it.
     pub fn watermarks(&self, topic: &str, partition: i32, committed: bool, timeout: Duration) -> Result<(i64, i64)> {
         let deadline = deadline_in(timeout);
         let at = |ts| -> Result<Option<i64>> {
@@ -291,6 +352,15 @@ impl Client {
     /// timeout, a connection cut) is sent again, and the broker may have created the topics the
     /// first time: on such a retry TOPIC_ALREADY_EXISTS reads as created (another client creating
     /// the same topic in that moment cannot be told apart).
+    ///
+    /// The broker is told to wait up to `timeout` (at most `socket.timeout.ms`, less a margin).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`] (or the last transient error) if `timeout` passes first;
+    /// [`Error::Transport`], [`Error::Auth`] or [`Error::Unsupported`] if no broker can be
+    /// reached or spoken to; [`Error::Broker`] for a code a retry does not mend.
+    /// [`Error::Config`]: a topic name over 32767 bytes. A topic's own error is in its entry.
     pub fn create_topics(&self, topics: &[(String, i32, i16)], timeout: Duration) -> Result<Vec<(String, Result<()>)>> {
         names("topic", topics.iter().map(|t| t.0.as_str()))?;
         let mut lost = false;
@@ -325,6 +395,13 @@ impl Client {
     }
 
     /// Every setting of each of `topics` (name, value; None for a sensitive one), or its error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`] (or the last transient error) if `timeout` passes first;
+    /// [`Error::Transport`], [`Error::Auth`] or [`Error::Unsupported`] if no broker can be
+    /// reached or spoken to; [`Error::Broker`] for a code a retry does not mend.
+    /// [`Error::Config`]: a topic name over 32767 bytes. A topic's own error is in its entry.
     pub fn describe_topic_configs(&self, topics: &[&str], timeout: Duration) -> Result<Vec<Result<TopicConfig>>> {
         names("topic", topics.iter().copied())?;
         self.retried(timeout, |inner, deadline| {
@@ -345,6 +422,15 @@ impl Client {
 
     /// Commits `offsets` (topic, partition, offset) for `group`, from outside its membership:
     /// what lag tools read. Retried while the coordinator moves or loads.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`] (or the last transient error) if `timeout` passes first;
+    /// [`Error::Transport`], [`Error::Auth`] or [`Error::Unsupported`] if no broker can be
+    /// reached or spoken to; [`Error::Broker`] for a code a retry does not mend.
+    /// [`Error::Broker`] for the first partition the coordinator refused (e.g.
+    /// [`Code::GROUP_AUTHORIZATION_FAILED`]), or if no coordinator is found;
+    /// [`Error::Config`]: a group or topic name over 32767 bytes.
     pub fn commit(&self, group: &str, offsets: &[(String, i32, i64)], timeout: Duration) -> Result<()> {
         names("group.id", [group])?;
         names("topic", offsets.iter().map(|o| o.0.as_str()))?;

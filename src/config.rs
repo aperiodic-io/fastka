@@ -2,12 +2,17 @@
 //! mean what they meant to librdkafka. A key this client does not know is refused: a setting
 //! silently ignored is how a TLS or SASL setting goes unnoticed. A key of the other role (a
 //! producer's on a consumer) is taken and ignored, as librdkafka takes it.
+//!
+//! The entry point is [`Config`]: set its keys, then [`Config::net`], [`Config::consumer`] and
+//! [`Config::producer`] check them and give the typed settings.
 use crate::error::{Error, Result};
 use crate::sasl::Mechanism;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// `key=value` settings, set in order (a later one wins).
+/// `key=value` settings, set in order (a later one wins). Nothing is checked until
+/// [`net`](Config::net), [`consumer`](Config::consumer) or [`producer`](Config::producer) is
+/// called. `Debug` shows a password's or a PEM key's value as `***`.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Config {
     pairs: Vec<(String, String)>,
@@ -27,15 +32,20 @@ fn secret(k: &str) -> bool {
 }
 
 impl Config {
+    /// No settings: every key at its default (`bootstrap.servers` must still be set).
     pub fn new() -> Config {
         Config::default()
     }
+    /// Sets `k` to `v`, replacing an earlier value of `k`. Never fails: an unknown key or a bad
+    /// value is refused later, by [`net`](Config::net), [`consumer`](Config::consumer) or
+    /// [`producer`](Config::producer).
     pub fn set(&mut self, k: impl Into<String>, v: impl Into<String>) -> &mut Config {
         let (k, v) = (k.into(), v.into());
         self.pairs.retain(|(o, _)| *o != k);
         self.pairs.push((k, v));
         self
     }
+    /// `k`'s value as set; None if it is not set (its alias is not looked at).
     pub fn get(&self, k: &str) -> Option<&str> {
         self.pairs.iter().rev().find(|(o, _)| o == k).map(|(_, v)| v.as_str())
     }
@@ -157,19 +167,33 @@ fn broker(s: &str) -> Result<String> {
     Ok(format!("{host}:{port}"))
 }
 
-/// How to reach the cluster: its brokers, TLS and SASL, the sockets' timeouts.
+/// How to reach the cluster: its brokers, TLS and SASL, the sockets' timeouts. Made by
+/// [`Config::net`]; `Debug` shows neither TLS material nor the SASL password.
 #[derive(Clone)]
 pub struct Net {
+    /// The bootstrap brokers, as `host:port` (`bootstrap.servers`, or `metadata.broker.list`;
+    /// port 9092 if none given, IPv6 bracketed).
     pub bootstrap: Vec<String>,
+    /// The client id sent with each request (`client.id`, default `fastka`).
     pub client_id: String,
+    /// TLS, if `security.protocol` is `ssl` or `sasl_ssl` (from the `ssl.*` keys); None: plaintext.
     pub tls: Option<Arc<rustls::ClientConfig>>,
+    /// SASL (mechanism, username, password), if `security.protocol` is `sasl_plaintext` or
+    /// `sasl_ssl` (`sasl.mechanisms`, `sasl.username`, `sasl.password`); None: no SASL.
     pub sasl: Option<(Mechanism, String, String)>,
-    /// a request without its answer in this long is a connection lost (`socket.timeout.ms`)
+    /// A request without its answer in this long is a connection lost (`socket.timeout.ms`,
+    /// default 60000 ms).
     pub request_timeout: Duration,
+    /// The longest a connection may take to set up, TCP, TLS and SASL
+    /// (`socket.connection.setup.timeout.ms`, default 30000 ms).
     pub connect_timeout: Duration,
+    /// The first wait before a broker is connected again, doubling up to `backoff_max`
+    /// (`reconnect.backoff.ms`, default 100 ms).
     pub backoff: Duration,
+    /// The longest wait between connection attempts (`reconnect.backoff.max.ms`, default
+    /// 10000 ms).
     pub backoff_max: Duration,
-    /// the largest response taken (`receive.message.max.bytes`)
+    /// The largest response taken, bytes (`receive.message.max.bytes`, default 100000000).
     pub max_response: usize,
 }
 
@@ -186,8 +210,13 @@ impl std::fmt::Debug for Net {
 /// `auto.offset.reset`: where a partition whose offset is out of range goes on from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reset {
+    /// From the partition's first offset (`earliest`, `smallest`, `beginning`).
     Earliest,
+    /// From the partition's end (`latest`, `largest`, `end`); the default.
     Latest,
+    /// Not reset: [`Consumer::pump`](crate::consumer::Consumer::pump) returns an
+    /// [`Error::Broker`] with [`OFFSET_OUT_OF_RANGE`](crate::Code::OFFSET_OUT_OF_RANGE)
+    /// (`error`).
     Error,
 }
 
@@ -195,37 +224,75 @@ pub enum Reset {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ConsumerSettings {
+    /// `group.id`, if set. The consumer does not join a group; this is for
+    /// [`Client::commit`](crate::client::Client::commit).
     pub group: Option<String>,
+    /// Where a partition whose offset is out of range goes on from (`auto.offset.reset`,
+    /// default `latest`).
     pub reset: Reset,
+    /// Whether a partition's end is given as [`Polled::Eof`](crate::consumer::Polled::Eof)
+    /// (`enable.partition.eof`, default false).
     pub partition_eof: bool,
+    /// The longest a broker waits for `min_bytes` before it answers a Fetch, ms
+    /// (`fetch.wait.max.ms`, default 500).
     pub max_wait_ms: i32,
+    /// The least a broker gathers before it answers a Fetch, bytes (`fetch.min.bytes`,
+    /// default 1).
     pub min_bytes: i32,
-    /// `fetch.max.bytes`, at most `queued.max.messages.kbytes` (as librdkafka caps it)
+    /// The most a Fetch's response holds, bytes: `fetch.max.bytes` (default 52428800), at most
+    /// `queued.max.messages.kbytes` × 1024 (as librdkafka caps it).
     pub max_bytes: i32,
+    /// The most a Fetch's response holds of one partition, bytes (`max.partition.fetch.bytes`
+    /// or `fetch.message.max.bytes`, default 1048576).
     pub partition_max_bytes: i32,
-    /// a partition is fetched again while it holds fewer queued (`queued.min.messages`)
+    /// A partition is fetched again while it holds fewer queued (`queued.min.messages`,
+    /// default 100000).
     pub queued_min: usize,
+    /// read_committed: aborted transactions' records and control records are skipped, and a
+    /// partition is read only up to its last stable offset (`isolation.level`, default
+    /// `read_committed`).
     pub committed: bool,
+    /// Whether each batch's CRC-32C is checked (`check.crcs`, default true here).
     pub check_crcs: bool,
 }
 
+/// A producer's settings, made by `Config::producer`. The producer is always idempotent with
+/// `acks=all`.
 #[derive(Clone, Debug)]
 pub struct ProducerSettings {
+    /// How long a partition's first queued message waits for others before its batch is sent
+    /// (`linger.ms` or `queue.buffering.max.ms`, default 5 ms; less than `message_timeout`).
     pub linger: Duration,
-    /// a partition's batch is sent once it holds this many bytes, or `batch_messages` messages
+    /// A partition's batch is sent once it holds this many bytes, or `batch_messages` messages
+    /// (`batch.size`, default 1000000).
     pub batch_bytes: usize,
+    /// The most messages a batch holds (`batch.num.messages`, default 10000).
     pub batch_messages: usize,
+    /// The most messages queued or in flight, beyond which a send is refused with
+    /// [`Error::QueueFull`] (`queue.buffering.max.messages`, default 100000; at least 1).
     pub queue_messages: usize,
+    /// The most bytes queued or in flight, beyond which a send is refused with
+    /// [`Error::QueueFull`]: `queue.buffering.max.kbytes` (default 1048576) × 1024.
     pub queue_bytes: usize,
+    /// A message not delivered within this long of its send fails with
+    /// [`Error::MessageTimedOut`] (`message.timeout.ms` or `delivery.timeout.ms`, default
+    /// 300000 ms).
     pub message_timeout: Duration,
-    /// the broker's wait for the replicas' acks (Produce's timeout)
+    /// The broker's wait for the replicas' acks (Produce's timeout; `request.timeout.ms`,
+    /// default 30000 ms).
     pub request_timeout: Duration,
+    /// The wait before a failed request is retried (`retry.backoff.ms`, default 100 ms).
     pub retry_backoff: Duration,
+    /// `retry.backoff.max.ms` (default 1000 ms), checked and kept.
     pub retry_backoff_max: Duration,
+    /// The compression codec, one of [`records`](crate::records)' `NONE`, `GZIP`, `SNAPPY`,
+    /// `LZ4`, `ZSTD` (`compression.type` or `compression.codec`, default `none`).
     pub codec: i16,
-    /// the largest batch a broker takes (`message.max.bytes`), and the most a Produce request holds
+    /// The largest batch a broker takes, bytes (`message.max.bytes`, default 1000000), and the
+    /// most a Produce request holds.
     pub max_batch: usize,
-    /// the metadata looked up again this often (`topic.metadata.refresh.interval.ms`; -1: never)
+    /// The metadata looked up again this often (`topic.metadata.refresh.interval.ms`, default
+    /// 300000 ms, at least 10 ms); None for -1: never.
     pub metadata_refresh: Option<Duration>,
 }
 
@@ -258,6 +325,16 @@ impl Config {
         }
     }
 
+    /// How to reach the cluster: `bootstrap.servers`, `client.id`, `security.protocol` with the
+    /// `ssl.*` and `sasl.*` keys, the sockets' timeouts and backoffs. Every key is checked, the
+    /// other role's too. TLS certificates and keys are read here (files at their `.location`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`]: a key this client does not know, a value out of range or not of its
+    /// type, or a key and its alias set to different values. Also: `bootstrap.servers` not set or naming no broker,
+    /// `sasl.username`/`sasl.password` missing with SASL, an `ssl.*` key without TLS, or TLS
+    /// material that cannot be read or parsed.
     pub fn net(&self) -> Result<Net> {
         self.check()?;
         let servers = self
@@ -324,6 +401,14 @@ impl Config {
         })
     }
 
+    /// A consumer's settings (`group.id`, `auto.offset.reset`, the `fetch.*` keys,
+    /// `isolation.level`, ...). Every key is checked, the other role's too.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`]: a key this client does not know, a value out of range or not of its
+    /// type, or a key and its alias set to different values. Also: `enable.auto.commit=true` (this client commits
+    /// only when asked, with [`Client::commit`](crate::client::Client::commit)).
     pub fn consumer(&self) -> Result<ConsumerSettings> {
         self.check()?;
         let g = |k, d| self.get(k).unwrap_or(d);
@@ -363,6 +448,14 @@ impl Config {
         })
     }
 
+    /// A producer's settings (`linger.ms`, `batch.*`, `queue.buffering.*`, `message.timeout.ms`,
+    /// `compression.type`, ...). Every key is checked, the other role's too.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`]: a key this client does not know, a value out of range or not of its
+    /// type, or a key and its alias set to different values. Also: `enable.idempotence=false`, `acks` other than
+    /// `all`/`-1`, or `linger.ms` not less than `message.timeout.ms`.
     pub fn producer(&self) -> Result<ProducerSettings> {
         self.check()?;
         let g = |k, d| self.get(k).unwrap_or(d);
