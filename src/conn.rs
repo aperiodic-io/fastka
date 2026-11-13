@@ -6,14 +6,55 @@ use crate::error::{Code, Error, Result};
 use crate::sasl::{self, Mechanism};
 use crate::wire;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// A socket, in TLS or not.
 pub enum Stream {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Plain(Sock),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, Sock>>),
+}
+
+/// A TCP socket whose every read and write waits only the time left to `deadline` (none: as the
+/// socket is set). Under TLS this is what bounds a request: rustls reads the socket as often as a
+/// record needs, and a timeout set once would be waited again at each read, so a broker trickling
+/// a byte at a time would hold a request (or the handshake) forever. At the deadline, WouldBlock.
+pub struct Sock {
+    tcp: TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl Sock {
+    fn left(&self) -> std::io::Result<Option<Duration>> {
+        let Some(d) = self.deadline else { return Ok(None) };
+        let left = d.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        Ok(Some(left))
+    }
+}
+
+impl Read for Sock {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(left) = self.left()? {
+            self.tcp.set_read_timeout(Some(left))?;
+        }
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for Sock {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(left) = self.left()? {
+            self.tcp.set_write_timeout(Some(left))?;
+        }
+        self.tcp.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tcp.flush()
+    }
 }
 
 impl std::fmt::Debug for Stream {
@@ -26,46 +67,39 @@ impl std::fmt::Debug for Stream {
 }
 
 impl Stream {
-    fn tcp(&self) -> &TcpStream {
+    fn sock(&mut self) -> &mut Sock {
         match self {
             Stream::Plain(s) => s,
-            Stream::Tls(s) => &s.sock,
+            Stream::Tls(s) => &mut s.sock,
         }
     }
-    pub fn set_nonblocking(&self, on: bool) -> Result<()> {
-        Ok(self.tcp().set_nonblocking(on)?)
+    pub fn set_nonblocking(&mut self, on: bool) -> Result<()> {
+        let s = self.sock();
+        s.deadline = None;
+        Ok(s.tcp.set_nonblocking(on)?)
     }
 }
 
-/// A stream whose reads and writes end at a deadline, each waiting only the time left: a broker
-/// trickling its answer (or reading a request a byte at a time) cannot hold a blocking request
-/// past its timeout. At the deadline, WouldBlock: `read_frame` and `write_all` give it back.
+/// A stream whose reads and writes end at a deadline, each socket operation waiting only the
+/// time left: a broker trickling its answer (or reading a request a byte at a time) cannot hold a
+/// blocking request past its timeout. At the deadline, WouldBlock: `read_frame` and `write_all`
+/// give it back.
 struct Until<'a>(&'a mut Stream, Instant);
-
-impl Until<'_> {
-    fn left(&self) -> std::io::Result<Duration> {
-        let left = self.1.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(ErrorKind::WouldBlock.into());
-        }
-        Ok(left)
-    }
-}
 
 impl Read for Until<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.tcp().set_read_timeout(Some(self.left()?))?;
+        self.0.sock().deadline = Some(self.1);
         self.0.read(buf)
     }
 }
 
 impl Write for Until<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.tcp().set_write_timeout(Some(self.left()?))?;
+        self.0.sock().deadline = Some(self.1);
         self.0.write(buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.tcp().set_write_timeout(Some(self.left()?))?;
+        self.0.sock().deadline = Some(self.1);
         self.0.flush()
     }
 }
@@ -101,16 +135,27 @@ impl Write for Stream {
 }
 
 /// A connected, checked, authenticated broker connection, its requests answered in turn.
-#[derive(Debug)]
 pub struct Conn {
     pub stream: Stream,
     pub addr: String,
+    client_id: String,
     corr: i32,
+    /// the last request, its buffer kept for the next (zeroed once SASL is through: it held the
+    /// password)
     out: Vec<u8>,
     timeout: Duration,
+    /// while connecting, the deadline every step shares
+    until: Option<Instant>,
     max_response: usize,
     /// the broker's versions (key, min, max), as ApiVersions said
     apis: Vec<(i16, i16, i16)>,
+}
+
+impl std::fmt::Debug for Conn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // never the buffers: the last request may be SASL's, with the password
+        f.debug_struct("Conn").field("stream", &self.stream).field("addr", &self.addr).finish_non_exhaustive()
+    }
 }
 
 /// A response's frame: the size first (up to `max`), then the frame itself into `buf`; Ok(false)
@@ -179,28 +224,27 @@ impl Conn {
         Conn::open_within(net, addr, net.connect_timeout)
     }
 
-    /// `open`, within `limit` (and the connection timeout).
+    /// `open`, within `limit` (and the connection timeout): one deadline for every step,
+    /// resolving the name, each address tried, TLS, ApiVersions and SASL each given what is left.
     pub fn open_within(net: &Net, addr: &str, limit: Duration) -> Result<Conn> {
         let limit = limit.min(net.connect_timeout).max(Duration::from_millis(1));
-        let deadline = Instant::now() + limit;
-        let tcp = tcp(addr, limit)?;
+        let deadline = deadline_in(limit);
+        let tcp = tcp(addr, deadline)?;
         tcp.set_nodelay(true)?;
+        let sock = Sock { tcp, deadline: Some(deadline) };
         let stream = match &net.tls {
-            None => Stream::Plain(tcp),
+            None => Stream::Plain(sock),
             Some(cfg) => {
                 let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h).trim_start_matches('[').trim_end_matches(']');
                 let conn = rustls::ClientConnection::new(cfg.clone(), crate::tls::server_name(host)?)
                     .map_err(|e| Error::Auth(format!("{addr}: TLS: {e}")))?;
-                let mut s = rustls::StreamOwned::new(conn, tcp);
-                s.sock.set_read_timeout(Some(left(deadline, addr)?))?;
-                s.sock.set_write_timeout(Some(left(deadline, addr)?))?;
+                let mut s = rustls::StreamOwned::new(conn, sock);
                 while s.conn.is_handshaking() {
                     s.conn.complete_io(&mut s.sock).map_err(|e| match e.kind() {
-                        ErrorKind::InvalidData => Error::Auth(format!("{addr}: TLS: {e}")),
                         ErrorKind::WouldBlock | ErrorKind::TimedOut => {
                             Error::Timeout(format!("{addr}: the TLS handshake"))
                         }
-                        _ => Error::Transport(format!("{addr}: TLS: {e}")),
+                        _ => tls_error(addr, e),
                     })?;
                 }
                 Stream::Tls(Box::new(s))
@@ -209,18 +253,21 @@ impl Conn {
         let mut c = Conn {
             stream,
             addr: addr.to_string(),
+            client_id: net.client_id.clone(),
             corr: 0,
             out: vec![],
             timeout: net.request_timeout,
+            until: Some(deadline),
             max_response: net.max_response,
             apis: vec![],
         };
-        c.timeout = left(deadline, addr)?.min(net.request_timeout);
         c.check_versions()?;
         if let Some((mech, user, pass)) = &net.sasl {
-            c.authenticate(*mech, user, pass)?;
+            let r = c.authenticate(*mech, user, pass);
+            c.out.fill(0); // the last request held the password
+            r?;
         }
-        c.timeout = net.request_timeout;
+        c.until = None;
         Ok(c)
     }
 
@@ -294,7 +341,7 @@ impl Conn {
         let corr = self.corr;
         let mut out = std::mem::take(&mut self.out);
         let v = if api == wire::API_VERSIONS { 0 } else { self.version(api) };
-        wire::request_at(&mut out, api, v, corr, "brrrrr", body);
+        wire::request_at(&mut out, api, v, corr, &self.client_id, body);
         let r = self.round_trip(&out, corr);
         self.out = out;
         r
@@ -306,9 +353,10 @@ impl Conn {
             ErrorKind::WouldBlock | ErrorKind::TimedOut => {
                 Error::Timeout(format!("{addr}: no answer in {:?}", self.timeout))
             }
-            _ => Error::Transport(format!("{addr}: {e}")),
+            _ => tls_error(addr, e),
         };
-        let deadline = Instant::now() + self.timeout;
+        let deadline = deadline_in(self.timeout);
+        let deadline = self.until.map_or(deadline, |u| deadline.min(u)); // connecting: its deadline too
         let mut s = Until(&mut self.stream, deadline);
         let mut written = 0;
         while !write_all(&mut s, out, &mut written).map_err(timeout)? {
@@ -333,10 +381,16 @@ impl Conn {
     }
 
     /// Its socket, for requests sent and answered without blocking (the consumer's Fetch).
-    pub fn into_stream(self) -> Result<Stream> {
+    pub fn into_stream(mut self) -> Result<Stream> {
         self.stream.set_nonblocking(true)?;
         Ok(self.stream)
     }
+}
+
+/// Now and `t`; a `t` past what the clock can count (`Duration::MAX`: no limit), a century.
+pub(crate) fn deadline_in(t: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(t).or_else(|| now.checked_add(Duration::from_secs(100 * 365 * 86_400))).unwrap_or(now)
 }
 
 fn left(deadline: Instant, addr: &str) -> Result<Duration> {
@@ -346,13 +400,58 @@ fn left(deadline: Instant, addr: &str) -> Result<Duration> {
         .ok_or_else(|| Error::Timeout(format!("{addr}: connecting (socket.connection.setup.timeout.ms)")))
 }
 
-/// TCP to the first of `addr`'s addresses that answers, each tried within `timeout`.
-fn tcp(addr: &str, timeout: Duration) -> Result<TcpStream> {
-    let addrs: Vec<_> =
-        addr.to_socket_addrs().map_err(|e| Error::Transport(format!("{addr}: resolving: {e}")))?.collect();
+/// An I/O error of a connection: TLS refusing a certificate (the broker's, or the broker the
+/// client's) is Auth, which a retry would meet again; anything else, a listener not speaking TLS
+/// among them, is Transport, which another broker, or a later try, may not meet.
+fn tls_error(addr: &str, e: std::io::Error) -> Error {
+    use rustls::AlertDescription as A;
+    let tls = e.get_ref().and_then(|e| e.downcast_ref::<rustls::Error>());
+    let refused = match tls {
+        Some(rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented) => true,
+        Some(rustls::Error::AlertReceived(a)) => matches!(
+            a,
+            A::BadCertificate
+                | A::UnsupportedCertificate
+                | A::CertificateRevoked
+                | A::CertificateExpired
+                | A::CertificateUnknown
+                | A::UnknownCA
+                | A::AccessDenied
+                | A::CertificateRequired
+        ),
+        _ => false,
+    };
+    match refused {
+        true => Error::Auth(format!("{addr}: TLS: {e}")),
+        false if tls.is_some() => Error::Transport(format!("{addr}: TLS: {e}")),
+        false => Error::Transport(format!("{addr}: {e}")),
+    }
+}
+
+/// `addr`'s addresses, by `deadline`. The system's resolver blocks as long as it likes, so it is
+/// asked on a thread of its own, left to finish alone if the deadline comes first.
+fn resolve(addr: &str, deadline: Instant) -> Result<Vec<SocketAddr>> {
+    if let Ok(a) = addr.parse::<SocketAddr>() {
+        return Ok(vec![a]);
+    }
+    let (tx, rx) = mpsc::channel();
+    let name = addr.to_string();
+    std::thread::Builder::new()
+        .name("fastka-resolve".into())
+        .spawn(move || drop(tx.send(name.to_socket_addrs().map(|a| a.collect::<Vec<_>>()))))
+        .map_err(|e| Error::Transport(format!("a thread to resolve {addr}: {e}")))?;
+    match rx.recv_timeout(left(deadline, addr)?) {
+        Ok(r) => r.map_err(|e| Error::Transport(format!("{addr}: resolving: {e}"))),
+        Err(_) => Err(Error::Timeout(format!("{addr}: resolving (socket.connection.setup.timeout.ms)"))),
+    }
+}
+
+/// TCP to the first of `addr`'s addresses that answers by `deadline`, each given the time left.
+fn tcp(addr: &str, deadline: Instant) -> Result<TcpStream> {
     let mut last = Error::Transport(format!("{addr}: resolves to no address"));
-    for a in addrs {
-        match TcpStream::connect_timeout(&a, timeout) {
+    for a in resolve(addr, deadline)? {
+        let Ok(left) = left(deadline, addr) else { break }; // the last address's error said
+        match TcpStream::connect_timeout(&a, left) {
             Ok(s) => return Ok(s),
             Err(e) => last = Error::Transport(format!("{addr} ({a}): connecting: {e}")),
         }
@@ -364,7 +463,7 @@ fn tcp(addr: &str, timeout: Duration) -> Result<TcpStream> {
 /// thread must not wait on either (a resolver that does not answer takes seconds per attempt).
 pub fn open_in_background(net: std::sync::Arc<Net>, addr: String) -> mpsc::Receiver<Result<Conn>> {
     let (tx, rx) = mpsc::channel();
-    let spawned = std::thread::Builder::new().name("brrrrr-kafka-connect".into()).spawn(move || {
+    let spawned = std::thread::Builder::new().name("fastka-connect".into()).spawn(move || {
         let _ = tx.send(Conn::open(&net, &addr));
     });
     if let Err(e) = spawned {

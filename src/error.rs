@@ -152,6 +152,7 @@ const NAMES: &[(i16, &str)] = &[
 
 /// What a call of this crate failed of.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Error {
     /// A broker answered with this code (what it was asked, and its message if it gave one).
     Broker(Code, String),

@@ -56,6 +56,15 @@ pub fn negotiate(api: i16, broker: &[(i16, i16, i16)]) -> Option<i16> {
     (v >= lo.max(bmin)).then_some(v)
 }
 
+/// A string the protocol can carry (an i16 length: at most 32767 bytes), else a Config error
+/// naming `what`: checked where a caller hands one in, as `Put::str` cannot fail.
+pub fn check_str(what: &str, s: &str) -> Result<()> {
+    match i16::try_from(s.len()) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(Error::Config(format!("{what}: {} bytes, over the protocol's 32767", s.len()))),
+    }
+}
+
 /// The big-endian primitives of the protocol, appended.
 pub trait Put {
     fn i8(&mut self, v: i8);

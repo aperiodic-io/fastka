@@ -125,6 +125,37 @@ fn ms(k: &str, v: &str, lo: i64, hi: i64) -> Result<Duration> {
     Ok(Duration::from_millis(int(k, v, lo, hi)? as u64))
 }
 
+/// A bootstrap broker as librdkafka takes it, as `host:port`: a scheme (any case) ignored, the
+/// port 9092 if none; IPv6 bracketed (`[::1]:9093`, `[::1]`) or bare (`::1`, its port 9092: a bare
+/// address cannot say where its port starts).
+fn broker(s: &str) -> Result<String> {
+    let bad = |why: &str| Error::Config(format!("bootstrap.servers: {s}: {why}"));
+    let rest = match s.split_once("://") {
+        Some((scheme, rest))
+            if ["plaintext", "ssl", "sasl_plaintext", "sasl_ssl"].contains(&scheme.to_ascii_lowercase().as_str()) =>
+        {
+            rest
+        }
+        _ => s,
+    };
+    let port = |p: &str| p.parse::<u16>().map_err(|_| bad("not a port"));
+    let (host, port) = if let Some(v6) = rest.strip_prefix('[') {
+        let (host, after) = v6.split_once(']').ok_or_else(|| bad("an IPv6 address without its ]"))?;
+        match after {
+            "" => (format!("[{host}]"), 9092),
+            p => (format!("[{host}]"), port(p.strip_prefix(':').ok_or_else(|| bad("not a port after ]"))?)?),
+        }
+    } else if rest.matches(':').count() > 1 {
+        (format!("[{rest}]"), 9092)
+    } else {
+        match rest.split_once(':') {
+            Some((host, p)) => (host.to_string(), port(p)?),
+            None => (rest.to_string(), 9092),
+        }
+    };
+    Ok(format!("{host}:{port}"))
+}
+
 /// How to reach the cluster: its brokers, TLS and SASL, the sockets' timeouts.
 #[derive(Clone)]
 pub struct Net {
@@ -212,30 +243,23 @@ impl Config {
         Ok(())
     }
 
+    /// `k`'s value, or its alias's; both set to different values is a mistake, refused.
+    fn aliased(&self, k: &str, alias: &str) -> Result<Option<&str>> {
+        match (self.get(k), self.get(alias)) {
+            (Some(a), Some(b)) if a.trim() != b.trim() => {
+                Err(Error::Config(format!("{k}={a} and {alias}={b}: one setting by two names, set one")))
+            }
+            (a, b) => Ok(a.or(b)),
+        }
+    }
+
     pub fn net(&self) -> Result<Net> {
         self.check()?;
         let servers = self
-            .get("bootstrap.servers")
-            .or(self.get("metadata.broker.list"))
+            .aliased("bootstrap.servers", "metadata.broker.list")?
             .ok_or_else(|| Error::Config("bootstrap.servers: not set".into()))?;
-        let bootstrap: Vec<String> = servers
-            .split(',')
-            .map(|s| {
-                s.trim()
-                    .trim_start_matches("PLAINTEXT://")
-                    .trim_start_matches("SSL://")
-                    .trim_start_matches("SASL_SSL://")
-                    .trim_start_matches("SASL_PLAINTEXT://")
-            })
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                if s.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
-                    s.to_string()
-                } else {
-                    format!("{s}:9092")
-                }
-            })
-            .collect();
+        let bootstrap: Vec<String> =
+            servers.split(',').map(str::trim).filter(|s| !s.is_empty()).map(broker).collect::<Result<_>>()?;
         if bootstrap.is_empty() {
             return Err(Error::Config("bootstrap.servers: no broker".into()));
         }
@@ -254,8 +278,7 @@ impl Config {
         let sasl = match sasl {
             false => None,
             true => {
-                let mech =
-                    Mechanism::parse(self.get("sasl.mechanisms").or(self.get("sasl.mechanism")).unwrap_or("GSSAPI"))?;
+                let mech = Mechanism::parse(self.aliased("sasl.mechanisms", "sasl.mechanism")?.unwrap_or("GSSAPI"))?;
                 let user = self.get("sasl.username").ok_or_else(|| Error::Config("sasl.username: not set".into()))?;
                 let pass = self.get("sasl.password").ok_or_else(|| Error::Config("sasl.password: not set".into()))?;
                 Some((mech, user.to_string(), pass.to_string()))
@@ -271,9 +294,11 @@ impl Config {
             true => Some(crate::tls::config(self)?),
         };
         let g = |k, d| self.get(k).unwrap_or(d);
+        let client_id = g("client.id", "fastka");
+        crate::wire::check_str("client.id", client_id)?;
         Ok(Net {
             bootstrap,
-            client_id: g("client.id", "brrrrr").to_string(),
+            client_id: client_id.to_string(),
             tls,
             sasl,
             request_timeout: ms("socket.timeout.ms", g("socket.timeout.ms", "60000"), 10, 300_000)?,
@@ -419,7 +444,7 @@ mod tests {
         c
     }
 
-    /// librdkafka's defaults where brrrrr leaves them; its names mean what they meant there.
+    /// librdkafka's defaults where this client keeps them; its names mean what they meant there.
     #[test]
     fn defaults_and_names_are_librdkafkas() {
         let c = cfg(&[]);
@@ -477,7 +502,7 @@ mod tests {
         assert!(c.producer().unwrap_err().to_string().contains("linger.ms"), "linger.ms past message.timeout.ms");
     }
 
-    /// A producer's setting on a consumer is taken (brrrrr gives every client the same lines).
+    /// A producer's setting on a consumer is taken (a deployment may give every client the same lines).
     #[test]
     fn the_other_roles_keys_are_taken() {
         let c = cfg(&[("linger.ms", "2"), ("fetch.wait.max.ms", "50")]);
@@ -524,5 +549,39 @@ mod tests {
             let r = tls(&[("ssl.ca.pem", &p.ca_pem), ("ssl.endpoint.identification.algorithm", v)]);
             assert_eq!(r.is_ok(), ok, "ssl.endpoint.identification.algorithm={v}: {r:?}");
         }
+    }
+
+    /// Brokers as librdkafka takes them: a scheme ignored (any case), a port or 9092, IPv6
+    /// bracketed or bare; a port that is not one refused.
+    #[test]
+    fn bootstrap_addresses() {
+        let n = |s: &str| {
+            let mut c = Config::new();
+            c.set("bootstrap.servers", s);
+            c.net().map(|n| n.bootstrap)
+        };
+        assert_eq!(n("ssl://k1:1,SASL_SSL://k2, Sasl_Plaintext://k3:3").unwrap(), ["k1:1", "k2:9092", "k3:3"]);
+        assert_eq!(
+            n("[::1]:9093,[::1],::1,2001:db8::1").unwrap(),
+            ["[::1]:9093", "[::1]:9092", "[::1]:9092", "[2001:db8::1]:9092"]
+        );
+        for bad in ["k1:port", "[::1", "[::1]9092", "k1:99999"] {
+            assert!(matches!(n(bad), Err(Error::Config(_))), "{bad}: {:?}", n(bad));
+        }
+        assert_eq!(cfg(&[]).net().unwrap().client_id, "fastka");
+    }
+
+    /// A setting and its alias both set, to different values: which was meant is not known.
+    #[test]
+    fn an_alias_disagreeing_is_refused() {
+        let c = cfg(&[("metadata.broker.list", "k3")]);
+        assert!(matches!(c.net(), Err(Error::Config(m)) if m.contains("metadata.broker.list")));
+        cfg(&[("metadata.broker.list", "k1:9092,k2")]).net().unwrap();
+        let sasl = [("security.protocol", "sasl_plaintext"), ("sasl.username", "u"), ("sasl.password", "p")];
+        let mut c = cfg(&sasl);
+        c.set("sasl.mechanisms", "PLAIN").set("sasl.mechanism", "SCRAM-SHA-256");
+        assert!(matches!(c.net(), Err(Error::Config(m)) if m.contains("sasl.mechanism")));
+        c.set("sasl.mechanism", "PLAIN");
+        c.net().unwrap();
     }
 }

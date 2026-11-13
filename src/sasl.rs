@@ -103,10 +103,12 @@ impl Scram {
         let salt = B64.decode(attr('s')?).map_err(|_| Error::Auth("the salt is not base64".into()))?;
         let iterations: u32 =
             attr('i')?.parse().map_err(|_| Error::Auth("the iteration count is not a number".into()))?;
-        // Kafka's ScramMechanism: at least 4096 iterations; fewer would be a downgrade
+        // Kafka's ScramMechanism: at least 4096 iterations; fewer would be a downgrade. At most
+        // 16384, its own maximum (a broker stores no credential past it): more, from a hostile
+        // broker or a man in the middle, would pin this thread in PBKDF2 past every timeout.
         let iterations = NonZeroU32::new(iterations)
-            .filter(|i| i.get() >= 4096)
-            .ok_or_else(|| Error::Auth(format!("{iterations} SCRAM iterations: fewer than 4096")))?;
+            .filter(|i| (4096..=16384).contains(&i.get()))
+            .ok_or_else(|| Error::Auth(format!("{iterations} SCRAM iterations: not within 4096..=16384")))?;
         let (alg, dig, len) = match self.mech {
             Mechanism::ScramSha256 => (pbkdf2::PBKDF2_HMAC_SHA256, &digest::SHA256, 32),
             _ => (pbkdf2::PBKDF2_HMAC_SHA512, &digest::SHA512, 64),
@@ -196,6 +198,17 @@ mod tests {
             format!("{s:?}").find('p').is_none_or(|_| !format!("{s:?}").contains("password")),
             "no password in Debug"
         );
+    }
+
+    /// A hostile broker (or a man in the middle on SASL_PLAINTEXT) cannot pin the connecting
+    /// thread in PBKDF2 far past every timeout with a huge iteration count.
+    #[test]
+    fn a_huge_iteration_count_is_refused() {
+        let mut s = Scram::with_nonce(Mechanism::ScramSha512, "u", "p", "n0");
+        let t0 = std::time::Instant::now();
+        let r = s.fin(b"r=n0srv,s=c2FsdA==,i=3000000");
+        let el = t0.elapsed();
+        assert!(r.is_err(), "3,000,000 iterations accepted, took {el:?} (i=4294967295 would take ~1000x)");
     }
 
     #[test]
