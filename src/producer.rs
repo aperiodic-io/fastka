@@ -466,7 +466,7 @@ fn xorshift(rng: &mut u64) -> u64 {
 }
 
 /// Kafka's `Utils.murmur2`, which Java's default partitioner picks a key's partition with.
-fn murmur2(data: &[u8]) -> i32 {
+pub(crate) fn murmur2(data: &[u8]) -> i32 {
     const M: u32 = 0x5bd1e995;
     let mut h = 0x9747b28c_u32 ^ data.len() as u32;
     let mut chunks = data.chunks_exact(4);
