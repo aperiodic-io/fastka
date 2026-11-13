@@ -7,12 +7,18 @@ use fastka::records::{self, Out, ReadOpts, Stamp};
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     let Some((&flags, b)) = data.split_first() else { return };
     let aborted = [(1, 0), (7, 3)];
-    let o = ReadOpts { from: (flags >> 4) as i64, committed: flags & 1 != 0, aborted: &aborted, check_crcs: flags & 2 != 0 };
+    let o = ReadOpts {
+        from: (flags >> 4) as i64,
+        committed: flags & 1 != 0,
+        aborted: &aborted,
+        check_crcs: flags & 2 != 0,
+        max_decompressed: 1 << 20,
+    };
     let mut plain = vec![];
     let _ = records::read(b, &o, &mut plain, |r| {
         let _ = r.headers().count();
     });
-    let _ = records::scan(b);
+    let _ = records::scan(b, flags & 2 != 0);
     // the bytes as records of a batch: written, then read back the same
     let values: Vec<&[u8]> = b.chunks(7).collect();
     if values.is_empty() {

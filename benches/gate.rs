@@ -14,7 +14,8 @@ const ROUNDS: usize = 20;
 fn values() -> Vec<Vec<u8>> {
     (0..RECORDS)
         .map(|i| {
-            let mut v = format!("{{\"seq\":{i},\"px\":{}.{:02},\"side\":\"{}\"}}", 1000 + i % 97, i % 100, i % 2).into_bytes();
+            let mut v =
+                format!("{{\"seq\":{i},\"px\":{}.{:02},\"side\":\"{}\"}}", 1000 + i % 97, i % 100, i % 2).into_bytes();
             v.resize(100, b' ');
             v
         })
@@ -26,14 +27,25 @@ fn batch(codec: i16, values: &[Vec<u8>]) -> Vec<u8> {
     let outs: Vec<Out<'_>> = values
         .iter()
         .enumerate()
-        .map(|(i, v)| Out { timestamp: 1_700_000_000_000 + i as i64, key: Some(&v[..8]), value: Some(v), headers: &hdrs })
+        .map(|(i, v)| Out {
+            timestamp: 1_700_000_000_000 + i as i64,
+            key: Some(&v[..8]),
+            value: Some(v),
+            headers: &hdrs,
+        })
         .collect();
     let mut out = vec![];
     // a Fetch's records: batches of 1000 records, as a producer of batch.num.messages=1000 writes
     for (k, chunk) in outs.chunks(1000).enumerate() {
         let mut b = vec![];
-        records::write(&mut b, chunk, Stamp { producer_id: 7, epoch: 0, base_sequence: (k * 1000) as i32 }, codec, &mut vec![])
-            .unwrap();
+        records::write(
+            &mut b,
+            chunk,
+            Stamp { producer_id: 7, epoch: 0, base_sequence: (k * 1000) as i32 },
+            codec,
+            &mut vec![],
+        )
+        .unwrap();
         b[..8].copy_from_slice(&((k * 1000) as i64).to_be_bytes()); // base offset, as the broker sets it
         out.extend(b);
     }

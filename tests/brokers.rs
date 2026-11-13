@@ -8,7 +8,7 @@
 //! - `FASTKA_IT_SASL=host:port` (Redpanda with SASL/SCRAM, user `it`/`it-secret` of both
 //!   SHA-256 and SHA-512, `it512`/`it-secret`)
 use fastka::client::Client;
-use fastka::consumer::{Consumer, Message, Offset, Polled};
+use fastka::consumer::{Assignment, Consumer, Message, Offset, Polled};
 use fastka::producer::{Deliveries, Delivery, Producer, Record};
 use fastka::{Code, Config, Error};
 use std::collections::HashMap;
@@ -61,14 +61,13 @@ fn produce_all(c: &Config, topic: &str, values: &[String]) -> Vec<(Option<i32>, 
 
 /// Every message of `parts` from their start, until each says its end.
 fn consume_all(c: &Config, topic: &str, parts: &[i32]) -> Vec<(i32, Message)> {
-    let client = std::sync::Arc::new(Client::new(c).unwrap());
-    let assign = parts.iter().map(|p| (topic.to_string(), *p, Offset::Beginning, false)).collect();
-    let mut k = Consumer::new(client, c.consumer().unwrap(), assign, true);
+    let assign = parts.iter().map(|p| Assignment::new(topic, *p, Offset::Beginning)).collect();
+    let mut k = Consumer::from_config(c, assign).unwrap();
     let (mut out, mut ends) = (vec![], std::collections::HashSet::new());
     let until = Instant::now() + T;
     while ends.len() < parts.len() {
         assert!(Instant::now() < until, "{} of {} partitions at their end", ends.len(), parts.len());
-        match k.next_event(Duration::from_millis(100), &mut |w| eprintln!("lost: {w}")).unwrap() {
+        match k.next_event(Duration::from_millis(100), &mut |n| eprintln!("notice: {n}")).unwrap() {
             Some((i, Polled::Msg(m))) => out.push((parts[i], m)),
             Some((i, Polled::Eof)) => drop(ends.insert(i)),
             _ => {}

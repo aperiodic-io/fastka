@@ -224,13 +224,13 @@ fn settings(c: &Config) -> ConsumerSettings {
     c.consumer().unwrap()
 }
 
-fn consumer(b: &Broker, extra: &[(&str, &str)], parts: Vec<Assign>) -> Consumer {
+fn consumer(b: &Broker, extra: &[(&str, &str)], parts: Vec<Assignment>) -> Consumer {
     let mut c = config(&b.addr);
     c.set("enable.partition.eof", "true").set("fetch.wait.max.ms", "10").set("reconnect.backoff.ms", "1");
     for (k, v) in extra {
         c.set(*k, *v);
     }
-    Consumer::new(Arc::new(Client::new(&c).unwrap()), settings(&c), parts, true)
+    Consumer::new(Arc::new(Client::new(&c).unwrap()), settings(&c), parts).unwrap()
 }
 
 /// Every event until each partition said its end `ends` times, within 5 s: (partition, value or
@@ -240,7 +240,7 @@ fn drain(c: &mut Consumer, ends: usize) -> (Vec<(usize, String)>, Vec<String>) {
     let until = Instant::now() + Duration::from_secs(5);
     while eofs.len() < c.parts.len() || eofs.values().any(|n| *n < ends) {
         assert!(Instant::now() < until, "no end: {got:?} {heard:?}");
-        match c.next_event(Duration::from_millis(50), &mut |w| heard.push(w)).unwrap() {
+        match c.next_event(Duration::from_millis(50), &mut |w| heard.push(w.to_string())).unwrap() {
             Some((i, Polled::Msg(m))) => got.push((i, String::from_utf8(m.value.unwrap()).unwrap())),
             Some((i, Polled::Eof)) => {
                 *eofs.entry(i).or_insert(0) += 1;
@@ -265,7 +265,7 @@ fn every_record_of_every_partition_then_each_end_once() {
     }
     let br = log_broker(logs(&[("t", 0, a), ("t", 1, b)]), no_fault());
     let mut c =
-        consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false), ("t".into(), 1, Offset::At(2), false)]);
+        consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning), Assignment::new("t", 1, Offset::At(2))]);
     let (got, heard) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["a0x", "a0y", "a1x", "a1y", "a2x", "a2y", "a3x", "a3y", "a4x", "a4y", "EOF"]);
     assert_eq!(vals(&got, 1), ["b2", "b3", "b4", "EOF"], "from offset 2");
@@ -285,7 +285,7 @@ fn headers_and_timestamps_come_with_the_messages() {
     let mut a = Log::default();
     a.push(4, &["v"]);
     let br = log_broker(logs(&[("t", 0, a)]), no_fault());
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let Some((0, Polled::Msg(m))) = c.next_event(Duration::from_secs(5), &mut |_| {}).unwrap() else { panic!() };
     assert_eq!((m.offset, m.timestamp, m.header("h")), (0, 1000, Some(&b"hv"[..])));
 }
@@ -297,7 +297,7 @@ fn from_the_end_only_what_comes_after() {
     a.push(0, &["old1", "old2"]);
     let l = logs(&[("t", 0, a)]);
     let br = log_broker(l.clone(), no_fault());
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::End, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::End)]);
     let (got, _) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["EOF"]);
     l.lock().unwrap().get_mut(&("t".into(), 0)).unwrap().push(2, &["new"]);
@@ -311,7 +311,7 @@ fn no_end_unless_asked() {
     let mut a = Log::default();
     a.push(0, &["x"]);
     let br = log_broker(logs(&[("t", 0, a)]), no_fault());
-    let mut c = consumer(&br, &[("enable.partition.eof", "false")], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[("enable.partition.eof", "false")], vec![Assignment::new("t", 0, Offset::Beginning)]);
     assert!(matches!(c.next_event(Duration::from_secs(5), &mut |_| {}).unwrap(), Some((0, Polled::Msg(_)))));
     assert_eq!(c.next_event(Duration::from_millis(200), &mut |_| {}).unwrap(), None);
 }
@@ -338,7 +338,7 @@ fn faults_are_retried_from_the_next_offset() {
     let mut c = consumer(
         &br,
         &[("fetch.message.max.bytes", "1"), ("socket.timeout.ms", "300")], // a batch a Fetch
-        vec![("t".into(), 0, Offset::Beginning, false)],
+        vec![Assignment::new("t", 0, Offset::Beginning)],
     );
     let (got, heard) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["m0", "m1", "m2", "m3", "m4", "m5", "EOF"]);
@@ -352,23 +352,31 @@ fn faults_are_retried_from_the_next_offset() {
 }
 
 /// An offset out of range goes on from the oldest record (`earliest`), the newest (`latest`), or
-/// is an error (`error`).
+/// is an error (`error`), from which a `seek` goes on.
 #[test]
 fn an_offset_out_of_range_follows_auto_offset_reset() {
     let mut a = Log { start: 10, ..Default::default() };
     a.push(0, &["s1", "s2"]);
     let l = logs(&[("t", 0, a)]);
     let br = log_broker(l.clone(), no_fault());
-    let mut c = consumer(&br, &[("auto.offset.reset", "earliest")], vec![("t".into(), 0, Offset::At(3), false)]);
+    let mut c = consumer(&br, &[("auto.offset.reset", "earliest")], vec![Assignment::new("t", 0, Offset::At(3))]);
     let (got, heard) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["s1", "s2", "EOF"]);
-    assert!(heard.iter().any(|h| h.contains("offset 3 is out of range: going on from the oldest")), "{heard:?}");
-    let mut c = consumer(&br, &[("auto.offset.reset", "latest")], vec![("t".into(), 0, Offset::At(99), false)]);
-    let (got, _) = drain(&mut c, 1);
-    assert_eq!(vals(&got, 0), ["EOF"]);
-    let mut c = consumer(&br, &[("auto.offset.reset", "error")], vec![("t".into(), 0, Offset::At(3), false)]);
+    assert_eq!(heard, ["t/0: offset 3 is out of range: reset to 10 (auto.offset.reset)"]);
+    let mut c = consumer(&br, &[("auto.offset.reset", "latest")], vec![Assignment::new("t", 0, Offset::At(99))]);
+    let mut notices = vec![];
+    while !matches!(c.next_event(Duration::from_millis(10), &mut |n| notices.push(n)).unwrap(), Some((0, Polled::Eof)))
+    {
+    }
+    let reset = Notice::Reset { topic: "t".into(), partition: 0, from: 99, to: 12 };
+    assert_eq!(notices, [reset]);
+    let mut c = consumer(&br, &[("auto.offset.reset", "error")], vec![Assignment::new("t", 0, Offset::At(3))]);
     let e = (0..1000).find_map(|_| c.next_event(Duration::from_millis(10), &mut |_| {}).err()).unwrap();
     assert_eq!(e.code(), Some(Code::OFFSET_OUT_OF_RANGE));
+    assert_eq!(c.position(0), Some(3), "where it was");
+    c.seek(0, Offset::Beginning).unwrap();
+    let (got, _) = drain(&mut c, 1);
+    assert_eq!(vals(&got, 0), ["s1", "s2", "EOF"]);
 }
 
 /// A paused partition is not fetched until it is resumed; a full one (`queued.min.messages`)
@@ -383,7 +391,7 @@ fn paused_and_full_partitions_are_not_fetched() {
     let mut c = consumer(
         &br,
         &[("queued.min.messages", "2"), ("fetch.message.max.bytes", "1")], // a batch a Fetch
-        vec![("t".into(), 0, Offset::Beginning, false), ("t".into(), 1, Offset::Beginning, false)],
+        vec![Assignment::new("t", 0, Offset::Beginning), Assignment::new("t", 1, Offset::Beginning)],
     );
     c.pause(|_, p| p == 1);
     let until = Instant::now() + Duration::from_secs(5);
@@ -422,16 +430,16 @@ fn a_corrupt_batch_is_fetched_again_then_an_error() {
         Answer::Body(fetch_answer("t", 0, 0, 1, Some(&b)))
     };
     let br = log_broker(logs(&[("t", 0, a.clone())]), Box::new(move |r, n| (n == 0).then(|| corrupt(r))));
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let (got, heard) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["good", "EOF"]);
     assert!(heard.iter().any(|h| h.contains("CRC")), "{heard:?}");
 
     let br = log_broker(logs(&[("t", 0, a)]), Box::new(move |r, _| Some(corrupt(r))));
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let (mut seen, mut heard) = (vec![], vec![]);
     let e = (0..5000)
-        .find_map(|_| match c.next_event(Duration::from_millis(5), &mut |w| heard.push(w)) {
+        .find_map(|_| match c.next_event(Duration::from_millis(5), &mut |w| heard.push(w.to_string())) {
             Err(e) => Some(e),
             Ok(Some((_, Polled::Msg(m)))) => {
                 seen.push(m);
@@ -454,7 +462,7 @@ fn reading_committed_stops_at_the_last_stable_offset() {
     a.push(0, &["open"]);
     a.lso = Some(2);
     let br = log_broker(logs(&[("t", 0, a)]), no_fault());
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let (got, _) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["c1", "c2", "EOF"], "the end at the LSO, before the open transaction");
     let r = br.requests(wire::FETCH);
@@ -472,7 +480,7 @@ fn reading_uncommitted_ends_at_the_high_watermark() {
     let mut c = consumer(
         &br,
         &[("isolation.level", "read_uncommitted"), ("fetch.message.max.bytes", "1")], // a batch a Fetch
-        vec![("t".into(), 0, Offset::Beginning, false)],
+        vec![Assignment::new("t", 0, Offset::Beginning)],
     );
     let (got, _) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["c1", "c2", "open", "EOF"], "no end at the LSO");
@@ -499,7 +507,7 @@ fn connecting_never_blocks_the_caller() {
         }
         _ => Answer::Drop,
     });
-    let mut c = consumer(&b, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&b, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     c.pump(&mut |_| {}).unwrap(); // the lookups (blocking, bounded) and the connect started
     let t = Instant::now();
     for _ in 0..100 {
@@ -526,7 +534,7 @@ fn leaders_are_looked_up_with_backoff() {
         wire::METADATA => Answer::Body(metadata(&[(0, &ia)], &[("t", &[(0, 0)])])),
         _ => Answer::Drop,
     });
-    let mut c = consumer(&front, &[], vec![("t".into(), 0, Offset::At(0), false)]);
+    let mut c = consumer(&front, &[], vec![Assignment::new("t", 0, Offset::At(0))]);
     let t = Instant::now();
     let (got, heard) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["x", "EOF"]);
@@ -541,7 +549,7 @@ fn next_any_hands_over_runs() {
     let mut c = consumer(
         &Broker::start(|_| Answer::Drop),
         &[],
-        vec![("t".into(), 0, Offset::At(0), false), ("t".into(), 1, Offset::At(0), false)],
+        vec![Assignment::new("t", 0, Offset::At(0)), Assignment::new("t", 1, Offset::At(0))],
     );
     for i in 0..(RUN as i64 + 5) {
         c.parts[0].queue.push_back(Message { offset: i, ..Default::default() });
@@ -559,7 +567,7 @@ fn a_zero_timeout_still_fetches() {
     let mut a = Log::default();
     a.push(0, &["z"]);
     let br = log_broker(logs(&[("t", 0, a)]), no_fault());
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let until = Instant::now() + Duration::from_secs(5);
     loop {
         assert!(Instant::now() < until, "never read");
@@ -587,12 +595,7 @@ fn records_are_read_over_tls() {
     let mut c = config(&format!("localhost:{port}"));
     c.set("security.protocol", "ssl").set("ssl.ca.pem", p.ca_pem.clone());
     c.set("enable.partition.eof", "true").set("fetch.wait.max.ms", "10").set("fetch.message.max.bytes", "100000");
-    let mut k = Consumer::new(
-        Arc::new(Client::new(&c).unwrap()),
-        settings(&c),
-        vec![("t".into(), 0, Offset::Beginning, false)],
-        true,
-    );
+    let mut k = Consumer::from_config(&c, vec![Assignment::new("t", 0, Offset::Beginning)]).unwrap();
     let (got, heard) = drain(&mut k, 1);
     assert_eq!(vals(&got, 0).len(), 81, "{heard:?}");
     assert!(vals(&got, 0)[79].ends_with("-small") && vals(&got, 0)[80] == "EOF");
@@ -604,7 +607,7 @@ fn poll_gives_the_messages_then_the_end_once() {
     let mut a = Log::default();
     a.push(0, &["p1", "p2"]);
     let br = log_broker(logs(&[("t", 0, a)]), no_fault());
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let (mut got, until) = (vec![], Instant::now() + Duration::from_secs(5));
     while !got.contains(&"EOF".to_string()) {
         assert!(Instant::now() < until, "{got:?}");
@@ -628,7 +631,7 @@ fn the_next_fetch_is_pipelined() {
     let mut a = Log::default();
     a.push(0, &["x"]);
     let br = log_broker(logs(&[("t", 0, a)]), no_fault());
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let until = Instant::now() + Duration::from_secs(5);
     while !c.pump(&mut |_| {}).unwrap() {
         assert!(Instant::now() < until);
@@ -645,7 +648,7 @@ fn a_zero_timeout_gives_what_has_arrived() {
     let mut a = Log::default();
     a.push(0, &["z"]);
     let br = log_broker(logs(&[("t", 0, a)]), no_fault());
-    let mut c = consumer(&br, &[("enable.partition.eof", "false")], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[("enable.partition.eof", "false")], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let until = Instant::now() + Duration::from_secs(5);
     loop {
         assert!(Instant::now() < until, "never given");
@@ -674,7 +677,7 @@ fn a_throttling_broker_is_waited_for() {
         })
     });
     let br = log_broker(l, throttled);
-    let mut c = consumer(&br, &[("fetch.message.max.bytes", "1")], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[("fetch.message.max.bytes", "1")], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let t = Instant::now();
     let (got, _) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["t1", "t2", "EOF"]);
@@ -696,7 +699,7 @@ fn a_preferred_replica_is_a_leader_moved() {
         })
     });
     let br = log_broker(logs(&[("t", 0, a)]), fault);
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let (got, heard) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["right", "EOF"]);
     assert!(heard.iter().any(|h| h.contains("NOT_LEADER_OR_FOLLOWER")), "{heard:?}");
@@ -710,14 +713,14 @@ fn fetch_errors_are_retried_or_given() {
     a.push(0, &["x"]);
     let timed_out: Fault = Box::new(|_, n| (n == 0).then(|| Answer::Body(fetch_answer("t", 0, 7, -1, None))));
     let br = log_broker(logs(&[("t", 0, a.clone())]), timed_out);
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let (got, heard) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["x", "EOF"]);
     assert!(heard.iter().any(|h| h.contains("REQUEST_TIMED_OUT")), "{heard:?}");
 
     let refused: Fault = Box::new(|_, _| Some(Answer::Body(fetch_answer("t", 0, 29, -1, None))));
     let br = log_broker(logs(&[("t", 0, a)]), refused);
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let e = (0..1000).find_map(|_| c.next_event(Duration::from_millis(5), &mut |_| {}).err()).unwrap();
     assert_eq!(e.code(), Some(Code(29)));
 }
@@ -731,12 +734,12 @@ fn an_unanswered_fetch_waits_out_its_own_wait_too() {
     let mut c = consumer(
         &br,
         &[("socket.timeout.ms", "200"), ("fetch.wait.max.ms", "400")],
-        vec![("t".into(), 0, Offset::Beginning, false)],
+        vec![Assignment::new("t", 0, Offset::Beginning)],
     );
     let (mut heard, until) = (vec![], Instant::now() + Duration::from_secs(5));
     while heard.is_empty() {
         assert!(Instant::now() < until);
-        c.pump(&mut |w| heard.push(w)).unwrap();
+        c.pump(&mut |w| heard.push(w.to_string())).unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(heard[0].contains("no answer to a Fetch in 600ms"), "{heard:?}");
@@ -753,7 +756,7 @@ fn a_lost_leader_is_reconnected_to_with_backoff() {
     let mut c = consumer(
         &b,
         &[("reconnect.backoff.ms", "50"), ("reconnect.backoff.max.ms", "100")],
-        vec![("t".into(), 0, Offset::At(0), false)],
+        vec![Assignment::new("t", 0, Offset::At(0))],
     );
     let t = Instant::now();
     while t.elapsed() < Duration::from_secs(2) {
@@ -785,7 +788,7 @@ fn a_leader_at_a_new_address_is_followed() {
             Answer::Drop
         }
     });
-    let mut c = consumer(&old, &[], vec![("t".into(), 0, Offset::At(0), false)]);
+    let mut c = consumer(&old, &[], vec![Assignment::new("t", 0, Offset::At(0))]);
     let (got, _) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["moved", "EOF"]);
     assert!(fetched.load(Ordering::SeqCst));
@@ -814,7 +817,8 @@ fn each_partition_is_fetched_from_its_own_leader() {
     let ba = leader(logs(&[("a", 0, a)]), addrs.clone());
     let bb = leader(logs(&[("b", 0, b)]), addrs.clone());
     addrs.set((ba.addr.clone(), bb.addr.clone())).unwrap();
-    let mut c = consumer(&ba, &[], vec![("a".into(), 0, Offset::At(0), false), ("b".into(), 0, Offset::At(0), false)]);
+    let mut c =
+        consumer(&ba, &[], vec![Assignment::new("a", 0, Offset::At(0)), Assignment::new("b", 0, Offset::At(0))]);
     let (got, heard) = drain(&mut c, 1);
     assert_eq!((vals(&got, 0), vals(&got, 1)), (vec!["from a", "EOF"], vec!["from b", "EOF"]), "{heard:?}");
     assert_eq!(c.brokers.len(), 2);
@@ -829,7 +833,7 @@ fn a_fetch_unanswered_never_blocks_the_caller() {
     let mut a = Log::default();
     a.push(0, &["x"]);
     let br = log_broker(logs(&[("t", 0, a)]), Box::new(|_, _| Some(Answer::Silence)));
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let until = Instant::now() + Duration::from_secs(5);
     while br.requests(wire::FETCH).is_empty() {
         assert!(Instant::now() < until);
@@ -850,7 +854,7 @@ fn a_quiet_socket_is_not_read_on_every_pump() {
     let mut a = Log::default();
     a.push(0, &["x"]);
     let br = log_broker(logs(&[("t", 0, a)]), Box::new(|_, _| Some(Answer::Silence)));
-    let mut c = consumer(&br, &[], vec![("t".into(), 0, Offset::Beginning, false)]);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
     let until = Instant::now() + Duration::from_secs(5);
     while br.requests(wire::FETCH).is_empty() {
         assert!(Instant::now() < until);
@@ -906,7 +910,7 @@ fn a_leader_that_stops_answering_is_left_for_the_new_leader() {
     let mut c = consumer(
         &old,
         &[("socket.timeout.ms", "30000"), ("fetch.wait.max.ms", "100")],
-        vec![("t".into(), 0, Offset::At(0), false)],
+        vec![Assignment::new("t", 0, Offset::At(0))],
     );
     let (got, heard) = drain(&mut c, 2);
     assert_eq!(vals(&got, 0), ["before", "EOF", "after", "EOF"], "{heard:?}");
@@ -948,7 +952,7 @@ fn a_leader_that_stops_answering_at_an_address_it_left_is_left() {
     let mut c = consumer(
         &old,
         &[("socket.timeout.ms", "30000"), ("fetch.wait.max.ms", "100")],
-        vec![("t".into(), 0, Offset::At(0), false)],
+        vec![Assignment::new("t", 0, Offset::At(0))],
     );
     let (got, heard) = drain(&mut c, 2);
     assert_eq!(vals(&got, 0), ["before", "EOF", "after", "EOF"], "{heard:?}");
@@ -972,18 +976,18 @@ fn a_slow_leader_is_looked_up_once_a_while_and_kept() {
     let mut c = consumer(
         &b,
         &[("socket.timeout.ms", "30000"), ("fetch.wait.max.ms", "100")],
-        vec![("t".into(), 0, Offset::At(0), false)],
+        vec![Assignment::new("t", 0, Offset::At(0))],
     );
     let mut heard = vec![];
     while Instant::now() < slow_from {
-        c.pump(&mut |w| heard.push(w)).unwrap();
+        c.pump(&mut |w| heard.push(w.to_string())).unwrap();
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(b.requests(wire::METADATA).len(), 1, "a leader answering in time is not looked up again");
     let fetches = b.requests(wire::FETCH).len();
     while b.requests(wire::FETCH).len() < fetches + 3 {
         assert!(Instant::now() < slow_from + Duration::from_secs(15), "{heard:?}");
-        c.pump(&mut |w| heard.push(w)).unwrap();
+        c.pump(&mut |w| heard.push(w.to_string())).unwrap();
         std::thread::sleep(Duration::from_millis(5));
     }
     // two answers 3.5 s late: overdue from 1.1 s each, looked up at about 1.1, 2.1 and 3.1 s. At
@@ -1024,15 +1028,15 @@ fn a_slow_leader_is_judged_by_each_partitions_own_topic() {
     let fine = Broker::start(move |r| if r.api == wire::METADATA { m1(r) } else { h1(r) });
     addrs.set((slow.addr.clone(), fine.addr.clone())).unwrap();
     let parts = vec![
-        ("a".into(), 0, Offset::At(0), false),
-        ("a".into(), 1, Offset::At(0), false),
-        ("b".into(), 1, Offset::At(0), false),
+        Assignment::new("a", 0, Offset::At(0)),
+        Assignment::new("a", 1, Offset::At(0)),
+        Assignment::new("b", 1, Offset::At(0)),
     ];
     let mut c = consumer(&slow, &[("socket.timeout.ms", "30000"), ("fetch.wait.max.ms", "100")], parts);
     let mut heard = vec![];
     // through two of its late answers: overdue, and looked up for it, more than once
     while Instant::now() < slow_from + Duration::from_secs(5) {
-        c.pump(&mut |w| heard.push(w)).unwrap();
+        c.pump(&mut |w| heard.push(w.to_string())).unwrap();
         std::thread::sleep(Duration::from_millis(5));
     }
     let lookups = slow.requests(wire::METADATA).len() + fine.requests(wire::METADATA).len();
@@ -1040,4 +1044,346 @@ fn a_slow_leader_is_judged_by_each_partitions_own_topic() {
     assert!(heard.is_empty(), "{heard:?}");
     let f = slow.requests(wire::FETCH);
     assert!(f.iter().all(|r| r.conn == f[0].conn), "one connection");
+}
+
+/// A corrupt batch fetched again until its retries are spent is an error; the Fetch sent from
+/// past it is dropped with it: the batch is never skipped, however long the caller polls on.
+#[test]
+fn a_corrupt_batch_is_never_skipped_after_its_error() {
+    let mut a = Log::default();
+    a.push(0, &["bad"]); // offset 0, served corrupt below
+    a.push(0, &["after"]); // offset 1
+    let bad = {
+        let mut b = batch(0, 0, &["bad"]);
+        let n = b.len();
+        b[n - 2] ^= 1;
+        b
+    };
+    let fault: Fault =
+        Box::new(move |r, _| (fetched(r)[0].2 == 0).then(|| Answer::Body(fetch_answer("t", 0, 0, 2, Some(&bad)))));
+    let br = log_broker(logs(&[("t", 0, a)]), fault);
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    let (mut errs, mut got) = (0, vec![]);
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until {
+        match c.next_event(Duration::from_millis(5), &mut |_| {}) {
+            Err(_) => errs += 1,
+            Ok(Some((_, Polled::Msg(m)))) => got.push(m.offset),
+            _ => {}
+        }
+    }
+    assert!(errs >= 2, "{errs} errors");
+    assert!(got.is_empty(), "nothing past the corrupt batch: {got:?}");
+    assert_eq!(c.position(0), Some(0));
+    let asked: Vec<i64> = br.requests(wire::FETCH).iter().flat_map(fetched).map(|f| f.2).collect();
+    assert!(asked.iter().all(|&o| o == 0), "never fetched from past it: {asked:?}");
+}
+
+/// One partition's error (an offset out of range with `auto.offset.reset=error`) in a response:
+/// the other partitions' records are queued all the same, none lost; the consumer goes on.
+#[test]
+fn a_partitions_error_loses_no_other_partitions_records() {
+    let (mut a, mut b) = (Log { start: 10, ..Default::default() }, Log::default());
+    a.push(0, &["a"]);
+    b.push(0, &["b0", "b1"]);
+    let br = log_broker(logs(&[("t", 0, a), ("t", 1, b)]), no_fault());
+    let mut c = consumer(
+        &br,
+        &[("auto.offset.reset", "error")],
+        vec![Assignment::new("t", 0, Offset::At(3)), Assignment::new("t", 1, Offset::Beginning)],
+    );
+    let (mut got, mut errs) = (vec![], 0);
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until {
+        match c.next_event(Duration::from_millis(5), &mut |_| {}) {
+            Err(e) => {
+                assert_eq!(e.code(), Some(Code::OFFSET_OUT_OF_RANGE));
+                errs += 1;
+            }
+            Ok(Some((i, Polled::Msg(m)))) => got.push((i, String::from_utf8(m.value.unwrap()).unwrap())),
+            _ => {}
+        }
+    }
+    assert!(errs >= 1);
+    assert_eq!(got, [(1, "b0".to_string()), (1, "b1".to_string())]);
+    assert_eq!((c.position(0), c.position(1)), (Some(3), Some(2)));
+}
+
+/// A response naming a partition not asked for, or one twice, is refused whole before anything
+/// is taken of it: fetched again from the same offsets, nothing skipped.
+#[test]
+fn a_response_naming_a_partition_not_asked_for_skips_nothing() {
+    for extra in [7, 0] {
+        let mut a = Log::default();
+        a.push(0, &["a0"]);
+        a.push(0, &["a1"]);
+        let rec = batch(0, 0, &["a0"]);
+        let fault: Fault = Box::new(move |_, n| {
+            (n == 0).then(|| {
+                let mut out = vec![];
+                out.i32(0);
+                out.i16(0);
+                out.i32(0);
+                out.i32(1);
+                out.str("t");
+                out.i32(2);
+                for (p, recs) in [(0, Some(&rec[..])), (extra, None)] {
+                    out.i32(p);
+                    out.i16(0);
+                    out.i64(2);
+                    out.i64(2);
+                    out.i64(0);
+                    out.i32(-1);
+                    out.i32(-1);
+                    match recs {
+                        Some(r) => out.bytes(r),
+                        None => out.i32(-1),
+                    }
+                }
+                Answer::Body(out)
+            })
+        });
+        let br = log_broker(logs(&[("t", 0, a)]), fault);
+        let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
+        let (got, heard) = drain(&mut c, 1);
+        assert_eq!(vals(&got, 0), ["a0", "a1", "EOF"], "{heard:?}");
+        assert!(heard[0].contains(&format!("t/{extra}: in a Fetch response, not asked for")), "{heard:?}");
+    }
+}
+
+/// A paused partition gives nothing, what is queued of it included, until it is resumed.
+#[test]
+fn a_paused_partition_gives_nothing_queued_until_resumed() {
+    let mut a = Log::default();
+    a.push(0, &["a1", "a2"]);
+    let br = log_broker(logs(&[("t", 0, a)]), no_fault());
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    while c.parts[0].queue.is_empty() {
+        c.pump(&mut |_| {}).unwrap();
+    }
+    c.pause(|_, _| true);
+    assert_eq!(c.next_event(Duration::from_millis(50), &mut |_| {}).unwrap(), None);
+    assert_eq!((c.poll(0), c.next_any()), (Polled::Empty, None));
+    assert_eq!(c.position(0), Some(0));
+    c.resume(|_, _| true);
+    let (got, _) = drain(&mut c, 1);
+    assert_eq!(vals(&got, 0), ["a1", "a2", "EOF"]);
+    // paused from the start
+    let mut a = Log::default();
+    a.push(0, &["x"]);
+    let br = log_broker(logs(&[("t", 0, a)]), no_fault());
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning).paused()]);
+    assert_eq!(c.next_event(Duration::from_millis(100), &mut |_| {}).unwrap(), None);
+    assert!(br.requests(wire::FETCH).is_empty());
+}
+
+/// `Duration::MAX`, a natural "until one comes", waits rather than overflowing.
+#[test]
+fn next_event_waits_for_duration_max() {
+    let mut a = Log::default();
+    a.push(0, &["x"]);
+    let br = log_broker(logs(&[("t", 0, a)]), no_fault());
+    let mut c = consumer(&br, &[("enable.partition.eof", "false")], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    assert!(matches!(c.next_event(Duration::MAX, &mut |_| {}).unwrap(), Some((0, Polled::Msg(_)))));
+}
+
+/// A partition assigned twice (one index would get its records twice, the other none) or an
+/// offset below 0 (read as the beginning) is refused; `seek` to one below 0 too, changing nothing.
+#[test]
+fn an_assignment_twice_or_below_offset_0_is_refused() {
+    let br = Broker::start(|_| Answer::Drop);
+    let c = config(&br.addr);
+    let client = Arc::new(Client::new(&c).unwrap());
+    let new = |parts| Consumer::new(client.clone(), settings(&c), parts).map(|_| ()).unwrap_err().to_string();
+    let twice = vec![Assignment::new("t", 0, Offset::Beginning), Assignment::new("t", 0, Offset::At(4))];
+    assert!(new(twice).contains("t/0: assigned twice"));
+    assert!(new(vec![Assignment::new("t", 1, Offset::At(-2))]).contains("t/1: offset -2"));
+    let mut k = Consumer::from_config(&c, vec![Assignment::new("t", 0, Offset::At(5))]).unwrap();
+    assert!(k.seek(0, Offset::At(-1)).is_err());
+    assert_eq!(k.position(0), Some(5));
+}
+
+/// KIP-74: of a Fetch, only the first partition with data gets a batch past its max bytes whole,
+/// the others it cut. The partitions are asked in turn first, as Java's consumer and librdkafka
+/// rotate them: a big batch behind a busy partition is not starved.
+#[test]
+fn a_partition_behind_a_busy_one_is_not_starved() {
+    let (mut a, mut b) = (Log::default(), Log::default());
+    for i in 0..300 {
+        a.push(0, &[&format!("a{i}")]);
+    }
+    b.push(0, &[&"B".repeat(2000)]);
+    let l = logs(&[("t", 0, a), ("t", 1, b)]);
+    let l2 = l.clone();
+    let fault: Fault = Box::new(move |r, _| {
+        let l = l2.lock().unwrap();
+        let mut out = vec![];
+        out.i32(0);
+        out.i16(0);
+        out.i32(0);
+        let asked = fetched(r);
+        out.i32(asked.len() as i32); // one topic per entry is fine for the decoder
+        let mut min_one = true;
+        for (t, p, offset) in asked {
+            out.str(&t);
+            out.i32(1);
+            let log = &l[&(t.clone(), p)];
+            out.i32(p);
+            out.i16(0);
+            out.i64(log.end());
+            out.i64(log.end());
+            out.i64(0);
+            out.i32(-1);
+            out.i32(-1);
+            let max = 300usize;
+            let mut recs = vec![];
+            for (base, bt) in &log.batches {
+                let next = base + i32::from_be_bytes(bt[23..27].try_into().unwrap()) as i64 + 1;
+                if next <= offset {
+                    continue;
+                }
+                if recs.is_empty() && bt.len() > max && !min_one {
+                    recs.extend(&bt[..max]); // partial batch, as LogSegment.read slices it
+                    break;
+                }
+                if !recs.is_empty() && recs.len() + bt.len() > max {
+                    break;
+                }
+                recs.extend(bt);
+            }
+            if !recs.is_empty() {
+                min_one = false;
+            }
+            out.bytes(&recs);
+        }
+        Some(Answer::Body(out))
+    });
+    let br = log_broker(l, fault);
+    let mut c = consumer(
+        &br,
+        &[("enable.partition.eof", "false"), ("fetch.message.max.bytes", "300")],
+        vec![Assignment::new("t", 0, Offset::Beginning), Assignment::new("t", 1, Offset::Beginning)],
+    );
+    let mut order = vec![];
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until && !order.iter().any(|&(i, _)| i == 1) {
+        if let Some((i, Polled::Msg(m))) = c.next_event(Duration::from_millis(5), &mut |_| {}).unwrap() {
+            order.push((i, m.offset));
+        }
+    }
+    let before = order.iter().filter(|o| o.0 == 0).count();
+    assert!(before < 50, "partition 1 got its first record only after {before} of partition 0's");
+}
+
+/// A broker always corrupt beside a healthy one is an error after its own retries (the healthy
+/// one's answers do not reset its count), and its reconnect backoff grows meanwhile.
+#[test]
+fn a_brokers_corrupt_count_and_backoff_are_its_own() {
+    let (mut a, mut b) = (Log::default(), Log::default());
+    a.push(0, &["a"]);
+    for i in 0..3000 {
+        b.push(0, &[&format!("b{i}")]); // one batch a Fetch, each answered at once
+    }
+    let addrs = Arc::new(std::sync::OnceLock::<(String, String)>::new());
+    let md = |addrs: Arc<std::sync::OnceLock<(String, String)>>| {
+        move |_: &Req| {
+            let (x, y) = addrs.get().unwrap();
+            Answer::Body(metadata(&[(0, x), (1, y)], &[("a", &[(0, 0)]), ("b", &[(0, 1)])]))
+        }
+    };
+    let bad = {
+        let mut b = batch(0, 0, &["bad"]);
+        let n = b.len();
+        b[n - 2] ^= 1;
+        b
+    };
+    let always: Fault = Box::new(move |_, _| Some(Answer::Body(fetch_answer("a", 0, 0, 1, Some(&bad)))));
+    let (m0, h0) = (md(addrs.clone()), log_handler(logs(&[("a", 0, a)]), always));
+    let corrupt = Broker::start(move |r| if r.api == wire::METADATA { m0(r) } else { h0(r) });
+    let (m1, h1) = (md(addrs.clone()), log_handler(logs(&[("b", 0, b)]), no_fault()));
+    let fine = Broker::start(move |r| if r.api == wire::METADATA { m1(r) } else { h1(r) });
+    addrs.set((corrupt.addr.clone(), fine.addr.clone())).unwrap();
+    let mut c = consumer(
+        &corrupt,
+        &[("enable.partition.eof", "false"), ("reconnect.backoff.max.ms", "1000"), ("fetch.message.max.bytes", "1")],
+        vec![Assignment::new("a", 0, Offset::At(0)), Assignment::new("b", 0, Offset::At(0))],
+    );
+    let until = Instant::now() + Duration::from_secs(5);
+    let e = loop {
+        assert!(Instant::now() < until, "a broker always corrupt is never an error");
+        if let Err(e) = c.next_event(Duration::from_millis(5), &mut |_| {}) {
+            break e;
+        }
+    };
+    assert!(e.to_string().contains("CRC"), "{e}");
+    let bad = c.brokers.iter().find(|b| b.addr == corrupt.addr).unwrap();
+    assert!(bad.backoff >= Duration::from_millis(8), "doubled from 1 ms each time: {:?}", bad.backoff);
+}
+
+/// A Fetch whose write stalls (the broker reads nothing) times out as one unanswered does.
+#[test]
+fn a_fetch_whose_write_stalls_times_out() {
+    let mut a = Log::default();
+    a.push(0, &["x"]);
+    let br = log_broker(logs(&[("t", 0, a)]), Box::new(|_, _| Some(Answer::Silence)));
+    let mut c = consumer(&br, &[("socket.timeout.ms", "100")], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    let until = Instant::now() + Duration::from_secs(5);
+    while br.requests(wire::FETCH).is_empty() {
+        assert!(Instant::now() < until);
+        c.pump(&mut |_| {}).unwrap();
+    }
+    // as if the request were still being written, long ago
+    c.brokers[0].written = 0;
+    c.brokers[0].inflight.as_mut().unwrap().since = Instant::now() - Duration::from_secs(60);
+    let e = c.receive(0, Instant::now()).unwrap_err();
+    assert!(e.to_string().contains("no answer to a Fetch"), "{e}");
+}
+
+/// A partition reset (or its leader lost) while a lookup runs is looked up as soon as it ends:
+/// the lookup, which did all it was for, does not count it as its failure (a backoff).
+#[test]
+fn a_reset_while_a_lookup_runs_is_looked_up_at_once() {
+    let br = Broker::start(|_| Answer::Drop);
+    let mut c =
+        consumer(&br, &[], vec![Assignment::new("t", 0, Offset::At(0)), Assignment::new("t", 1, Offset::At(0))]);
+    c.parts[0].broker = Some(0);
+    let (tx, rx) = mpsc::channel();
+    tx.send(Found { offsets: None, leaders: vec![] }).unwrap();
+    (c.lookup, c.looking) = (Some(rx), vec![(0, 0, false, true), (1, 0, false, true)]);
+    // their leaders looked up (found); partition 0 reset meanwhile
+    c.parts[1].broker = Some(0);
+    c.parts[0].next = None;
+    let now = Instant::now();
+    c.lookups(now, &mut |_| {});
+    assert!(c.lookup_at <= now && c.lookup_backoff == BACKOFF, "the reset's lookup waits {:?}", c.lookup_at - now);
+    // and one that failed at what it was for waits
+    let (tx, rx) = mpsc::channel();
+    tx.send(Found { offsets: None, leaders: vec![] }).unwrap();
+    (c.lookup, c.looking) = (Some(rx), vec![(0, 0, true, false)]);
+    c.lookups(now, &mut |_| {});
+    assert!(c.lookup_at > now);
+}
+
+/// `seek`: what is queued of the partition dropped, and what a Fetch in flight brings of it from
+/// the old offset; read from the new one on.
+#[test]
+fn seek_drops_what_is_queued_and_in_flight() {
+    let mut a = Log::default();
+    for i in 0..5 {
+        a.push(0, &[&format!("m{i}")]);
+    }
+    let br = log_broker(logs(&[("t", 0, a)]), no_fault());
+    let mut c = consumer(&br, &[("fetch.message.max.bytes", "1")], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    // m0 queued, the Fetch from 1 in flight
+    while c.parts[0].queue.is_empty() || c.brokers[0].inflight.is_none() {
+        c.pump(&mut |_| {}).unwrap();
+    }
+    c.seek(0, Offset::At(3)).unwrap();
+    assert_eq!(c.position(0), Some(3));
+    let (got, heard) = drain(&mut c, 1);
+    assert_eq!(vals(&got, 0), ["m3", "m4", "EOF"], "{heard:?}");
+    c.seek(0, Offset::Beginning).unwrap();
+    assert_eq!(c.position(0), None, "looked up");
+    let (got, _) = drain(&mut c, 1);
+    assert_eq!(vals(&got, 0), ["m0", "m1", "m2", "m3", "m4", "EOF"]);
 }

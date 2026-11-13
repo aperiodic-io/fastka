@@ -311,10 +311,10 @@ impl<C: Deliveries> Producer<C> {
             Ok(Some(part)) => {
                 let q = &mut t.parts.get_mut(&part).expect("a partition of the topic").queue;
                 q.push_back(p);
-                wake = q.len() == 1 || q.len() % sh.s.batch_messages == 0;
+                wake = q.len() == 1 || q.len().is_multiple_of(sh.s.batch_messages);
                 // a batch's worth on this partition: the next keyless go to another (KIP-480's
                 // sticky partitioner, as librdkafka's)
-                if sticky && q.len() % sh.s.batch_messages == 0 {
+                if sticky && q.len().is_multiple_of(sh.s.batch_messages) {
                     t.rotate(xorshift(&mut st.rng));
                 }
             }

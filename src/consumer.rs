@@ -1,15 +1,18 @@
 //! The consumer: each partition leader's Fetch sent from the caller's thread on a non-blocking
 //! socket, the next Fetch sent before a response is parsed (the broker prepares it meanwhile),
 //! each partition's records queued for the caller to take (`poll`, `next_any`). No threads hand
-//! messages over and no message is an object of its own until it is taken (brrrrr's ADR-0005).
+//! messages over and no message is an object of its own until it is taken.
 //!
 //! Nothing blocks the caller's thread: connecting (a resolver, a SYN dropped) and looking up
 //! leaders and offsets run on threads of their own; a lookup that fails is tried again later,
-//! with a doubling backoff, as librdkafka recovers by itself. A lost connection, a moved leader, an offset out of range
-//! (`auto.offset.reset`), each is retried from the next offset not yet given, and said to the
-//! caller's `lost` (to count and log).
+//! with a doubling backoff, as librdkafka recovers by itself. A lost connection, a moved leader,
+//! an offset out of range (`auto.offset.reset`), each is retried from the next offset not yet
+//! given, and told to the caller's `notice` (a [`Notice`], to count and log).
+//!
+//! Not done: KIP-320's leader epochs (a Fetch names none, so a truncation after an unclean
+//! leader election is not detected).
 use crate::client::Client;
-use crate::config::{ConsumerSettings, Net, Reset};
+use crate::config::{Config, ConsumerSettings, Net, Reset};
 use crate::conn::{self, Conn, Stream};
 use crate::error::{Code, Error, Result};
 use crate::records::{self, ReadOpts};
@@ -24,11 +27,20 @@ use std::time::{Duration, Instant};
 pub enum Offset {
     Beginning,
     End,
+    /// at least 0
     At(i64),
+}
+
+fn checked(t: &str, p: i32, o: Offset) -> Result<()> {
+    match o {
+        Offset::At(n) if n < 0 => Err(Error::Config(format!("{t}/{p}: offset {n}: an offset is at least 0"))),
+        _ => Ok(()),
+    }
 }
 
 /// A message as the consumer gives it.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Message {
     pub offset: i64,
     /// ms
@@ -36,7 +48,6 @@ pub struct Message {
     pub key: Option<Vec<u8>>,
     /// None: a tombstone
     pub value: Option<Vec<u8>>,
-    /// only when the consumer was made `with_headers`
     pub headers: Vec<(String, Option<Vec<u8>>)>,
 }
 
@@ -48,16 +59,57 @@ impl Message {
 
 /// What `poll` gives of a partition.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Polled {
     Msg(Message),
     /// The partition's end: every record it held when it was fetched last has been given
     /// (with `enable.partition.eof`).
     Eof,
+    /// nothing yet (or the partition is paused)
     Empty,
 }
 
-/// A partition's assignment: (topic, partition, where from, paused).
-pub type Assign = (String, i32, Offset, bool);
+/// A partition to consume: its topic, number, where from, and whether it starts paused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Assignment {
+    topic: String,
+    partition: i32,
+    offset: Offset,
+    paused: bool,
+}
+
+impl Assignment {
+    pub fn new(topic: impl Into<String>, partition: i32, offset: Offset) -> Assignment {
+        Assignment { topic: topic.into(), partition, offset, paused: false }
+    }
+    /// Not fetched, nor given, until `Consumer::resume`.
+    pub fn paused(self) -> Assignment {
+        Assignment { paused: true, ..self }
+    }
+}
+
+/// What the consumer mended by itself, told to the caller's `notice` (to count and log).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Notice {
+    /// The partition's offset `from` was out of range: read on from `to` (`auto.offset.reset`).
+    /// The records between are not given.
+    Reset { topic: String, partition: i32, from: i64, to: i64 },
+    /// Something tried again (a connection lost, a leader moved, a lookup failed): no record is
+    /// lost or given twice for it.
+    Retrying(String),
+}
+
+impl std::fmt::Display for Notice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Notice::Reset { topic, partition, from, to } => {
+                write!(f, "{topic}/{partition}: offset {from} is out of range: reset to {to} (auto.offset.reset)")
+            }
+            Notice::Retrying(why) => f.write_str(why),
+        }
+    }
+}
 
 /// A lookup's longest; one that fails is tried again later.
 const LOOKUP: Duration = Duration::from_secs(2);
@@ -68,7 +120,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// connection stays open until `socket.timeout.ms`, while its partitions get new leaders in
 /// seconds. A partition led elsewhere now drops the connection and is fetched from its new leader.
 const OVERDUE: Duration = Duration::from_secs(1);
-/// Responses in a row that cannot be read (a corrupt batch) fetched again before it is an error.
+/// A broker's responses in a row that cannot be read (a corrupt batch) fetched again before it
+/// is an error.
 const CORRUPT_RETRIES: u32 = 3;
 /// `next_any`'s longest run of a partition before the next's.
 const RUN: usize = 1000;
@@ -89,7 +142,8 @@ enum Link {
 
 struct InFlight {
     corr: i32,
-    asked: Vec<(usize, i64)>,
+    /// (partition, offset, its epoch then: one seeked since is not this Fetch's to answer)
+    asked: Vec<(usize, i64, u32)>,
     since: Instant,
 }
 
@@ -103,6 +157,11 @@ struct Broker {
     inflight: Option<InFlight>,
     corr: i32,
     backoff: Duration,
+    /// its responses in a row that could not be read
+    corrupt: u32,
+    /// its Fetches sent: where the next starts in its partitions (KIP-74 gives only the first
+    /// partition with data a batch past its max bytes; each must be first in turn)
+    rotate: usize,
     /// no request before then: the broker asked for the wait (`throttle_time_ms`, KIP-219)
     throttled: Instant,
     /// when its socket, found empty, is read again (`QUIET_READ`)
@@ -127,6 +186,10 @@ struct Part {
     incoming: usize,
     at_end: bool,
     eof: bool,
+    /// one more at each `seek`: what was asked before it is not taken
+    epoch: u32,
+    /// the offset found out of range, until where to read on from is looked up
+    reset_from: Option<i64>,
 }
 
 /// The Fetch of the partitions assigned it, on the caller's thread.
@@ -134,7 +197,6 @@ pub struct Consumer {
     client: Arc<Client>,
     net: Arc<Net>,
     s: ConsumerSettings,
-    with_headers: bool,
     parts: Vec<Part>,
     brokers: Vec<Broker>,
     plain: Vec<u8>,
@@ -143,10 +205,9 @@ pub struct Consumer {
     lookup_backoff: Duration,
     turn: usize,
     run: usize,
-    /// responses in a row that could not be read
-    corrupt: u32,
-    /// a lookup under way
+    /// a lookup under way, and the partitions it is for: (index, epoch, its offset, its leader)
     lookup: Option<mpsc::Receiver<Found>>,
+    looking: Vec<(usize, u32, bool, bool)>,
 }
 
 /// A lookup's answer: the offsets asked for, each topic's leaders.
@@ -162,31 +223,39 @@ impl std::fmt::Debug for Consumer {
 }
 
 impl Consumer {
-    /// A consumer of `parts` on `client`'s cluster; `with_headers`: messages carry their headers.
-    pub fn new(client: Arc<Client>, s: ConsumerSettings, parts: Vec<Assign>, with_headers: bool) -> Consumer {
+    /// A consumer of `parts` on `client`'s cluster. An error: a partition assigned twice, or an
+    /// offset below 0.
+    pub fn new(client: Arc<Client>, s: ConsumerSettings, parts: Vec<Assignment>) -> Result<Consumer> {
+        for (i, a) in parts.iter().enumerate() {
+            checked(&a.topic, a.partition, a.offset)?;
+            if parts[..i].iter().any(|b| b.topic == a.topic && b.partition == a.partition) {
+                return Err(Error::Config(format!("{}/{}: assigned twice", a.topic, a.partition)));
+            }
+        }
         let parts = parts
             .into_iter()
-            .map(|(topic, partition, want, paused)| Part {
-                topic,
-                partition,
-                next: match want {
-                    Offset::At(o) if o >= 0 => Some(o),
+            .map(|a| Part {
+                next: match a.offset {
+                    Offset::At(o) => Some(o),
                     _ => None,
                 },
-                want,
+                topic: a.topic,
+                partition: a.partition,
+                want: a.offset,
                 queue: VecDeque::new(),
-                paused,
+                paused: a.paused,
                 broker: None,
                 incoming: 0,
                 at_end: false,
                 eof: false,
+                epoch: 0,
+                reset_from: None,
             })
             .collect();
-        Consumer {
+        Ok(Consumer {
             net: client.net().clone(),
             client,
             s,
-            with_headers,
             parts,
             brokers: vec![],
             plain: vec![],
@@ -194,9 +263,14 @@ impl Consumer {
             lookup_backoff: BACKOFF,
             turn: 0,
             run: 0,
-            corrupt: 0,
             lookup: None,
-        }
+            looking: vec![],
+        })
+    }
+
+    /// A consumer of `parts`, its client and settings made of `cfg`.
+    pub fn from_config(cfg: &Config, parts: Vec<Assignment>) -> Result<Consumer> {
+        Consumer::new(Arc::new(Client::new(cfg)?), cfg.consumer()?, parts)
     }
 
     /// Its cluster's control plane.
@@ -210,12 +284,36 @@ impl Consumer {
     }
 
     /// The next offset partition `i` gives (None: not resolved yet), past what is queued.
+    ///
+    /// Panics if `i` is not an index of `partitions`.
     pub fn position(&self, i: usize) -> Option<i64> {
         let p = &self.parts[i];
         p.queue.front().map(|m| m.offset).or(p.next)
     }
 
-    /// Partitions that `which` names fetched again, or no longer.
+    /// Partition `i` read from `offset` on: what is queued of it, and what a Fetch in flight
+    /// brings of it, dropped. After `auto.offset.reset=error`'s error, where to go on from.
+    /// An error: an offset below 0 (nothing changed).
+    ///
+    /// Panics if `i` is not an index of `partitions`.
+    pub fn seek(&mut self, i: usize, offset: Offset) -> Result<()> {
+        let p = &mut self.parts[i];
+        checked(&p.topic, p.partition, offset)?;
+        p.epoch = p.epoch.wrapping_add(1);
+        p.queue.clear();
+        (p.incoming, p.at_end, p.eof, p.reset_from, p.want) = (0, false, false, None, offset);
+        p.next = match offset {
+            Offset::At(o) => Some(o),
+            _ => None,
+        };
+        if p.next.is_none() {
+            self.lookup_at = self.lookup_at.min(Instant::now());
+        }
+        Ok(())
+    }
+
+    /// Partitions that `which` names fetched and given again, or no longer (what is queued of a
+    /// paused partition is kept for its resume).
     pub fn resume(&mut self, which: impl Fn(&str, i32) -> bool) {
         self.parts.iter_mut().filter(|p| which(&p.topic, p.partition)).for_each(|p| p.paused = false);
     }
@@ -225,7 +323,7 @@ impl Consumer {
 
     /// The offsets not resolved and the leaders of the partitions without a broker, looked up on
     /// a thread of its own once the backoff is past; its answer applied once it has one.
-    fn lookups(&mut self, now: Instant, lost: &mut dyn FnMut(String)) {
+    fn lookups(&mut self, now: Instant, notice: &mut dyn FnMut(Notice)) {
         if let Some(rx) = &self.lookup {
             let done = match rx.try_recv() {
                 Err(mpsc::TryRecvError::Empty) => return,
@@ -235,12 +333,18 @@ impl Consumer {
             self.lookup = None;
             let failed = match done {
                 None => {
-                    lost("looking up leaders and offsets: the thread ended".into());
+                    notice(Notice::Retrying("looking up leaders and offsets: the thread ended".into()));
                     true
                 }
-                Some(d) => self.found(d, now, lost),
+                Some(d) => self.found(d, now, notice),
             };
-            let failed = failed || self.parts.iter().any(|p| p.broker.is_none() || p.next.is_none());
+            // only what it was for: a partition reset (or lost) while it ran is looked up at once
+            let looking = std::mem::take(&mut self.looking);
+            let failed = failed
+                || looking.iter().any(|&(i, e, offset, leader)| {
+                    let p = &self.parts[i];
+                    p.epoch == e && ((offset && p.next.is_none()) || (leader && p.broker.is_none()))
+                });
             if failed {
                 self.lookup_at = now + self.lookup_backoff;
                 self.lookup_backoff = (self.lookup_backoff * 2).min(MAX_BACKOFF);
@@ -260,6 +364,10 @@ impl Consumer {
         for &b in &overdue {
             self.brokers[b].checked = now;
         }
+        self.looking = (self.parts.iter().enumerate())
+            .map(|(i, p)| (i, p.epoch, p.next.is_none(), p.broker.is_none_or(|b| overdue.contains(&b))))
+            .filter(|l| l.2 || l.3)
+            .collect();
         let unresolved: Vec<(String, i32, i64)> = (self.parts.iter())
             .filter(|p| p.next.is_none())
             .map(|p| (p.topic.clone(), p.partition, if p.want == Offset::End { wire::LATEST } else { wire::EARLIEST }))
@@ -272,7 +380,7 @@ impl Consumer {
         topics.dedup();
         let (client, committed) = (self.client.clone(), self.s.committed);
         let (tx, rx) = mpsc::channel();
-        let spawned = std::thread::Builder::new().name("brrrrr-kafka-lookup".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("fastka-lookup".into()).spawn(move || {
             let offsets = (!unresolved.is_empty()).then(|| client.list_offsets(&unresolved, committed, LOOKUP));
             let leaders = topics.into_iter().map(|t| (t.clone(), client.leaders(&t, LOOKUP))).collect();
             let _ = tx.send(Found { offsets, leaders });
@@ -280,33 +388,43 @@ impl Consumer {
         match spawned {
             Ok(_) => self.lookup = Some(rx),
             Err(e) => {
-                lost(format!("a thread to look up leaders and offsets: {e}"));
+                notice(Notice::Retrying(format!("a thread to look up leaders and offsets: {e}")));
                 self.lookup_at = now + self.lookup_backoff;
             }
         }
     }
 
     /// A lookup's answer applied: whether some of it failed.
-    fn found(&mut self, d: Found, now: Instant, lost: &mut dyn FnMut(String)) -> bool {
+    fn found(&mut self, d: Found, now: Instant, notice: &mut dyn FnMut(Notice)) -> bool {
         let mut failed = false;
         match d.offsets {
             None => {}
             Some(Ok(found)) => {
                 for (t, p, r) in found {
-                    let Some(part) = self.parts.iter_mut().find(|x| x.topic == t && x.partition == p) else { continue };
+                    let Some(i) = self.parts.iter().position(|x| x.topic == t && x.partition == p) else { continue };
+                    let part = &mut self.parts[i];
+                    // looked up for it as it is now: not seeked since
+                    if part.next.is_some() || !self.looking.iter().any(|l| (l.0, l.1, l.2) == (i, part.epoch, true)) {
+                        continue;
+                    }
                     match r {
-                        // only partitions without an offset are looked up, and only a lookup gives one
-                        Ok(o) => part.next = Some(o.unwrap_or(0)),
+                        Ok(o) => {
+                            let to = o.unwrap_or(0);
+                            part.next = Some(to);
+                            if let Some(from) = part.reset_from.take() {
+                                notice(Notice::Reset { topic: t, partition: p, from, to });
+                            }
+                        }
                         Err(e) => {
                             failed = true;
-                            lost(format!("{t}/{p}: looking up where to read from: {e}"));
+                            notice(Notice::Retrying(format!("{t}/{p}: looking up where to read from: {e}")));
                         }
                     }
                 }
             }
             Some(Err(e)) => {
                 failed = true;
-                lost(format!("looking up where to read from: {e}"));
+                notice(Notice::Retrying(format!("looking up where to read from: {e}")));
             }
         }
         for (t, r) in d.leaders {
@@ -314,7 +432,7 @@ impl Consumer {
                 Ok(l) => l,
                 Err(e) => {
                     failed = true;
-                    lost(format!("{t}: looking up its partitions' leaders: {e}"));
+                    notice(Notice::Retrying(format!("{t}: looking up its partitions' leaders: {e}")));
                     continue;
                 }
             };
@@ -335,7 +453,7 @@ impl Consumer {
                 })
             });
             if let Some((b, why)) = moved {
-                self.drop_broker(b, now, why, lost);
+                self.drop_broker(b, now, why, notice);
             }
             for i in 0..self.parts.len() {
                 let p = &self.parts[i];
@@ -357,6 +475,8 @@ impl Consumer {
                             inflight: None,
                             corr: 0,
                             backoff: self.net.backoff,
+                            corrupt: 0,
+                            rotate: 0,
                             throttled: now,
                             quiet_until: now,
                             checked: now,
@@ -383,9 +503,15 @@ impl Consumer {
 
     /// Broker `b` is lost: its partitions' leaders looked up again, its Fetch asked again (from
     /// the offsets not yet given) once it connects again.
-    fn drop_broker(&mut self, b: usize, now: Instant, why: String, lost: &mut dyn FnMut(String)) {
+    fn drop_broker(&mut self, b: usize, now: Instant, why: String, notice: &mut dyn FnMut(Notice)) {
+        let br = &self.brokers[b];
+        notice(Notice::Retrying(format!("broker {} ({}): {why}: retried in {:?}", br.id, br.addr, br.backoff)));
+        self.reset_broker(b, now);
+    }
+
+    /// `drop_broker`'s work, untold.
+    fn reset_broker(&mut self, b: usize, now: Instant) {
         let br = &mut self.brokers[b];
-        lost(format!("broker {} ({}): {why}: retried in {:?}", br.id, br.addr, br.backoff));
         br.link = Link::Idle(now + br.backoff);
         br.backoff = (br.backoff * 2).min(self.net.backoff_max);
         (br.inflight, br.written) = (None, 0);
@@ -405,17 +531,21 @@ impl Consumer {
             return;
         }
         let s = &self.s;
-        let asked: Vec<(usize, i64)> = (self.parts.iter().enumerate())
+        let mut asked: Vec<(usize, i64, u32)> = (self.parts.iter().enumerate())
             .filter(|(_, p)| p.broker == Some(b) && !p.paused && p.queue.len() + p.incoming < s.queued_min)
-            .filter_map(|(i, p)| Some((i, p.next?)))
+            .filter_map(|(i, p)| Some((i, p.next?, p.epoch)))
             .collect();
         if asked.is_empty() {
             return;
         }
         let br = &mut self.brokers[b];
+        // each partition first in turn, as Java's consumer and librdkafka rotate theirs
+        let first = br.rotate % asked.len();
+        asked.rotate_left(first);
+        br.rotate = br.rotate.wrapping_add(1);
         br.corr = br.corr.wrapping_add(1);
         let wire_parts: Vec<(&str, (i32, i64))> =
-            asked.iter().map(|&(i, o)| (self.parts[i].topic.as_str(), (self.parts[i].partition, o))).collect();
+            asked.iter().map(|&(i, o, _)| (self.parts[i].topic.as_str(), (self.parts[i].partition, o))).collect();
         let limits = FetchLimits {
             max_wait_ms: s.max_wait_ms,
             min_bytes: s.min_bytes,
@@ -430,12 +560,18 @@ impl Consumer {
         br.inflight = Some(InFlight { corr: br.corr, asked, since: Instant::now() });
     }
 
-    /// Reads what has arrived and sends the Fetches due, without blocking; `lost(why)` hears what is retried. Whether a response arrived. An error
-    /// is one a retry does not mend (a record the broker should never have sent, an offset out
-    /// of range with `auto.offset.reset=error`).
-    pub fn pump(&mut self, lost: &mut dyn FnMut(String)) -> Result<bool> {
+    /// Reads what has arrived and sends the Fetches due, without blocking; `notice` hears what
+    /// is mended. Whether a response arrived.
+    ///
+    /// An error is one a retry did not mend: a partition's (an offset out of range with
+    /// `auto.offset.reset=error`, a topic not authorized), or a broker's records that cannot be
+    /// read (a corrupt batch, fetched again `CORRUPT_RETRIES` times first). The consumer stays
+    /// usable after one, and no record is lost or skipped for it: the other partitions' records
+    /// are queued, and the partition in error is fetched again from where it was (the same
+    /// error again, until it mends or is `seek`ed past).
+    pub fn pump(&mut self, notice: &mut dyn FnMut(Notice)) -> Result<bool> {
         let now = Instant::now();
-        self.lookups(now, lost);
+        self.lookups(now, notice);
         let mut heard = false;
         for b in 0..self.brokers.len() {
             if !self.parts.iter().any(|p| p.broker == Some(b)) {
@@ -451,17 +587,17 @@ impl Consumer {
                 Link::Connecting(rx) => match rx.try_recv() {
                     Err(mpsc::TryRecvError::Empty) => continue,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        self.drop_broker(b, now, "connecting: the thread ended".into(), lost);
+                        self.drop_broker(b, now, "connecting: the thread ended".into(), notice);
                         continue;
                     }
                     Ok(Err(e)) => {
-                        self.drop_broker(b, now, format!("connecting: {e}"), lost);
+                        self.drop_broker(b, now, format!("connecting: {e}"), notice);
                         continue;
                     }
                     Ok(Ok(c)) => match c.into_stream() {
                         Ok(s) => self.brokers[b].link = Link::Ready(s),
                         Err(e) => {
-                            self.drop_broker(b, now, format!("connecting: {e}"), lost);
+                            self.drop_broker(b, now, format!("connecting: {e}"), notice);
                             continue;
                         }
                     },
@@ -474,24 +610,34 @@ impl Consumer {
             match self.flush(b).and_then(|()| self.receive(b, now)) {
                 Ok(Some(resp)) => {
                     heard = true;
-                    self.brokers[b].backoff = self.net.backoff;
-                    let r = self.answered(b, &resp, lost);
+                    let r = self.answered(b, &resp, notice);
                     self.brokers[b].buf = resp; // its capacity, for the next
                     self.brokers[b].buf.clear();
+                    let br = &mut self.brokers[b];
                     match r {
-                        Ok(Ok(())) => self.corrupt = 0,
-                        Ok(Err(e)) => self.drop_broker(b, now, e.to_string(), lost),
-                        // a response this client cannot read (cut, a CRC that does not match):
-                        // fetched again on a new connection, but not without end
-                        Err(e @ Error::Protocol(_)) if self.corrupt < CORRUPT_RETRIES => {
-                            self.corrupt += 1;
-                            self.drop_broker(b, now, e.to_string(), lost)
+                        Ok(Ok(())) => (br.backoff, br.corrupt) = (self.net.backoff, 0),
+                        Ok(Err(e)) => self.drop_broker(b, now, e.to_string(), notice),
+                        // a partition's: the response itself was read
+                        Err(e @ Error::Broker(..)) => {
+                            (br.backoff, br.corrupt) = (self.net.backoff, 0);
+                            return Err(e);
                         }
-                        Err(e) => return Err(e),
+                        // a response this client cannot read (cut, a CRC that does not match):
+                        // fetched again on a new connection, but not without end. Its Fetch in
+                        // flight (sent from past what was refused) is dropped either way
+                        Err(e) if br.corrupt < CORRUPT_RETRIES => {
+                            br.corrupt += 1;
+                            self.drop_broker(b, now, e.to_string(), notice)
+                        }
+                        Err(e) => {
+                            br.corrupt = 0; // a new error's retries
+                            self.reset_broker(b, now);
+                            return Err(e);
+                        }
                     }
                 }
                 Ok(None) => {}
-                Err(e) => self.drop_broker(b, now, e.to_string(), lost),
+                Err(e) => self.drop_broker(b, now, e.to_string(), notice),
             }
         }
         Ok(heard)
@@ -509,8 +655,9 @@ impl Consumer {
             (self.net.max_response, self.net.request_timeout + Duration::from_millis(self.s.max_wait_ms as u64));
         let br = &mut self.brokers[b];
         let Link::Ready(s) = &mut br.link else { return Ok(None) };
-        let Some(inflight) = br.inflight.as_ref().filter(|_| br.written == br.out.len()) else { return Ok(None) };
-        if now >= br.quiet_until {
+        let Some(inflight) = br.inflight.as_ref() else { return Ok(None) };
+        // read once written whole; timed out also while its write stalls
+        if br.written == br.out.len() && now >= br.quiet_until {
             #[cfg(test)]
             {
                 br.reads += 1;
@@ -532,11 +679,14 @@ impl Consumer {
         Ok(None)
     }
 
-    /// Broker `b`'s Fetch answered (`frame`: size, correlation id, body): the next Fetch sent
-    /// (from the offsets after the whole batches, before the records are parsed), then the
-    /// records queued. The inner result: what sending the next Fetch met (the connection lost,
-    /// not the records).
-    fn answered(&mut self, b: usize, frame: &[u8], lost: &mut dyn FnMut(String)) -> Result<std::io::Result<()>> {
+    /// Broker `b`'s Fetch answered (`frame`: size, correlation id, body): the whole response
+    /// checked first (each partition one asked for, once; its batches' headers and CRCs), then
+    /// the next Fetch sent (from the offsets after the whole batches, before the records are
+    /// parsed), then the records queued. No partition's next offset passes a record not queued;
+    /// a partition's error is returned once the others' records are. The inner result: what
+    /// sending the next Fetch met (the connection lost, not the records; a partition's error
+    /// with it comes again from the Fetch asked again).
+    fn answered(&mut self, b: usize, frame: &[u8], notice: &mut dyn FnMut(Notice)) -> Result<std::io::Result<()>> {
         let inflight = self.brokers[b].inflight.take().expect("a Fetch in flight");
         let body = wire::response(&frame[4..], inflight.corr)?;
         let base = 4; // ranges are of `frame[4..]`
@@ -548,18 +698,23 @@ impl Consumer {
             // the response's own error (a fetch session's, none is used): asked again
             return Ok(Err(std::io::Error::other(format!("a Fetch refused: {}", got.error))));
         }
+        let mut corrupt = None;
+        let mut seen = vec![false; inflight.asked.len()];
         let mut answers = Vec::with_capacity(got.parts.len());
         for fp in &got.parts {
-            let Some(&(i, asked)) = inflight
-                .asked
-                .iter()
-                .find(|(i, _)| self.parts[*i].topic == fp.topic && self.parts[*i].partition == fp.partition)
-            else {
+            let k = (inflight.asked.iter())
+                .position(|&(i, _, _)| self.parts[i].topic == fp.topic && self.parts[i].partition == fp.partition);
+            // refused before anything is changed: what was taken of it would be fetched past
+            let Some(k) = k.filter(|&k| !std::mem::replace(&mut seen[k], true)) else {
                 return Err(Error::Protocol(format!(
-                    "{}/{}: in a Fetch response, not asked for",
+                    "{}/{}: in a Fetch response, not asked for (or twice)",
                     fp.topic, fp.partition
                 )));
             };
+            let (i, asked, epoch) = inflight.asked[k];
+            if self.parts[i].epoch != epoch {
+                continue; // seeked since: its answer is not taken
+            }
             let range = fp.records.start + base..fp.records.end + base;
             // a broker suggests another replica only to a consumer that gave its rack (none
             // is): read as a leader that moved
@@ -568,84 +723,85 @@ impl Consumer {
             } else {
                 fp.error
             };
+            let mut scanned = None;
             if error == Code::NONE {
-                let (next, count) = records::scan(&frame[range.clone()]);
-                let p = &mut self.parts[i];
-                p.next = Some(p.next.unwrap_or(asked).max(next.unwrap_or(asked)));
-                p.incoming = count;
+                match records::scan(&frame[range.clone()], self.s.check_crcs) {
+                    Ok(s) => scanned = Some(s),
+                    Err(e) => drop(corrupt.get_or_insert(in_part(&self.parts[i], e))),
+                }
             }
             let end = if self.s.committed && fp.last_stable >= 0 { fp.last_stable } else { fp.high };
-            answers.push((i, asked, error, end, fp.aborted.clone(), range));
+            answers.push((i, asked, error, end, fp.aborted.clone(), range, scanned));
         }
-        for (i, asked, err, _, _, _) in &answers {
+        let mut fatal = None;
+        for (i, asked, err, _, _, _, scanned) in &answers {
             let p = &mut self.parts[*i];
             match *err {
-                Code::NONE => {}
+                Code::NONE => {
+                    // a partition refused (`corrupt`) stays where it was asked
+                    if let Some((next, count)) = *scanned {
+                        p.next = Some(p.next.unwrap_or(*asked).max(next.unwrap_or(*asked)));
+                        p.incoming = count;
+                    }
+                }
                 Code::OFFSET_OUT_OF_RANGE => {
                     let to = match self.s.reset {
                         Reset::Earliest => Offset::Beginning,
                         Reset::Latest => Offset::End,
                         Reset::Error => {
-                            return Err(Error::Broker(
-                                *err,
-                                format!("{}/{}: offset {asked} (auto.offset.reset=error)", p.topic, p.partition),
-                            ))
+                            let why = format!("{}/{}: offset {asked} (auto.offset.reset=error)", p.topic, p.partition);
+                            fatal.get_or_insert(Error::Broker(*err, why));
+                            continue;
                         }
                     };
-                    lost(format!(
-                        "{}/{}: offset {asked} is out of range: going on from the {} (auto.offset.reset)",
-                        p.topic,
-                        p.partition,
-                        if to == Offset::Beginning { "oldest" } else { "newest" }
-                    ));
-                    (p.want, p.next) = (to, None);
+                    // told once where it reads on from is found
+                    (p.want, p.next, p.reset_from) = (to, None, Some(*asked));
                     self.lookup_at = Instant::now();
                 }
                 c if c.stale_metadata() || c.retriable() => {
-                    lost(format!("{}/{}: fetch error {c}: looking up its leader again", p.topic, p.partition));
+                    let why = format!("{}/{}: fetch error {c}: looking up its leader again", p.topic, p.partition);
+                    notice(Notice::Retrying(why));
                     p.broker = None;
                     self.lookup_at = Instant::now();
                 }
-                c => return Err(Error::Broker(c, format!("fetching {}/{}", p.topic, p.partition))),
+                c => drop(fatal.get_or_insert(Error::Broker(c, format!("fetching {}/{}", p.topic, p.partition)))),
             }
         }
-        if self.parts.iter().any(|p| p.broker == Some(b)) {
+        // none from past a batch refused: the broker is dropped, and asked again, for it
+        if corrupt.is_none() && self.parts.iter().any(|p| p.broker == Some(b)) {
             self.send(b); // pipelined: the broker prepares it while these are parsed
         }
         let sent = self.flush(b);
         let mut plain = std::mem::take(&mut self.plain);
-        let with_headers = self.with_headers;
-        let mut corrupt = None;
-        for (i, asked, err, end, aborted, range) in answers {
-            if err != Code::NONE {
+        for (i, asked, _, end, aborted, range, scanned) in answers {
+            if scanned.is_none() {
                 continue;
             }
             let p = &mut self.parts[i];
             p.incoming = 0;
             let before = p.queue.len();
-            let o =
-                ReadOpts { from: asked, committed: self.s.committed, aborted: &aborted, check_crcs: self.s.check_crcs };
+            let o = ReadOpts {
+                from: asked,
+                committed: self.s.committed,
+                aborted: &aborted,
+                check_crcs: false, // checked by `scan`
+                max_decompressed: self.net.max_response,
+            };
             let read = records::read(&frame[range], &o, &mut plain, |r| {
                 p.queue.push_back(Message {
                     offset: r.offset,
                     timestamp: r.timestamp,
                     key: r.key.map(<[u8]>::to_vec),
                     value: r.value.map(<[u8]>::to_vec),
-                    headers: if with_headers {
-                        r.headers().map(|(k, v)| (k.to_string(), v.map(<[u8]>::to_vec))).collect()
-                    } else {
-                        vec![]
-                    },
+                    headers: r.headers().map(|(k, v)| (k.to_string(), v.map(<[u8]>::to_vec))).collect(),
                 })
             });
             if let Err(e) = read {
-                // fetched again from where it was asked: none of this response's records given
+                // fetched again from where it was asked (the Fetch sent dropped with the broker):
+                // none of this response's records given
                 p.queue.truncate(before);
                 p.next = Some(asked);
-                corrupt.get_or_insert(match e {
-                    Error::Protocol(m) => Error::Protocol(format!("{}/{}: {m}", p.topic, p.partition)),
-                    e => e,
-                });
+                corrupt.get_or_insert(in_part(p, e));
                 continue;
             }
             let delivered = p.queue.len() > before;
@@ -657,15 +813,20 @@ impl Consumer {
             p.at_end = caught;
         }
         self.plain = plain;
-        match corrupt {
-            Some(e) => Err(e),
-            None => Ok(sent),
+        match (corrupt, fatal, sent) {
+            (Some(e), _, _) | (None, Some(e), Ok(())) => Err(e),
+            (None, _, sent) => Ok(sent),
         }
     }
 
-    /// Partition `i`'s next message, its end once, or nothing yet.
+    /// Partition `i`'s next message, its end once, or nothing yet (nothing while it is paused).
+    ///
+    /// Panics if `i` is not an index of `partitions`.
     pub fn poll(&mut self, i: usize) -> Polled {
         let p = &mut self.parts[i];
+        if p.paused {
+            return Polled::Empty;
+        }
         match p.queue.pop_front() {
             Some(m) => Polled::Msg(m),
             None if std::mem::take(&mut p.eof) => Polled::Eof,
@@ -673,8 +834,8 @@ impl Consumer {
         }
     }
 
-    /// The next message of any partition: a partition's run, up to `RUN` messages, then the
-    /// next's, so no partition waits on another's whole backlog.
+    /// The next message of any partition not paused: a partition's run, up to `RUN` messages,
+    /// then the next's, so no partition waits on another's whole backlog.
     pub fn next_any(&mut self) -> Option<(usize, Message)> {
         let n = self.parts.len();
         if n == 0 {
@@ -685,6 +846,9 @@ impl Consumer {
         }
         for k in 0..n {
             let i = (self.turn + k) % n;
+            if self.parts[i].paused {
+                continue;
+            }
             if let Some(m) = self.parts[i].queue.pop_front() {
                 if i != self.turn % n {
                     self.run = 0;
@@ -696,26 +860,37 @@ impl Consumer {
         None
     }
 
-    /// The next event of any partition (a message, or an end), waiting up to `timeout` for one.
-    pub fn next_event(&mut self, timeout: Duration, lost: &mut dyn FnMut(String)) -> Result<Option<(usize, Polled)>> {
-        let until = Instant::now() + timeout;
+    /// The next event of any partition not paused (a message, or an end), waiting up to
+    /// `timeout` for one (`Duration::MAX`: until one comes).
+    ///
+    /// An error is `pump`'s: the consumer stays usable, and no record is lost or skipped for it.
+    pub fn next_event(&mut self, timeout: Duration, notice: &mut dyn FnMut(Notice)) -> Result<Option<(usize, Polled)>> {
+        let until = Instant::now().checked_add(timeout);
+        let ready = |p: &Part| !p.paused && (!p.queue.is_empty() || p.eof);
         loop {
             if let Some((i, m)) = self.next_any() {
                 return Ok(Some((i, Polled::Msg(m))));
             }
-            if let Some(i) = self.parts.iter_mut().position(|p| std::mem::take(&mut p.eof)) {
+            if let Some(i) = self.parts.iter_mut().position(|p| !p.paused && std::mem::take(&mut p.eof)) {
                 return Ok(Some((i, Polled::Eof)));
             }
             // pumped at least once, whatever the timeout: a caller polling without waiting reads too
-            let heard = self.pump(lost)?;
-            let ready = self.parts.iter().any(|p| !p.queue.is_empty() || p.eof);
-            if !ready && Instant::now() >= until {
+            let heard = self.pump(notice)?;
+            if !self.parts.iter().any(ready) && until.is_some_and(|u| Instant::now() >= u) {
                 return Ok(None);
             }
             if !heard {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+    }
+}
+
+/// A partition's read error, naming it.
+fn in_part(p: &Part, e: Error) -> Error {
+    match e {
+        Error::Protocol(m) => Error::Protocol(format!("{}/{}: {m}", p.topic, p.partition)),
+        e => e,
     }
 }
 
