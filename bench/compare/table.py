@@ -40,3 +40,15 @@ for workload in ["consume", "produce"]:
                 print(f"| {name} | {n / secs:,.0f} | {cpu / n * 1e6:.2f} | {rss / 1024:.0f} MB | {len(rs)} |")
             elif k in errors:
                 print(f"| {c} | fails: {errors[k][:90]} | | | |")
+
+lat = {c: rs for (w, _, c), rs in rows.items() if w == "latency"}
+if lat:
+    rate_n = next(iter(lat.values()))[0]["n"]
+    print(f"\n**Produce → consume latency, {rate_n:,} messages at 5,000/s, one partition (fastka's producer for both; the consumer differs)**\n")
+    print("| consumer | p50 | p99 | p99.9 | max |")
+    print("|---|---:|---:|---:|---:|")
+    for c in order:
+        if c in lat:
+            m = lambda k: statistics.median(r["latency_us"][k] for r in lat[c])
+            name = f"**{c}**" if c == "fastka" else c
+            print(f"| {name} | {m('p50'):,.0f} µs | {m('p99'):,.0f} µs | {m('p999'):,.0f} µs | {m('max'):,.0f} µs |")
