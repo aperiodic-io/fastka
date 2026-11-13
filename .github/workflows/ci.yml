@@ -49,6 +49,23 @@ jobs:
       - if: failure()
         run: for c in fastka-rp fastka-apache fastka-sasl; do docker logs $c 2>&1 | tail -30; done
 
+  acceptance:
+    # end to end against real brokers (tests/acceptance.rs): Apache Kafka's own Java client as the
+    # reference (its partitioner, its reads and writes, its transactions, quotas, group offsets),
+    # Redpanda, and a 3-node cluster losing a leader while it is produced to and read from
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21" }
+      - run: scripts/brokers.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
+      - run: scripts/cluster.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
+      - run: scripts/java-oracle.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
+      - run: cargo test --test acceptance -- --test-threads=2
+      - if: failure()
+        run: for c in fastka-rp fastka-apache fastka-c0 fastka-c1 fastka-c2; do echo "== $c"; docker logs $c 2>&1 | tail -20; done
+
   stress:
     runs-on: ubuntu-24.04
     steps:

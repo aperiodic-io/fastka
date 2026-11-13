@@ -46,6 +46,8 @@ indexmap = "2"
 proptest = "1.11"
 # a CA and the brokers' certificates for the TLS tests
 rcgen = "0.13"
+# the acceptance tests read the Java oracle's lines
+serde_json = "1"
 
 [profile.dev]
 opt-level = 1

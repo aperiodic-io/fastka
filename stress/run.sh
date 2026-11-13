@@ -5,11 +5,11 @@
 # Release build with overflow checks and debug assertions on. Exits non-zero on any violation.
 set -euo pipefail
 cd "$(dirname "$0")"
-docker rm -f fastka-chaos >/dev/null 2>&1 || true
+docker rm -fv fastka-chaos >/dev/null 2>&1 || true
 docker run -d --name fastka-chaos -p 19094:19094 redpandadata/redpanda:v24.2.7 redpanda start \
   --mode dev-container --smp 1 --memory 1G --reserve-memory 0M --check=false \
   --kafka-addr 0.0.0.0:19094 --advertise-kafka-addr 127.0.0.1:19095 >/dev/null
-trap 'docker rm -f fastka-chaos >/dev/null 2>&1 || true' EXIT
+trap 'docker rm -fv fastka-chaos >/dev/null 2>&1 || true' EXIT
 timeout 180 bash -c "until docker exec fastka-chaos rpk cluster info -X brokers=127.0.0.1:19094 >/dev/null 2>&1; do sleep 1; done"
 cargo build --release -q
 for codec in ${STRESS_CODECS:-lz4 none zstd}; do
