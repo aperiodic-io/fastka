@@ -3,7 +3,8 @@
 #   fastka-rp      Redpanda v24.2         127.0.0.1:19092  (rpk inside: franz-go, another client)
 #   fastka-apache  Apache Kafka 4.1 KRaft 127.0.0.1:29092  (its own traffic, transaction markers
 #                  included, on an internal listener: the advertised address is the host's)
-#   fastka-sasl    Redpanda v26.2 + SCRAM 127.0.0.1:39092  (it/it-secret SHA-256, it512/it-secret SHA-512)
+#   fastka-sasl    Redpanda v26.2 + SCRAM 127.0.0.1:39092  (it/it-secret SHA-256, it512/it-secret SHA-512,
+#                  noacl/noacl-secret authenticated but granted nothing)
 # `scripts/brokers.sh down` removes them. Prints the environment the tests read.
 set -euo pipefail
 names=(fastka-rp fastka-apache fastka-sasl)
@@ -30,6 +31,8 @@ done
 r="docker exec fastka-sasl rpk"
 $r security user create it -p it-secret --mechanism SCRAM-SHA-256 >/dev/null
 $r security user create it512 -p it-secret --mechanism SCRAM-SHA-512 >/dev/null
+# authenticated, granted nothing: what a writer the cluster has not authorized meets
+$r security user create noacl -p noacl-secret --mechanism SCRAM-SHA-256 >/dev/null
 $r cluster config set superusers '["it","it512"]' >/dev/null
 $r cluster config set enable_sasl true >/dev/null
 cat <<ENV

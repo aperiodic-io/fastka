@@ -727,3 +727,155 @@ fn wait_cluster(nodes: &[String]) {
         std::thread::sleep(Duration::from_secs(1));
     }
 }
+
+// ---- carried over from brrrrr's acceptance suite (tests/acceptance/features/kafka.feature):
+// the scenarios there that exercise the client rather than the pipeline above it
+
+/// The only broker restarts under a consumer and a producer (brrrrr: "A source broker that
+/// restarts is fetched again from where it was"): the consumer reads on from where it was, no
+/// record skipped or read twice; the producer delivers what it sends after, each once, in order.
+#[test]
+fn the_only_broker_restarting_skips_and_repeats_nothing() {
+    if env("FASTKA_IT_RPK").is_none() {
+        return; // docker, and an image of its own
+    }
+    let node = "fastka-restart";
+    let _ = Command::new("docker").args(["rm", "-fv", node]).output();
+    docker(&[
+        "run",
+        "-d",
+        "--name",
+        node,
+        "--network",
+        "host",
+        "redpandadata/redpanda:v24.2.7",
+        "redpanda",
+        "start",
+        "--mode",
+        "dev-container",
+        "--smp",
+        "1",
+        "--memory",
+        "1G",
+        "--reserve-memory",
+        "0M",
+        "--check=false",
+        "--kafka-addr",
+        "0.0.0.0:59292",
+        "--advertise-kafka-addr",
+        "127.0.0.1:59292",
+        "--rpc-addr",
+        "0.0.0.0:59345",
+        "--advertise-rpc-addr",
+        "127.0.0.1:59345",
+        "--pandaproxy-addr",
+        "0.0.0.0:58282",
+        "--schema-registry-addr",
+        "0.0.0.0:58281",
+        "--set",
+        r#"redpanda.admin=[{"address":"0.0.0.0","port":59744}]"#,
+    ]);
+    struct Gone(&'static str);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = Command::new("docker").args(["rm", "-fv", self.0]).output();
+        }
+    }
+    let _gone = Gone(node);
+    let addr = "127.0.0.1:59292";
+    let mut c = cfg(addr);
+    c.set("message.timeout.ms", "120000").set("socket.timeout.ms", "5000").set("reconnect.backoff.max.ms", "1000");
+    let until = Instant::now() + Duration::from_secs(120);
+    while Client::new(&c).unwrap().metadata(None, Duration::from_secs(2)).is_err() {
+        assert!(Instant::now() < until, "the broker up");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let topic = unique("restart");
+    create(&c, &topic, 1, 1);
+    let p = Producer::new(&c, Heard::default()).unwrap();
+    let mut k = Consumer::from_config(&c, vec![Assignment::new(&topic, 0, Offset::Beginning)]).unwrap();
+    let (mut got, mut notices) = (vec![], vec![]);
+    let read_to = |k: &mut Consumer, n: usize, got: &mut Vec<String>, notices: &mut Vec<String>| {
+        let until = Instant::now() + Duration::from_secs(120);
+        while got.len() < n {
+            assert!(Instant::now() < until, "{} of {n} read", got.len());
+            match k.next_event(Duration::from_millis(100), &mut |x| notices.push(x.to_string())) {
+                Ok(Some((_, Polled::Msg(m)))) => got.push(String::from_utf8(m.value.unwrap()).unwrap()),
+                Ok(_) => {}
+                Err(e) => notices.push(format!("error: {e}")),
+            }
+        }
+    };
+    for i in 0..2000u64 {
+        p.send(Record::to(&topic).value(i.to_string().as_bytes()), i).unwrap();
+    }
+    p.flush(T).unwrap();
+    read_to(&mut k, 1000, &mut got, &mut notices); // half read, the rest queued or on the log
+    docker(&["restart", "-t", "1", node]);
+    for i in 2000..4000u64 {
+        p.send(Record::to(&topic).value(i.to_string().as_bytes()), i).unwrap();
+    }
+    p.flush(Duration::from_secs(120)).expect("delivered once the broker is back");
+    read_to(&mut k, 4000, &mut got, &mut notices);
+    let want: Vec<String> = (0..4000).map(|i| i.to_string()).collect();
+    assert_eq!(got, want, "every record once, in order, across the restart");
+    let heard = p.context().0.lock().unwrap().clone();
+    assert!(heard.values().all(|h| h.2.is_none()), "{:?}", heard.values().find(|h| h.2.is_some()));
+    assert!(notices.iter().any(|n| n.contains("broker")), "the consumer said it reconnected: {notices:?}");
+}
+
+/// Batches librdkafka wrote, in each codec (brrrrr: "Batches librdkafka compressed with <codec>
+/// are read"; kcat, librdkafka's own command line client, writes them): each record read once,
+/// key, value and header as written. librdkafka's LZ4 framing is the one historically misread.
+#[test]
+fn batches_librdkafka_compressed_are_read() {
+    let Some(addr) = redpanda() else { return };
+    let c = cfg(&addr);
+    for codec in ["gzip", "snappy", "lz4", "zstd"] {
+        let topic = unique(&format!("rdk-{codec}"));
+        create(&c, &topic, 1, 1);
+        let input: String = (0..3000).map(|i| format!("k{}:{codec}-{i}-{}\n", i % 13, "z".repeat(i % 41))).collect();
+        let mut kcat = Command::new("docker")
+            .args(["run", "--rm", "-i", "--network", "host", "edenhill/kcat:1.7.1", "-P", "-b", &addr, "-t", &topic])
+            .args(["-z", codec, "-K:", "-H", "via=librdkafka", "-X", "linger.ms=50", "-X", "batch.num.messages=500"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write as _;
+        kcat.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        assert!(kcat.wait().unwrap().success(), "kcat {codec}");
+        let (read, _) = read_all(&c, &topic, 1, T);
+        assert_eq!(read.len(), 3000, "{codec}");
+        for (i, (_, m)) in read.iter().enumerate() {
+            assert_eq!(m.offset, i as i64);
+            assert_eq!(m.key.as_deref(), Some(format!("k{}", i % 13).as_bytes()), "{codec} #{i}");
+            assert_eq!(m.value.as_deref(), Some(format!("{codec}-{i}-{}", "z".repeat(i % 41)).as_bytes()));
+            assert_eq!(m.header("via"), Some(&b"librdkafka"[..]));
+        }
+    }
+}
+
+/// A writer the cluster has not authorized (brrrrr: "An anonymous writer denied InitProducerId
+/// reports the broker's fatal cause"): its record fails, reported not persisted, with the
+/// broker's code named, and the producer says why it can deliver nothing.
+#[test]
+fn a_writer_not_authorized_is_told_the_brokers_cause() {
+    let Some(addr) = env("FASTKA_IT_SASL") else { return };
+    let mut admin = cfg(&addr);
+    admin.set("security.protocol", "sasl_plaintext").set("sasl.mechanisms", "SCRAM-SHA-256");
+    admin.set("sasl.username", "it").set("sasl.password", "it-secret");
+    let topic = unique("denied");
+    create(&admin, &topic, 1, 1);
+    let mut c = admin.clone();
+    c.set("sasl.username", "noacl").set("sasl.password", "noacl-secret").set("message.timeout.ms", "10000");
+    let p = Producer::new(&c, Heard::default()).unwrap();
+    p.send(Record::to(&topic).value(b"not mine to write"), 0).unwrap();
+    p.flush(Duration::from_secs(30)).unwrap();
+    let heard = p.context().0.lock().unwrap().clone();
+    let (_, _, err, persisted) = &heard[&0];
+    let err = err.as_deref().expect("refused");
+    assert!(err.contains("AUTHORIZATION_FAILED"), "the broker's cause named: {err}");
+    assert_eq!(*persisted, Persisted::No);
+    let (read, _) = read_all(&admin, &topic, 1, T);
+    assert!(read.is_empty(), "nothing written");
+}

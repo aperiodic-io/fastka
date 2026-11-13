@@ -188,6 +188,12 @@ Every claim below is a test in this repository that CI runs.
   `auto.offset.reset`, `seek`); records at the broker's size limit; 48 partitions of 3 topics with
   one paused; partitions added while producing.
 
+  Three scenarios come from the acceptance suite of the engine fastka was extracted from, where they
+  exercise the client underneath:
+  - the only broker restarting under a consumer and a producer: nothing skipped or repeated;
+  - batches librdkafka (kcat) compressed, in every codec: read exactly;
+  - a writer the cluster has not authorized: told the broker's cause.
+
   On a 3-node cluster (`scripts/cluster.sh`), the leader of a partition is stopped until the
   partition is led elsewhere, then started again:
   - while producing, each delivery is in the log once, where it was reported, and a key's order
@@ -243,6 +249,10 @@ Every claim below is a test in this repository that CI runs.
     runs for 90 s on every PR and for 15 minutes nightly, with a new seed each run. The last
     local run sent 31M messages; 22 producers went fatal in the harsh profile and 33k reports
     said "possibly persisted", and every invariant held.
+- **fastka against librdkafka under bursts** (`bench/kafka-stress/`, nightly). Many pipelines on one
+  producer, bursting at each top of the hour, run three ways: fastka's defaults, fastka with
+  librdkafka's request shape, and librdkafka. The broker's answers are delayed, or held back. Each
+  run is read back, and fastka's must be exactly once and in order.
 - **The end-to-end performance gate** (`bench/perf-gate/`, CI's `perf` job, on every pull request).
   - What it runs: fastka's real producer and consumer against Redpanda (keyless, lz4 and keyed
     producing; consuming in two codecs; produce-to-consume latency).
