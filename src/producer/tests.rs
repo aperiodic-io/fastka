@@ -1584,3 +1584,15 @@ fn a_lookup_near_another_messages_deadline_is_given_time_to_answer() {
     let asked = b.requests(wire::METADATA).iter().filter(|r| slow(r)).count();
     assert_eq!(asked, 1, "looked up once");
 }
+
+/// A batch's retries back off as librdkafka's do: `retry.backoff.ms` doubled at each attempt,
+/// never past `retry.backoff.max.ms`.
+#[test]
+fn retries_back_off_exponentially_to_the_max() {
+    let mut c = Config::new();
+    c.set("bootstrap.servers", "x:1").set("retry.backoff.ms", "100").set("retry.backoff.max.ms", "1000");
+    let s = c.producer().unwrap();
+    let waits: Vec<u128> = (1..=6).map(|a| super::retry_wait(&s, a).as_millis()).collect();
+    assert_eq!(waits, [100, 200, 400, 800, 1000, 1000]);
+    assert_eq!(super::retry_wait(&s, u32::MAX).as_millis(), 1000, "no overflow");
+}

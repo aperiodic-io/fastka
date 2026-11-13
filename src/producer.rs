@@ -222,6 +222,12 @@ impl<C: Deliveries> std::fmt::Debug for Producer<C> {
     }
 }
 
+/// A batch's wait before its retry after `attempts`: `retry.backoff.ms` doubled at each, at most
+/// `retry.backoff.max.ms` (librdkafka's backoff).
+pub(crate) fn retry_wait(s: &ProducerSettings, attempts: u32) -> Duration {
+    s.retry_backoff.saturating_mul(1 << attempts.saturating_sub(1).min(20)).min(s.retry_backoff_max)
+}
+
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
@@ -1100,7 +1106,7 @@ fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Reque
                     st.metadata_due = true;
                     moved.push((t.clone(), *p));
                 }
-                sent.retry_at = now + sh.s.retry_backoff * sent.attempts.min(10);
+                sent.retry_at = now + retry_wait(&sh.s, sent.attempts);
                 part.inflight = Some(sent);
             }
             c => {
