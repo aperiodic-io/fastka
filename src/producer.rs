@@ -759,7 +759,9 @@ fn sequence_broken(c: Code) -> bool {
 type Request = Vec<(String, i32, Arc<Vec<u8>>, Instant)>;
 
 /// The batches broker `id` leads that are due, taken (marked sending): sealed from their queues
-/// where none is in flight (once lingered, or full), sent again where one is.
+/// where none is in flight (once lingered, or full), sent again where one is; the longest waiting
+/// first, up to `message.max.bytes` a request (at least one batch: what does not fit waits for the
+/// next request, sealed if it was).
 fn take_due<C: Deliveries>(
     sh: &Shared<C>,
     st: &mut State<C::Opaque>,
@@ -770,7 +772,7 @@ fn take_due<C: Deliveries>(
     let mut out: Request = vec![];
     let mut next: Option<Instant> = None;
     // what is past its deadline is given up here, whichever thread runs first after a stall:
-    // nothing is sent past `message.timeout.ms` (a lease fence rests on it)
+    // nothing is sent past `message.timeout.ms`
     expire(st, now);
     if st.fatal.is_some() {
         // nothing more is sent: what is queued fails with the fatal error (`fail_queued`)
@@ -778,14 +780,13 @@ fn take_due<C: Deliveries>(
         return (out, None);
     }
     let Some((pid, epoch)) = st.pid else { return (out, None) };
-    let (mut sealed, mut failed) = (vec![], vec![]);
-    for (name, t) in st.topics.iter_mut() {
-        for (&pnum, part) in t.parts.iter_mut().filter(|(_, p)| p.leader == Some(id)) {
-            if let Some(sent) = &mut part.inflight {
+    // what is due: since when, its partition, how many messages to seal (0: one to send again)
+    let mut due: Vec<(Instant, String, i32, usize)> = vec![];
+    for (name, t) in st.topics.iter() {
+        for (&pnum, part) in t.parts.iter().filter(|(_, p)| p.leader == Some(id)) {
+            if let Some(sent) = &part.inflight {
                 if !sent.sending && sent.retry_at <= now {
-                    sent.sending = true;
-                    sent.attempts += 1;
-                    out.push((name.clone(), pnum, sent.bytes.clone(), sent.msgs[0].deadline));
+                    due.push((sent.retry_at, name.clone(), pnum, 0));
                 } else if !sent.sending {
                     next = Some(next.map_or(sent.retry_at, |n| n.min(sent.retry_at)));
                 }
@@ -808,39 +809,64 @@ fn take_due<C: Deliveries>(
                 next = Some(next.map_or(ready, |x| x.min(ready)));
                 continue; // lingering: more may join the batch
             }
-            let msgs: Vec<_> = part.queue.drain(..n).collect();
-            let outs: Vec<Out<'_>> = msgs
-                .iter()
-                .map(|p| Out {
-                    timestamp: p.timestamp,
-                    key: p.key.as_deref(),
-                    value: p.value.as_deref(),
-                    headers: &p.headers,
-                })
-                .collect();
-            let mut b = vec![];
-            let written = records::write(
-                &mut b,
-                &outs,
-                Stamp { producer_id: pid, epoch, base_sequence: part.seq },
-                s.codec,
-                &mut vec![],
-            );
-            drop(outs);
-            match written {
-                Err(e) => failed.push((name.clone(), pnum, msgs, e)),
-                Ok(()) => {
-                    let seq = part.seq;
-                    // Kafka's sequences wrap to 0 past i32::MAX
-                    part.seq = part.seq.wrapping_add(n as i32) & i32::MAX;
-                    let bytes = Arc::new(b);
-                    out.push((name.clone(), pnum, bytes.clone(), msgs[0].deadline));
-                    let maybe_written = false;
-                    part.inflight =
-                        Some(Sent { msgs, bytes, seq, sending: true, retry_at: now, attempts: 1, maybe_written });
-                    sealed.push((name.clone(), pnum));
-                }
+            due.push((first.enqueued, name.clone(), pnum, n));
+        }
+    }
+    // the longest waiting first: a request's bound starves no partition
+    due.sort_unstable_by_key(|d| d.0);
+    let (mut sealed, mut failed, mut total) = (vec![], vec![], 0);
+    for (_, name, pnum, n) in due {
+        let part = st.topics.get_mut(&name).and_then(|t| t.parts.get_mut(&pnum)).expect("a partition due");
+        if n == 0 {
+            let sent = part.inflight.as_mut().expect("a batch to send again");
+            if !out.is_empty() && total + sent.bytes.len() > s.max_batch {
+                break;
             }
+            total += sent.bytes.len();
+            sent.sending = true;
+            sent.attempts += 1;
+            out.push((name, pnum, sent.bytes.clone(), sent.msgs[0].deadline));
+            continue;
+        }
+        let msgs: Vec<_> = part.queue.drain(..n).collect();
+        let outs: Vec<Out<'_>> = msgs
+            .iter()
+            .map(|p| Out {
+                timestamp: p.timestamp,
+                key: p.key.as_deref(),
+                value: p.value.as_deref(),
+                headers: &p.headers,
+            })
+            .collect();
+        let mut b = vec![];
+        let written = records::write(
+            &mut b,
+            &outs,
+            Stamp { producer_id: pid, epoch, base_sequence: part.seq },
+            s.codec,
+            &mut vec![],
+        );
+        drop(outs);
+        if let Err(e) = written {
+            failed.push((name, pnum, msgs, e));
+            continue;
+        }
+        let seq = part.seq;
+        // Kafka's sequences wrap to 0 past i32::MAX
+        part.seq = part.seq.wrapping_add(n as i32) & i32::MAX;
+        let bytes = Arc::new(b);
+        // past the request's bound: sealed, sent in the next request, as early as it was due
+        let fits = out.is_empty() || total + bytes.len() <= s.max_batch;
+        let (attempts, retry_at) = if fits { (1, now) } else { (0, msgs[0].enqueued) };
+        if fits {
+            total += bytes.len();
+            out.push((name.clone(), pnum, bytes.clone(), msgs[0].deadline));
+        }
+        let maybe_written = false;
+        part.inflight = Some(Sent { msgs, bytes, seq, sending: fits, retry_at, attempts, maybe_written });
+        sealed.push((name, pnum));
+        if !fits {
+            break;
         }
     }
     for (name, pnum, msgs, e) in failed {
