@@ -64,7 +64,10 @@ jobs:
       - run: scripts/brokers.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
       - run: scripts/cluster.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
       - run: scripts/java-oracle.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
-      - run: cargo test --test acceptance -- --test-threads=2
+      - run: cargo test --test acceptance -- --test-threads=2 --skip through_a_leader
+      # the 3-node cluster's scenarios alone, one at a time: nothing else starts or stops a broker
+      # on the runner meanwhile
+      - run: cargo test --test acceptance through_a_leader -- --test-threads=1 --nocapture
       - if: failure()
         run: for c in fastka-rp fastka-apache fastka-c0 fastka-c1 fastka-c2; do echo "== $c"; docker logs $c 2>&1 | tail -20; done
 

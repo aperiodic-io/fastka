@@ -708,13 +708,23 @@ fn consuming_through_a_leader_stopped_and_started() {
     assert_eq!(key(&read), key(&healthy), "every record once, as the healthy cluster has them");
 }
 
-/// Every node of the cluster up and answering again.
+/// Every node of the cluster up and answering again. A node not running (one that died starting
+/// again) is started again, and its last log lines are printed: the cause, when CI's runner is
+/// short of something a node needs.
 fn wait_cluster(nodes: &[String]) {
-    for n in nodes {
-        let _ = Command::new("docker").args(["start", n]).output();
-    }
-    let until = Instant::now() + Duration::from_secs(120);
+    let running = |n: &str| {
+        let out = Command::new("docker").args(["inspect", "-f", "{{.State.Running}}", n]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim() == "true"
+    };
+    let until = Instant::now() + Duration::from_secs(180);
     loop {
+        for n in nodes {
+            if !running(n) {
+                let logs = Command::new("docker").args(["logs", "--tail", "15", n]).output().unwrap();
+                eprintln!("{n} not running; its last lines:\n{}", String::from_utf8_lossy(&logs.stderr));
+                let _ = Command::new("docker").args(["start", n]).output();
+            }
+        }
         // node 0's admin API (scripts/cluster.sh: node i on 4964i)
         let out = Command::new("docker")
             .args(["exec", &nodes[0], "rpk", "cluster", "health", "-X", "admin.hosts=127.0.0.1:49640"])
@@ -724,7 +734,7 @@ fn wait_cluster(nodes: &[String]) {
             return;
         }
         assert!(Instant::now() < until, "the cluster healthy again: {}", String::from_utf8_lossy(&out.stdout));
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(2));
     }
 }
 
