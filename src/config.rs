@@ -283,7 +283,8 @@ pub struct ProducerSettings {
     pub request_timeout: Duration,
     /// The wait before a failed request is retried (`retry.backoff.ms`, default 100 ms).
     pub retry_backoff: Duration,
-    /// `retry.backoff.max.ms` (default 1000 ms), checked and kept.
+    /// `retry.backoff.max.ms` (default 1000 ms): the longest a retry waits, `retry.backoff.ms`
+    /// doubled at each attempt up to it (a batch's retries, the metadata lookups).
     pub retry_backoff_max: Duration,
     /// The compression codec, one of [`records`](crate::records)' `NONE`, `GZIP`, `SNAPPY`,
     /// `LZ4`, `ZSTD` (`compression.type` or `compression.codec`, default `none`).
