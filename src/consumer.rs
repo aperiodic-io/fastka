@@ -132,6 +132,9 @@ const RUN: usize = 1000;
 // ponytail: a fixed wait, not the socket's readiness (`poll`/`epoll`, a call too); a wait to
 // tune if a pipeline's latency is gated below 0.1 ms
 const QUIET_READ: Duration = Duration::from_micros(100);
+/// `next_event`'s longest wait on its sockets before it looks at its timers again (a
+/// reconnect due, a lookup, a Fetch overdue), and what a readiness missed costs at most.
+const WAIT: Duration = Duration::from_millis(10);
 
 enum Link {
     /// not connected: may connect at `.0`
@@ -208,6 +211,9 @@ pub struct Consumer {
     /// a lookup under way, and the partitions it is for: (index, epoch, its offset, its leader)
     lookup: Option<mpsc::Receiver<Found>>,
     looking: Vec<(usize, u32, bool, bool)>,
+    /// the brokers' sockets, registered for readability (`wait`); None: waits are sleeps
+    #[cfg(unix)]
+    ready: Option<(mio::Poll, mio::Events)>,
 }
 
 /// A lookup's answer: the offsets asked for, each topic's leaders.
@@ -264,6 +270,8 @@ impl Consumer {
             turn: 0,
             run: 0,
             lookup: None,
+            #[cfg(unix)]
+            ready: mio::Poll::new().ok().map(|p| (p, mio::Events::with_capacity(16))),
             looking: vec![],
         })
     }
@@ -512,6 +520,10 @@ impl Consumer {
     /// `drop_broker`'s work, untold.
     fn reset_broker(&mut self, b: usize, now: Instant) {
         let br = &mut self.brokers[b];
+        #[cfg(unix)]
+        if let (Link::Ready(s), Some((poll, _))) = (&br.link, &self.ready) {
+            let _ = poll.registry().deregister(&mut mio::unix::SourceFd(&s.raw_fd()));
+        }
         br.link = Link::Idle(now + br.backoff);
         br.backoff = (br.backoff * 2).min(self.net.backoff_max);
         (br.inflight, br.written) = (None, 0);
@@ -595,7 +607,19 @@ impl Consumer {
                         continue;
                     }
                     Ok(Ok(c)) => match c.into_stream() {
-                        Ok(s) => self.brokers[b].link = Link::Ready(s),
+                        Ok(s) => {
+                            #[cfg(unix)]
+                            if let Some((poll, _)) = &self.ready {
+                                // a descriptor of a socket closed unregistered may still be
+                                // registered under its number: registered again, then
+                                let (fd, r, t) = (s.raw_fd(), poll.registry(), mio::Token(b));
+                                let mut src = mio::unix::SourceFd(&fd);
+                                if r.register(&mut src, t, mio::Interest::READABLE).is_err() {
+                                    let _ = r.reregister(&mut src, t, mio::Interest::READABLE);
+                                }
+                            }
+                            self.brokers[b].link = Link::Ready(s)
+                        }
                         Err(e) => {
                             self.drop_broker(b, now, format!("connecting: {e}"), notice);
                             continue;
@@ -860,6 +884,37 @@ impl Consumer {
         None
     }
 
+    /// Waits until a socket has something to read, at most `WAIT` and not past `until`. What no
+    /// socket says (a connection or a lookup under way on a thread, a Fetch not written whole) is
+    /// looked at again within 1 ms, as it was before there was a wait.
+    fn wait(&mut self, until: Option<Instant>) {
+        let now = Instant::now();
+        let mut slice = until.map_or(WAIT, |u| u.saturating_duration_since(now).min(WAIT));
+        let pending = self.lookup.is_some()
+            || self
+                .brokers
+                .iter()
+                .any(|b| matches!(b.link, Link::Connecting(_)) || b.inflight.is_some() && b.written < b.out.len());
+        if pending {
+            slice = slice.min(Duration::from_millis(1));
+        }
+        #[cfg(unix)]
+        if let Some((poll, events)) = &mut self.ready {
+            // edge triggered: a broker's socket is read until it would block, or its one
+            // response is whole (one Fetch in flight a broker), so no readiness is left unseen;
+            // one missed would cost a `WAIT`
+            if poll.poll(events, Some(slice)).is_ok() {
+                for e in events.iter() {
+                    if let Some(br) = self.brokers.get_mut(e.token().0) {
+                        br.quiet_until = now; // readable: read at the next pump
+                    }
+                }
+                return;
+            }
+        }
+        std::thread::sleep(slice.min(Duration::from_millis(1)));
+    }
+
     /// The next event of any partition not paused (a message, or an end), waiting up to
     /// `timeout` for one (`Duration::MAX`: until one comes).
     ///
@@ -880,7 +935,7 @@ impl Consumer {
                 return Ok(None);
             }
             if !heard {
-                std::thread::sleep(Duration::from_millis(1));
+                self.wait(until);
             }
         }
     }

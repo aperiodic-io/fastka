@@ -870,6 +870,28 @@ fn a_quiet_socket_is_not_read_on_every_pump() {
     assert!(reads >= 1, "read again once its wait is over: {:?} of pumps", t.elapsed());
 }
 
+/// A consumer with nothing to read waits on its sockets' readiness, not on a timer: an idle
+/// `next_event` reads its socket a few times (each wait's end, `WAIT`), not every millisecond, and
+/// what arrives is read when it arrives (the produce-to-consume latency a 1 ms sleep floored).
+#[cfg(unix)]
+#[test]
+fn an_idle_consumer_waits_on_its_socket_not_a_timer() {
+    let mut a = Log::default();
+    a.push(0, &["x"]);
+    let br = log_broker(logs(&[("t", 0, a)]), Box::new(|_, _| Some(Answer::Silence)));
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    let until = Instant::now() + Duration::from_secs(5);
+    while br.requests(wire::FETCH).is_empty() {
+        assert!(Instant::now() < until);
+        c.pump(&mut |_| {}).unwrap();
+    }
+    let (t, before) = (Instant::now(), c.brokers[0].reads);
+    assert_eq!(c.next_event(Duration::from_millis(300), &mut |_| {}).unwrap(), None);
+    let reads = c.brokers[0].reads - before;
+    let most = (t.elapsed().as_millis() / WAIT.as_millis()) as u64 * 2 + 4;
+    assert!(reads <= most, "{reads} reads of an idle socket in {:?}, at most {most}", t.elapsed());
+}
+
 /// A leader cut off from the network (its Fetch unanswered, its connection open) whose
 /// partitions' leadership moves: they are fetched from their new leader within seconds, not after
 /// `socket.timeout.ms`. On staging, a broker cut off for 60 s held its partitions' rows that long:

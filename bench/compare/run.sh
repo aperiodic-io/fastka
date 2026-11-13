@@ -37,3 +37,11 @@ for codec in none lz4; do
   done
   docker exec "$RPK" rpk topic delete "$backlog" >/dev/null
 done
+# latency: produce -> consume at LATENCY_RATE msgs/s (default 5000) on one partition, linger 0
+for r in $(seq "$RUNS"); do
+  for c in fastka rdkafka; do
+    t="cmp-latency-$c-$r-$RANDOM$RANDOM"; docker exec "$RPK" rpk topic create "$t" -p 1 -r 1 >/dev/null
+    N=${LATENCY_N:-20000} PARTS=1 one latency "$c" "$t" none
+    docker exec "$RPK" rpk topic delete "$t" >/dev/null
+  done
+done

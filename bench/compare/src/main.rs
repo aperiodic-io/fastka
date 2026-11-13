@@ -1,8 +1,11 @@
 //! One workload, one client, one process: `compare <produce|consume> <client> <brokers> <topic> <partitions> <n> <size> [codec]`.
 //! Prints one JSON line: wall time, CPU time (user + system, every thread of the process) and peak RSS.
 //! `run.sh` drives it. Every client is given the same batch and fetch sizes where it has the setting.
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
 struct Args {
     brokers: String,
     topic: String,
@@ -37,16 +40,19 @@ fn main() {
         ("consume", "rdkafka") => rdkafka_consume(&args),
         ("consume", "rskafka") => rskafka_consume(&args),
         ("consume", "kafka-rust") => kafka_rust_consume(&args),
+        ("latency", "fastka") => latency(&args, fastka_latency),
+        ("latency", "rdkafka") => latency(&args, rdkafka_latency),
         _ => panic!("unknown workload {workload} or client {client}"),
     };
     let (secs, cpu_s) = (t0.elapsed().as_secs_f64(), cpu() - cpu0);
     assert_eq!(got, args.n, "{client}: {got} messages of {}", args.n);
     println!(
-        r#"{{"workload":"{workload}","client":"{client}","codec":"{}","n":{},"size":{},"secs":{secs:.4},"cpu":{cpu_s:.4},"rss_kb":{}}}"#,
+        r#"{{"workload":"{workload}","client":"{client}","codec":"{}","n":{},"size":{},"secs":{secs:.4},"cpu":{cpu_s:.4},"rss_kb":{}{}}}"#,
         args.codec,
         args.n,
         args.size,
-        rss_kb()
+        rss_kb(),
+        EXTRA.get().map_or("", String::as_str)
     );
 }
 
@@ -78,6 +84,102 @@ const T: Duration = Duration::from_secs(120);
 /// fits a broker's default 1 MB batch, as fastka's and librdkafka's batches are bounded.
 fn per_batch(size: usize) -> usize {
     (900_000 / (size + 24)).clamp(1, 10_000)
+}
+
+// ---- latency: produce -> consume, one partition, at a fixed rate ----
+
+/// What a latency run's consumer is given: where it reads, a flag to start once it reads, and the
+/// sender's epoch; it returns each message's latency (ns).
+/// Fields a workload adds to its JSON line.
+static EXTRA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+type LatencyFn = fn(&Args, Arc<AtomicBool>, Instant) -> Vec<u64>;
+
+/// `n` messages at `LATENCY_RATE` a second, each carrying when it was sent, read back in the same
+/// process (one clock); the producer's linger is 0 for both clients. Prints the percentiles.
+fn latency(a: &Args, consume: LatencyFn) -> usize {
+    let rate: u64 = std::env::var("LATENCY_RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(5000);
+    let ready = Arc::new(AtomicBool::new(false));
+    let epoch = Instant::now();
+    let reader = {
+        let (a, ready) = (Args { ..a.clone() }, ready.clone());
+        std::thread::spawn(move || consume(&a, ready, epoch))
+    };
+    while !ready.load(Relaxed) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut cfg = fastka::Config::new();
+    cfg.set("bootstrap.servers", &a.brokers).set("linger.ms", "0");
+    let p = fastka::producer::Producer::new(&cfg, Count(Default::default(), Default::default())).unwrap();
+    let start = Instant::now();
+    for i in 0..a.n as u64 {
+        let due = start + Duration::from_nanos(i * 1_000_000_000 / rate);
+        while Instant::now() < due {
+            p.poll(Duration::ZERO);
+            std::hint::spin_loop();
+        }
+        let mut v = (epoch.elapsed().as_nanos() as u64).to_be_bytes().to_vec();
+        v.resize(a.size.max(8), 0);
+        p.send(fastka::producer::Record::to(&a.topic).value(&v), ()).map_err(|(e, _)| e).unwrap();
+    }
+    p.flush(T).unwrap();
+    let mut lat = reader.join().unwrap();
+    lat.sort_unstable();
+    let q = |f: f64| lat[((lat.len() as f64 * f) as usize).min(lat.len() - 1)] as f64 / 1000.0;
+    eprintln!("latency_us p50={:.0} p99={:.0} p999={:.0} max={:.0}", q(0.5), q(0.99), q(0.999), q(1.0));
+    let _ = EXTRA.set(format!(
+        r#","latency_us":{{"p50":{:.1},"p99":{:.1},"p999":{:.1},"max":{:.1}}}"#,
+        q(0.5),
+        q(0.99),
+        q(0.999),
+        q(1.0)
+    ));
+    lat.len()
+}
+
+fn sent_at(v: &[u8], epoch: Instant) -> u64 {
+    (epoch.elapsed().as_nanos() as u64).saturating_sub(u64::from_be_bytes(v[..8].try_into().unwrap()))
+}
+
+fn fastka_latency(a: &Args, ready: Arc<AtomicBool>, epoch: Instant) -> Vec<u64> {
+    use fastka::consumer::{Assignment, Consumer, Offset, Polled};
+    let mut cfg = fastka::Config::new();
+    cfg.set("bootstrap.servers", &a.brokers).set("enable.partition.eof", "true").set("fetch.wait.max.ms", "100");
+    let mut k = Consumer::from_config(&cfg, vec![Assignment::new(&a.topic, 0, Offset::End)]).unwrap();
+    let mut lat = Vec::with_capacity(a.n);
+    while lat.len() < a.n {
+        match k.next_event(Duration::from_millis(100), &mut |_| {}).unwrap() {
+            Some((_, Polled::Msg(m))) => lat.push(sent_at(m.value.as_deref().unwrap(), epoch)),
+            Some((_, Polled::Eof)) => ready.store(true, Relaxed), // at the end: the sender may start
+            _ => {}
+        }
+    }
+    lat
+}
+
+fn rdkafka_latency(a: &Args, ready: Arc<AtomicBool>, epoch: Instant) -> Vec<u64> {
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::Message;
+    let c: BaseConsumer = rdkafka_cfg(a)
+        .set("group.id", "fastka-compare")
+        .set("enable.auto.commit", "false")
+        .set("enable.partition.eof", "true")
+        .set("fetch.wait.max.ms", "100")
+        .create()
+        .unwrap();
+    let mut tpl = rdkafka::TopicPartitionList::new();
+    tpl.add_partition_offset(&a.topic, 0, rdkafka::Offset::End).unwrap();
+    c.assign(&tpl).unwrap();
+    let mut lat = Vec::with_capacity(a.n);
+    while lat.len() < a.n {
+        match c.poll(Duration::from_millis(100)) {
+            Some(Ok(m)) => lat.push(sent_at(m.payload().unwrap(), epoch)),
+            Some(Err(rdkafka::error::KafkaError::PartitionEOF(_))) => ready.store(true, Relaxed),
+            Some(Err(e)) => panic!("{e}"),
+            None => {}
+        }
+    }
+    lat
 }
 
 // ---- fastka ----

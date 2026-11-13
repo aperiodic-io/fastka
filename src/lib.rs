@@ -1,5 +1,5 @@
 #![doc = include_str!("../README.md")]
-#![warn(missing_docs)]
+#![cfg_attr(not(test), warn(missing_docs))]
 pub mod client;
 pub mod config;
 pub(crate) mod conn;

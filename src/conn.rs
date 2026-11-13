@@ -67,6 +67,15 @@ impl std::fmt::Debug for Stream {
 }
 
 impl Stream {
+    /// The socket's descriptor, for a readiness wait.
+    #[cfg(unix)]
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        match self {
+            Stream::Plain(s) => s.tcp.as_raw_fd(),
+            Stream::Tls(s) => s.sock.tcp.as_raw_fd(),
+        }
+    }
     fn sock(&mut self) -> &mut Sock {
         match self {
             Stream::Plain(s) => s,
