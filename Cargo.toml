@@ -51,3 +51,7 @@ debug = "line-tables-only"
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
+
+[[bench]]
+name = "gate"
+harness = false

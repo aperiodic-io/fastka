@@ -1,0 +1,11 @@
+{
+  "fetch_decode": 27805367,
+  "read_gzip": 586729891,
+  "read_lz4": 314876972,
+  "read_none": 212695115,
+  "read_snappy": 329595654,
+  "read_zstd": 346564035,
+  "write_lz4": 97311274,
+  "write_none": 61011246,
+  "write_zstd": 158303737
+}

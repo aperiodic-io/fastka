@@ -1,0 +1,21 @@
+[package]
+name = "fastka-compare"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "fastka against other Kafka clients for Rust: the same workloads, each in a process of its own"
+
+[workspace]
+
+[dependencies]
+fastka = { path = "../.." }
+rdkafka = { version = "0.39", default-features = false, features = ["libz", "zstd"] }
+rskafka = { version = "0.6", default-features = false, features = ["compression-lz4"] }
+kafka = { version = "0.10", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
