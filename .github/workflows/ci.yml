@@ -43,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - run: scripts/brokers.sh | tee -a "$GITHUB_ENV.sh" && sed 's/^export //; s/ /\n/g' "$GITHUB_ENV.sh" >> "$GITHUB_ENV"
+      - run: scripts/brokers.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
       - run: cargo test --test brokers -- --nocapture
       - if: failure()
         run: for c in fastka-rp fastka-apache fastka-sasl; do docker logs $c 2>&1 | tail -30; done
