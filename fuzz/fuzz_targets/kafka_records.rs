@@ -1,4 +1,4 @@
-//! A Fetch's records, whatever bytes they hold (brrrrr-kafka's `records`): read uncommitted or
+//! A Fetch's records, whatever bytes they hold (fastka's `records`): read uncommitted or
 //! committed, the CRC checked or not, each record's headers walked, never a panic; and what a
 //! batch written here holds reads back the same.
 #![no_main]

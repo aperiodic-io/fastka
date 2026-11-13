@@ -1,4 +1,4 @@
-//! A broker's responses, whatever bytes they hold (brrrrr-kafka's `wire`): each decoder fails or
+//! A broker's responses, whatever bytes they hold (fastka's `wire`): each decoder fails or
 //! decodes, never panics, and allocates no more than its bytes allow (a length past the end is
 //! refused before anything is allocated for it). The first byte picks the decoder.
 #![no_main]

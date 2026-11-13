@@ -1,0 +1,28 @@
+[package]
+name = "fastka-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+fastka = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[workspace]
+
+[[bin]]
+name = "kafka_responses"
+path = "fuzz_targets/kafka_responses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kafka_records"
+path = "fuzz_targets/kafka_records.rs"
+test = false
+doc = false
+bench = false
