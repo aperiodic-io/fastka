@@ -1,0 +1,15 @@
+# cargo-mutants (`cargo mutants`): every mutant of the library must make a test fail, or be listed
+# below with why no test can tell it from the original.
+test_tool = "nextest"
+# the producer's and consumer's tests wait on real sockets and timers: a mutant that hangs one is
+# caught by its timeout, kept short of the suite's own
+timeout_multiplier = 3.0
+minimum_test_timeout = 60
+# a mutant that leaves a variable unused must still build under -D warnings, or it is filed as
+# unviable instead of tested
+cap_lints = true
+profile = "mutants"
+# The Kani proofs: only Kani compiles them (`#[cfg(kani)]`), so a mutant of one builds the same
+# binary and no test can catch it. CI's kani job checks them.
+exclude_globs = ["src/proofs.rs"]
+exclude_re = []
