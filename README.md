@@ -9,11 +9,18 @@ fastka = "0.1"
 ```
 
 fastka was written for one job: a market-data pipeline engine whose data thread used to spend
-more time inside librdkafka than decoding the messages. It came out of that engine (where it
-replaced librdkafka in production) as a crate that knows nothing of it. That origin explains both
+more time inside librdkafka than decoding the messages. It came out of that engine, where it
+replaced librdkafka, as a crate that knows nothing of it. That origin explains both
 what it is good at and the things it deliberately leaves out.
 
-<!-- BENCH-SUMMARY -->
+**At a glance** (1M messages of 100 B through Redpanda on the same 4-vCPU host, medians of 5
+runs; [details below](#benchmarks)):
+
+- **Consuming**, fastka spends the least CPU per message of the clients measured. That is
+  0.24 µs, against 1.56 µs for librdkafka (via rdkafka) and 0.30 µs for rskafka. It reads about
+  4M msgs/s on one thread.
+- **Producing**, fastka has about 2× librdkafka's throughput at less than half its CPU per message.
+- **Latency** from produce to consume is level with librdkafka (p50 0.34 ms against 0.37 ms).
 
 ## What it is
 
@@ -46,8 +53,8 @@ what it is good at and the things it deliberately leaves out.
   so an existing deployment's `key=value` lines mean what they meant. A key the client doesn't
   honour is **refused at startup**, never silently ignored. A TLS setting dropped silently is how
   production ends up in plaintext.
-- **Small.** About 6k lines of library code, with 9 dependencies (rustls, ring, the codecs and
-  crc32c). zstd is the only C code it builds.
+- **Small.** About 4.6k lines of library code (comments aside), with 10 dependencies: rustls,
+  ring, mio (on Unix), the codecs and crc32c. zstd is the only C code it builds.
 
 ## What it is not
 
@@ -62,6 +69,10 @@ loudly at startup, not half-supported:
 | **GSSAPI/Kerberos, OAUTHBEARER, encrypted private keys, JKS/PKCS#12** | rdkafka. |
 | **Flexible protocol versions (KIP-482 tagged fields), Fetch sessions (KIP-227), leader epochs (KIP-320), SASL re-authentication (KIP-368)** | Every broker from Kafka 2.4 to 4.1, and Redpanda, still speaks the versions used here. A broker that drops them is refused at connect, naming the API. |
 | **Epoch bump on a sequence gap** | Where librdkafka bumps the producer epoch and renumbers, a fastka producer becomes *fatal* (`fatal_error()`), and you create a new one. This only happens when a batch may have been written but its outcome is unknown: its answer lost, or a refusal with a code not known to come before the broker appends. |
+
+**Platforms.** CI runs on Linux. The consumer waits on socket readiness through mio's epoll or
+kqueue on Unix. Elsewhere, Windows included, it compiles, but the consumer checks its sockets every
+millisecond instead, and nothing there is tested.
 
 Two further limits. fastka has not been run by anyone except its authors, and its API is 0.x. The
 verification below is thorough, but it doesn't replace years of other people's production traffic,
@@ -167,7 +178,8 @@ Every claim below is a test in this repository that CI runs.
   - varints round-trip for every `i64`;
   - no bytes make the varint, cursor or batch-header decoders panic or read out of bounds;
   - an array length from the wire is never trusted beyond the bytes that are actually present;
-  - version negotiation picks the newest common version.
+  - version negotiation picks the newest common version;
+  - every key lands on a partition the topic has, whatever its partition count.
 - **Fuzzing** (`fuzz/`, cargo-fuzz). Every response decoder and the record reader get arbitrary
   bytes. Nothing panics, and nothing is allocated beyond what the bytes allow. Decompression is
   capped, so a 1 MB zstd bomb is refused instead of growing into gigabytes.
@@ -185,20 +197,117 @@ Every claim below is a test in this repository that CI runs.
     - every report is true;
     - a key's order is kept;
     - the consumer reads every partition exactly as a reader without faults does.
-  - It runs for 90 s on every PR and for 15 minutes nightly, with a new seed each run.
+  - Each profile (lz4, none, zstd, and a harsh one whose stalls outlast `message.timeout.ms`)
+    runs for 90 s on every PR and for 15 minutes nightly, with a new seed each run. The last
+    local run sent 31M messages; 22 producers went fatal in the harsh profile and 33k reports
+    said "possibly persisted", and every invariant held.
 - **The benchmark gate** (`benches/gate.rs`, `bench/gate/gate.py`).
   - What it measures: the hot paths (reading records in every codec, writing batches, decoding
     a Fetch).
   - How: counted in instructions under Valgrind, which is deterministic to well below 0.1%.
   - When: on every PR, against the base branch built on the same runner.
   - A regression above 3% fails the PR.
-- **Adversarial review.** Before release, independent reviewers went through the producer, the
-  consumer, and the network/security layers looking for data loss, panics on broker input, and
-  denial of service. Each finding they confirmed is a regression test now.
+- **Adversarial review.** Before release, the code went through two rounds of review aimed at
+  breaking it. Reviewers looked at the producer, the consumer and the network and security
+  layers, hunting for data loss, panics on broker input, and denial of service.
+  - The first round found about 40 defects, among them:
+    - a Produce request with no size cap;
+    - records skipped after a partition error;
+    - a zstd decompression bomb;
+    - a TLS read that could outlive its timeout;
+    - a SASL password visible in `Debug` output.
+  - The second round reviewed the fixes. It found 7 more, among them a consumer queue with no
+    byte bound and a reconnect that overran `message.timeout.ms`.
+  - Each finding was proved by a test that failed first, and that test now guards the fix.
 
 ## Benchmarks
 
-<!-- BENCH-TABLE -->
+Reproduce these with `scripts/brokers.sh && bench/compare/run.sh > out.jsonl && bench/compare/table.py out.jsonl`.
+The raw runs are in [`bench/results/compare.jsonl`](bench/results/compare.jsonl).
+
+**Setup:**
+- 4 vCPUs and 15 GB of RAM; Linux 6.18.
+- Redpanda 24.2 (`--smp 1`) in Docker on the same host.
+- A topic of 3 partitions; 1,000,000 messages of 100 B.
+- Each run is a fresh process. A produce run writes a fresh topic. A consume run reads a backlog
+  written once, in batches of up to 10,000 messages, from the beginning of every partition.
+- Wall time runs from creating the client to the last message delivered or read, so connection
+  setup is included.
+- CPU time is user plus system time of the whole process, *every thread included*
+  (`getrusage`). This is what a client really costs a host, not only the caller's thread.
+
+**The clients, and how each is driven:**
+- **fastka**: `Producer::send` and `poll`; `Consumer::next_event`.
+- **rdkafka 0.39** (librdkafka 2.12):
+  - producing: `BaseProducer`, idempotent, `linger.ms=5`, the same batch sizes as fastka;
+  - consuming: `BaseConsumer::poll` with assigned partitions, as librdkafka's per-message API
+    is used.
+- **rskafka 0.6** (async, tokio multi-thread runtime). It has no batching producer at this level,
+  so the harness batches for it (10,000 messages or ~1 MB, one batch per partition in flight). It
+  consumes `fetch_records` with the 3 partitions as 3 tasks, which run on 3 cores at once.
+- **kafka-rust 0.10** (`kafka`): synchronous `send_all` of the same batches, `acks=all`,
+  not idempotent. It has no lz4.
+
+All clients write with `acks=all`.
+
+**Consume, 1,000,000 messages of 100 B, compression: none**
+
+| client | msgs/s | CPU µs / msg | peak RSS | runs |
+|---|---:|---:|---:|---:|
+| **fastka** | 4,089,980 | 0.24 | 24 MB | 5 |
+| rdkafka | 276,365 | 1.56 | 57 MB | 5 |
+| rskafka | 5,437,738 | 0.30 | 35 MB | 5 |
+| kafka-rust | cannot read record batches v2 (Kafka ≥ 0.11's format): `UnexpectedEof` | | | |
+
+**Consume, 1,000,000 messages of 100 B, compression: lz4**
+
+| client | msgs/s | CPU µs / msg | peak RSS | runs |
+|---|---:|---:|---:|---:|
+| **fastka** | 3,608,805 | 0.26 | 79 MB | 5 |
+| rdkafka | 295,438 | 1.25 | 120 MB | 5 |
+| rskafka | 4,415,011 | 0.51 | 120 MB | 5 |
+
+**Produce, 1,000,000 messages of 100 B, compression: none**
+
+| client | msgs/s | CPU µs / msg | peak RSS | runs |
+|---|---:|---:|---:|---:|
+| **fastka** | 1,622,060 | 0.64 | 25 MB | 5 |
+| rdkafka | 768,049 | 1.45 | 37 MB | 5 |
+| rskafka | 1,787,630 | 0.77 | 22 MB | 5 |
+| kafka-rust | 600,528 | 0.96 | 7 MB | 5 |
+
+**Produce, 1,000,000 messages of 100 B, compression: lz4**
+
+| client | msgs/s | CPU µs / msg | peak RSS | runs |
+|---|---:|---:|---:|---:|
+| **fastka** | 1,514,005 | 0.66 | 14 MB | 5 |
+| rdkafka | 793,021 | 1.39 | 36 MB | 5 |
+| rskafka | 477,168 | 0.67 | 17 MB | 5 |
+
+**Produce → consume latency, 20,000 messages at 5,000/s, one partition (fastka's producer for both; the consumer differs)**
+
+| consumer | p50 | p99 | p99.9 | max |
+|---|---:|---:|---:|---:|
+| **fastka** | 343 µs | 3,178 µs | 4,961 µs | 6,376 µs |
+| rdkafka | 367 µs | 3,511 µs | 5,249 µs | 7,526 µs |
+
+**How to read these numbers:**
+- **CPU per message is the number fastka was built for.** Its consumer does all its work on the
+  thread that calls it, with no per-message allocation behind a lock and no hand-off between
+  threads. That is the gap to librdkafka, whose per-message API pays for a heap object per
+  message, op queues and a thread hand-off.
+- **rskafka reads faster in wall time** because it decodes three partitions on three cores,
+  while fastka's consumer is one thread. Run one fastka consumer per thread over a share of the
+  partitions to use more cores. rskafka's *producer* numbers depend on the harness's batching
+  (above), so read them as an upper bound.
+- **librdkafka's wall time** includes its threads' start-up and its fetch queue's hand-off. A
+  long-running consumer amortizes the start-up but not the per-message CPU.
+- **Latency:** in both latency runs fastka's producer writes (with `linger.ms=0`), and the two
+  consumers read the same stream with `fetch.wait.max.ms=100`. So the table compares consumers.
+  fastka's consumer blocks on its sockets' readiness (epoll/kqueue) between Fetches. It does not
+  spin, so an idle consumer costs nothing.
+- **This is one host with the broker local.** Over a real network, round trips dominate latency
+  and all clients look closer.
 
 ## Settings
 
