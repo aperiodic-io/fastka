@@ -114,6 +114,9 @@ const KEYS: &[&str] = &[
     "compression.level",
     "sticky.partitioning.linger.ms",
     "topic.metadata.refresh.interval.ms",
+    "max.in.flight.requests.per.connection",
+    "max.in.flight",
+    "max.request.size",
 ];
 
 fn int(k: &str, v: &str, lo: i64, hi: i64) -> Result<i64> {
@@ -296,9 +299,18 @@ pub struct ProducerSettings {
     /// The compression codec, one of [`records`](crate::records)' `NONE`, `GZIP`, `SNAPPY`,
     /// `LZ4`, `ZSTD` (`compression.type` or `compression.codec`, default `none`).
     pub codec: i16,
-    /// The largest batch a broker takes, bytes (`message.max.bytes`, default 1000000), and the
-    /// most a Produce request holds.
+    /// The largest batch a broker takes, bytes (`message.max.bytes`, default 1000000).
     pub max_batch: usize,
+    /// The most bytes of batches a Produce request holds (`max.request.size`, the Java client's
+    /// name; default `message.max.bytes`, as before the setting). A request holds at least one
+    /// batch, however large: the due batches longest waiting go first, the rest in the next
+    /// request.
+    pub max_request: usize,
+    /// Produce requests outstanding to a broker at once, each on a connection (and a thread) of
+    /// its own (`max.in.flight.requests.per.connection` or `max.in.flight`, 1 to 5 as
+    /// librdkafka's idempotent producer, default 1). A partition has one batch in flight whatever
+    /// this is: its messages stay in the order sent, its sequences without a gap.
+    pub max_in_flight: usize,
     /// The metadata looked up again this often (`topic.metadata.refresh.interval.ms`, default
     /// 300000 ms, at least 10 ms); None for -1: never.
     pub metadata_refresh: Option<Duration>,
@@ -523,6 +535,7 @@ impl Config {
                 retry_backoff.as_millis()
             )));
         }
+        let max_batch = int("message.max.bytes", g("message.max.bytes", "1000000"), 1000, 1_000_000_000)? as usize;
         Ok(ProducerSettings {
             linger,
             batch_bytes: int("batch.size", g("batch.size", "1000000"), 1, 2_147_483_647)? as usize,
@@ -546,7 +559,17 @@ impl Config {
             retry_backoff,
             retry_backoff_max,
             codec,
-            max_batch: int("message.max.bytes", g("message.max.bytes", "1000000"), 1000, 1_000_000_000)? as usize,
+            max_batch,
+            max_request: match self.get("max.request.size") {
+                Some(v) => int("max.request.size", v, 1, 2_147_483_647)? as usize,
+                None => max_batch,
+            },
+            max_in_flight: int(
+                "max.in.flight.requests.per.connection",
+                self.aliased("max.in.flight.requests.per.connection", "max.in.flight")?.unwrap_or("1"),
+                1,
+                5,
+            )? as usize,
             metadata_refresh: match int(
                 "topic.metadata.refresh.interval.ms",
                 g("topic.metadata.refresh.interval.ms", "300000"),
@@ -592,6 +615,11 @@ mod tests {
             (Duration::from_millis(5), Duration::from_secs(300), 100_000)
         );
         assert_eq!(p.metadata_refresh, Some(Duration::from_secs(300)));
+        assert_eq!((p.max_in_flight, p.max_request), (1, 1_000_000), "a request bounded by message.max.bytes");
+        let p = cfg(&[("message.max.bytes", "2000000")]).producer().unwrap();
+        assert_eq!(p.max_request, 2_000_000, "max.request.size defaults to message.max.bytes");
+        let p = cfg(&[("max.in.flight", "5"), ("max.request.size", "1048576")]).producer().unwrap();
+        assert_eq!((p.max_in_flight, p.max_request), (5, 1_048_576));
         let p = cfg(&[("topic.metadata.refresh.interval.ms", "-1")]).producer().unwrap();
         assert_eq!(p.metadata_refresh, None, "-1: never");
         let p = cfg(&[("queue.buffering.max.ms", "20"), ("delivery.timeout.ms", "1500")]).producer().unwrap();
@@ -618,6 +646,10 @@ mod tests {
             ("isolation.level", "dirty", "read_committed or"),
             ("linger.ms", "soon", "not an integer"),
             ("auto.offset.reset", "middle", "earliest, latest"),
+            // librdkafka's idempotent producer's bound
+            ("max.in.flight", "6", "out of range 1..5"),
+            ("max.in.flight.requests.per.connection", "0", "out of range 1..5"),
+            ("max.request.size", "0", "out of range"),
         ] {
             let c = cfg(&[(k, v)]);
             let e = c.net().and(c.consumer().map(|_| ())).and(c.producer().map(|_| ())).unwrap_err().to_string();
@@ -722,5 +754,7 @@ mod tests {
         assert!(matches!(c.net(), Err(Error::Config(m)) if m.contains("sasl.mechanism")));
         c.set("sasl.mechanism", "PLAIN");
         c.net().unwrap();
+        let c = cfg(&[("max.in.flight", "2"), ("max.in.flight.requests.per.connection", "3")]);
+        assert!(matches!(c.producer(), Err(Error::Config(m)) if m.contains("max.in.flight")));
     }
 }

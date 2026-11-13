@@ -34,7 +34,10 @@ runs; [details below](#benchmarks)):
     threads, so a dropped SYN never blocks your loop.
 - **An idempotent producer** with delivery reports, and the semantics of librdkafka where they matter:
   - ordering per partition: one batch of a partition in flight, and a retry is sent with the same
-    sequence number;
+    sequence number. A broker can have up to `max.in.flight` requests outstanding, each on its own
+    connection;
+  - batches are encoded (copied, compressed, checksummed) by the broker's thread without holding
+    the producer's lock, so `send` and `poll` never wait for a compression;
   - `message.timeout.ms` bounds a message from `send` to its report, retries and the request in
     flight included;
   - partitioning by key with Java's murmur2, so keyed records land where the Java client puts
@@ -214,7 +217,8 @@ Every claim below is a test in this repository that CI runs.
     - every report is true;
     - a key's order is kept;
     - the consumer reads every partition exactly as a reader without faults does.
-  - Each profile (lz4, none, zstd, and a harsh one whose stalls outlast `message.timeout.ms`)
+  - Each profile (lz4, none, zstd, lz4 with `max.in.flight=5` and small requests, and a harsh
+    one whose stalls outlast `message.timeout.ms`)
     runs for 90 s on every PR and for 15 minutes nightly, with a new seed each run. The last
     local run sent 31M messages; 22 producers went fatal in the harsh profile and 33k reports
     said "possibly persisted", and every invariant held.
@@ -354,6 +358,15 @@ Settings use librdkafka's names and defaults, except where noted. Unknown keys a
   - `retry.backoff.ms`, `retry.backoff.max.ms`;
   - `compression.type` (`none`, `gzip`, `snappy`, `lz4`, `zstd`), `compression.level`;
   - `message.max.bytes`, `topic.metadata.refresh.interval.ms`.
+  - `max.request.size` (the Java client's name): the most bytes of batches a Produce request
+    holds. The batches that have waited longest go first, so none starves. A request always holds
+    at least one batch. Default: `message.max.bytes` (Java's default is 1048576).
+  - `max.in.flight.requests.per.connection` (or `max.in.flight`), 1 to 5, default 1: how many
+    Produce requests a broker can have outstanding at once, each on its own connection. A
+    partition still has one batch in flight, so its order and sequences are kept. A higher value
+    helps only when several requests' worth of batches are due at once, so pair it with a
+    `max.request.size` below them: 5 and 1048576 give librdkafka's request shape
+    (`bench/kafka-stress`).
   - `enable.idempotence=false` and any `acks` other than `all` are refused: the producer is always
     idempotent.
 

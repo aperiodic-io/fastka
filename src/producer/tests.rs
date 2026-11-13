@@ -562,7 +562,9 @@ fn nothing_is_sent_past_its_deadline() {
         msgs: vec![msg(2)],
         bytes: Arc::new(vec![]),
         seq: 0,
+        deadline: past,
         sending: false,
+        by: 0,
         retry_at: past,
         attempts: 1,
         maybe_written: true, // its answer lost
@@ -573,7 +575,8 @@ fn nothing_is_sent_past_its_deadline() {
     t.parts.insert(1, sent);
     st.topics.insert("o".into(), t);
     (st.outstanding, st.queued, st.queued_bytes) = (2, 2, 2 * msg(0).size());
-    let (req, _) = take_due(sh, &mut st, 0, Instant::now());
+    let (req, fresh, _, _) = take_due(sh, &mut st, 0, 0, Instant::now());
+    assert!(fresh.is_empty(), "a batch past its deadline sealed to send");
     assert!(
         req.is_empty(),
         "a batch past its deadline taken to send: {:?}",
@@ -624,8 +627,8 @@ fn a_fatal_producer_takes_nothing_to_send() {
     st.topics.insert("o".into(), t);
     (st.outstanding, st.queued, st.queued_bytes) = (1, 1, 16);
     st.set_fatal(Code::OUT_OF_ORDER_SEQUENCE_NUMBER, "a gap".into());
-    let (req, _) = take_due(sh, &mut st, 0, Instant::now());
-    assert!(req.is_empty(), "a fatal producer sent a batch");
+    let (req, fresh, _, _) = take_due(sh, &mut st, 0, 0, Instant::now());
+    assert!(req.is_empty() && fresh.is_empty(), "a fatal producer sent a batch");
 }
 
 fn log_of<'a>(logs: &'a Logs) -> std::sync::MutexGuard<'a, HashMap<(String, i32), Log>> {
@@ -1747,4 +1750,236 @@ fn a_topic_name_too_long_for_the_protocol_is_refused() {
     send(&p, "o", "x", 1);
     let h = heard(&p, 1);
     assert_eq!(h[0].3, None, "{h:?}");
+}
+
+/// The partitions a Produce request carries.
+fn partitions_in(r: &Req) -> usize {
+    let mut c = Cur::new(&r.body);
+    c.nstr().unwrap();
+    c.i16().unwrap();
+    c.i32().unwrap();
+    let mut n = 0;
+    for _ in 0..c.i32().unwrap() {
+        c.str().unwrap();
+        for _ in 0..c.i32().unwrap() {
+            c.i32().unwrap();
+            c.bytes().unwrap();
+            n += 1;
+        }
+    }
+    n
+}
+
+/// A broker slow to answer (each Produce held `ms`), and the most Produce requests it held at once.
+fn slow(ms: u64) -> (Fault, Arc<AtomicUsize>) {
+    let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let m2 = most.clone();
+    let f: Fault = Box::new(move |_, _, _| {
+        m2.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(ms));
+        now.fetch_sub(1, Ordering::SeqCst);
+        None
+    });
+    (f, most)
+}
+
+/// While a broker is slow to answer, full batches of other partitions pile up: one request carries
+/// them all (up to `message.max.bytes` by default), unless `max.request.size` bounds a request
+/// lower; then each request carries what fits, at least one batch (librdkafka sends one partition
+/// a request, the Java client bounds a request by this setting).
+#[test]
+fn max_request_size_bounds_a_produce_request() {
+    let run = |extra: &[(&str, &str)]| {
+        let (f, _) = slow(150);
+        let (b, logs) = sink(&["o"], 6, f);
+        let mut settings = vec![("batch.num.messages", "4"), ("linger.ms", "0")];
+        settings.extend_from_slice(extra);
+        let p = producer(&b, &settings);
+        for i in 0..96 {
+            send(&p, "o", &format!("m{i}"), i);
+        }
+        let h = heard(&p, 96);
+        assert!(h.iter().all(|x| x.3.is_none()), "{h:?}");
+        let mut all: Vec<String> = (0..6).flat_map(|q| values(&logs, "o", q)).collect();
+        all.sort();
+        assert_eq!(all.len(), 96, "each message once");
+        all.dedup();
+        assert_eq!(all.len(), 96, "each message once");
+        b.requests(wire::PRODUCE).iter().map(partitions_in).max().unwrap()
+    };
+    assert!(run(&[]) > 1, "by default a request carries every partition due, up to message.max.bytes");
+    // a batch of 4 small messages is about 200 bytes: one goes, two do not fit
+    assert_eq!(run(&[("max.request.size", "200")]), 1, "bounded: a batch a request");
+}
+
+/// `max.in.flight.requests.per.connection` (librdkafka's name; `max.in.flight` its alias): that
+/// many Produce requests to a broker at once, each on a connection of its own. A partition still
+/// has one batch in flight, so each partition's messages land once and in order. Unbounded, the
+/// first request takes every batch due and leaves the other connections nothing:
+/// `max.request.size` makes room for them.
+#[test]
+fn max_in_flight_sends_requests_to_a_broker_side_by_side() {
+    for (n, want) in [("1", 1), ("3", 3)] {
+        let (f, most) = slow(200);
+        let (b, logs) = sink(&["o"], 6, f);
+        let settings =
+            [("batch.num.messages", "2"), ("linger.ms", "0"), ("max.in.flight", n), ("max.request.size", "200")];
+        let p = producer(&b, &settings);
+        for i in 0..60 {
+            send(&p, "o", &format!("m{i:02}"), i);
+        }
+        let h = heard(&p, 60);
+        assert!(h.iter().all(|x| x.3.is_none()), "{h:?}");
+        assert_eq!(most.load(Ordering::SeqCst), want, "max.in.flight={n}: requests held at once");
+        let mut total = 0;
+        for q in 0..6 {
+            let v = values(&logs, "o", q);
+            let mut sorted = v.clone();
+            sorted.sort();
+            assert_eq!(v, sorted, "partition {q} in the order sent");
+            total += v.len();
+        }
+        assert_eq!(total, 60, "each message once");
+        let conns: std::collections::HashSet<usize> = b.requests(wire::PRODUCE).iter().map(|r| r.conn).collect();
+        assert_eq!(conns.len(), want, "max.in.flight={n}: a connection each");
+        assert_eq!(p.shared.lock().threads.len(), want, "max.in.flight={n}: a thread each");
+    }
+}
+
+/// A batch is encoded (compressed, its CRC taken) off the producer's lock: `send`, the other
+/// broker threads and `poll` go on meanwhile. Here a batch of 16 MB of gzip takes far longer to
+/// write than any `send` beside it may wait (bench/kafka-stress: in a burst every `send` waited
+/// out each batch's encoding).
+#[test]
+fn a_batch_is_encoded_off_the_producers_lock() {
+    let (b, _) = sink(&["o", "q"], 1, no_fault());
+    let big = 16 * 1024 * 1024;
+    let p = producer(
+        &b,
+        &[
+            ("compression.type", "gzip"),
+            ("message.max.bytes", &(2 * big).to_string()),
+            ("batch.size", &(2 * big).to_string()),
+            ("batch.num.messages", "16"),
+            ("linger.ms", "0"),
+        ],
+    );
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut noise = |n: usize| (0..n).map(|_| xorshift(&mut rng) as u8).collect::<Vec<u8>>();
+    let values: Vec<Vec<u8>> = (0..16).map(|_| noise(big / 16)).collect();
+    // how long the encoding takes, as the broker thread does it
+    let t = Instant::now();
+    let outs: Vec<Out<'_>> =
+        values.iter().map(|v| Out { timestamp: 0, key: None, value: Some(v), headers: &[] }).collect();
+    let stamp = Stamp { producer_id: 1, epoch: 0, base_sequence: 0 };
+    records::write(&mut vec![], &outs, stamp, records::GZIP, &mut vec![]).unwrap();
+    let encoding = t.elapsed();
+    send(&p, "q", "warm", 100); // the producer id and the topics looked up before the timing
+    heard(&p, 1);
+    for (i, v) in values.iter().enumerate() {
+        p.send(Record::to("o").value(v), i as u64).unwrap();
+    }
+    // while the batch is written, the slowest of many sends
+    let (start, mut slowest, mut i) = (Instant::now(), Duration::ZERO, 200);
+    while start.elapsed() < encoding {
+        let t = Instant::now();
+        send(&p, "q", "small", i);
+        slowest = slowest.max(t.elapsed());
+        i += 1;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(slowest < encoding / 4, "a send waited {slowest:?} while a batch was encoded (which takes {encoding:?})");
+    let h = heard(&p, 17 + (i as usize - 200));
+    assert!(h.iter().all(|x| x.3.is_none()), "{:?}", h.iter().find(|x| x.3.is_some()));
+}
+
+/// `max.request.size` at its edge: batches whose bytes sum to the bound exactly go in one request,
+/// a byte less and the second waits for the next (counted as `size_of` counts them, a batch's
+/// header included); the longest waiting first.
+#[test]
+fn a_request_takes_batches_up_to_max_request_size_exactly() {
+    let batch = records::HEADER + size_of(None, Some(&[0; 40]), &[]);
+    for (bound, taken, more) in [(2 * batch, 2, false), (2 * batch - 1, 1, true)] {
+        let mut c = config("127.0.0.1:1");
+        c.set("linger.ms", "0").set("max.request.size", bound.to_string());
+        let p = Producer::new(&c, Heard::default()).unwrap();
+        let sh = &*p.shared;
+        let mut st = sh.lock();
+        st.pid = Some((1000, 0));
+        let (now, later) = (Instant::now(), Instant::now() + Duration::from_secs(60));
+        let mut t = Topic {
+            partitions: vec![0, 1],
+            sticky: 0,
+            unassigned: VecDeque::new(),
+            parts: HashMap::new(),
+            missing: None,
+        };
+        for (q, o) in [(0, 2), (1, 1)] {
+            let mut part = Part { queue: VecDeque::new(), seq: 0, inflight: None, leader: Some(0) };
+            part.queue.push_back(Pending {
+                key: None,
+                value: Some(vec![0; 40]),
+                headers: vec![],
+                timestamp: 0,
+                partition: None,
+                opaque: o,
+                deadline: later,
+                enqueued: now - Duration::from_millis(o), // partition 0 waiting the longer
+            });
+            t.parts.insert(q, part);
+        }
+        st.topics.insert("o".into(), t);
+        (st.outstanding, st.queued, st.queued_bytes) = (2, 2, 2 * size_of(None, Some(&[0; 40]), &[]));
+        let (req, fresh, _, left) = take_due(sh, &mut st, 0, 7, now);
+        assert!(req.is_empty(), "nothing was in flight");
+        let parts: Vec<i32> = fresh.iter().map(|f| f.1).collect();
+        assert_eq!(parts.len(), taken, "max.request.size={bound} (a batch is {batch} bytes): {parts:?}");
+        assert_eq!(parts[0], 0, "the longest waiting first");
+        assert_eq!(left, more, "a batch left for the next request");
+        let sent = st.topics["o"].parts[&0].inflight.as_ref().unwrap();
+        assert!(sent.sending && sent.by == 7 && sent.msgs.is_empty(), "its messages out to encode, by thread 7");
+        // encoded and put back: in the request, under the bound
+        let written = encode(&fresh, sh.s.codec, &mut vec![]);
+        let mut req = vec![];
+        assert!(!encoded(sh, &mut st, &mut req, fresh, written));
+        assert_eq!(req.len(), taken);
+        assert!(req.iter().map(|r| r.2.len()).sum::<usize>() <= bound);
+        assert_eq!(st.topics["o"].parts[&0].inflight.as_ref().unwrap().msgs.len(), 1, "its messages back");
+    }
+}
+
+/// A batch that fails to encode fails its messages, not persisted, and gives its sequence back:
+/// the next batch of its partition is sent at it.
+#[test]
+fn a_batch_that_fails_to_encode_gives_its_sequence_back() {
+    let p = Producer::new(config("127.0.0.1:1").set("linger.ms", "0"), Heard::default()).unwrap();
+    let sh = &*p.shared;
+    let mut st = sh.lock();
+    st.pid = Some((1000, 0));
+    let later = Instant::now() + Duration::from_secs(60);
+    let mut part = Part { queue: VecDeque::new(), seq: 5, inflight: None, leader: Some(0) };
+    part.queue.push_back(Pending {
+        key: None,
+        value: Some(vec![1]),
+        headers: vec![],
+        timestamp: 0,
+        partition: None,
+        opaque: 1,
+        deadline: later,
+        enqueued: Instant::now() - Duration::from_secs(1),
+    });
+    let mut t =
+        Topic { partitions: vec![0], sticky: 0, unassigned: VecDeque::new(), parts: HashMap::new(), missing: None };
+    t.parts.insert(0, part);
+    st.topics.insert("o".into(), t);
+    (st.outstanding, st.queued, st.queued_bytes) = (1, 1, size_of(None, Some(&[1]), &[]));
+    let (_, fresh, _, _) = take_due(sh, &mut st, 0, 0, Instant::now());
+    assert_eq!(st.topics["o"].parts[&0].seq, 6, "sealed: the sequence taken");
+    let mut req = vec![];
+    encoded(sh, &mut st, &mut req, fresh, vec![Err(Error::Protocol("a codec's failure".into()))]);
+    assert!(req.is_empty());
+    let part = &st.topics["o"].parts[&0];
+    assert!(part.inflight.is_none() && part.seq == 5, "its sequence given back");
+    assert_eq!((st.queued, st.queued_bytes), (0, 0));
+    assert!(matches!(st.reports.front(), Some((_, Some(0), None, Some(Error::Protocol(_)), Persisted::No, 1))));
 }
