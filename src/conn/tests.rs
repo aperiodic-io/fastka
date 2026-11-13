@@ -559,3 +559,61 @@ fn bootstrap_tries_the_next_broker_after_an_unsupported_one() {
     let r = client.metadata(Some(&[]), Duration::from_secs(1));
     assert!(matches!(r, Err(Error::Unsupported(_))), "{r:?}");
 }
+
+/// A socket's timeout is the deadline's WouldBlock on every platform (Unix says WouldBlock,
+/// Windows TimedOut); any other error is itself.
+#[test]
+fn a_sockets_timeout_is_would_block_and_nothing_else_is() {
+    let err = |k: ErrorKind| timed_out::<()>(Err(k.into())).unwrap_err().kind();
+    assert_eq!(err(ErrorKind::TimedOut), ErrorKind::WouldBlock);
+    assert_eq!(err(ErrorKind::WouldBlock), ErrorKind::WouldBlock);
+    assert_eq!(err(ErrorKind::ConnectionReset), ErrorKind::ConnectionReset);
+    assert_eq!(timed_out(Ok(3)).unwrap(), 3);
+}
+
+/// No limit (`Duration::MAX`, past what the clock counts) is a century on: never now, nor a year.
+#[test]
+fn no_limit_is_a_century_on() {
+    let far = deadline_in(Duration::MAX).saturating_duration_since(Instant::now());
+    assert!(far > Duration::from_secs(50 * 365 * 86_400), "{far:?}");
+    let near = deadline_in(Duration::from_secs(2)).saturating_duration_since(Instant::now());
+    assert!(near <= Duration::from_secs(2) && near > Duration::from_secs(1), "{near:?}");
+}
+
+/// A certificate refused, by this client or by the broker's alert, is Auth (a retry meets it
+/// again); another TLS failure is Transport, said as TLS's; any other I/O error plain Transport.
+#[test]
+fn tls_refusals_are_auth_and_other_failures_transport() {
+    use rustls::AlertDescription as A;
+    let tls = |e: rustls::Error| tls_error("b:1", std::io::Error::new(ErrorKind::InvalidData, e));
+    assert!(matches!(tls(rustls::Error::AlertReceived(A::BadCertificate)), Error::Auth(m) if m.contains("TLS")));
+    assert!(matches!(tls(rustls::Error::AlertReceived(A::UnknownCA)), Error::Auth(_)));
+    assert!(matches!(tls(rustls::Error::NoCertificatesPresented), Error::Auth(_)));
+    assert!(
+        matches!(tls(rustls::Error::AlertReceived(A::HandshakeFailure)), Error::Transport(m) if m.contains("TLS:"))
+    );
+    let plain = tls_error("b:1", std::io::Error::from(ErrorKind::ConnectionReset));
+    assert!(matches!(&plain, Error::Transport(m) if !m.contains("TLS")), "{plain}");
+}
+
+/// A connection's descriptor is its own socket's (what the consumer waits on): two connections,
+/// two descriptors, neither a standard stream.
+#[test]
+fn a_connections_descriptor_is_its_sockets() {
+    let b = Broker::start(|_| Answer::Drop);
+    let one = Conn::open(&net(&config(&b.addr)), &b.addr).unwrap();
+    let two = Conn::open(&net(&config(&b.addr)), &b.addr).unwrap();
+    let (a, c) = (one.stream.raw_fd(), two.stream.raw_fd());
+    assert!(a > 2 && c > 2 && a != c, "descriptors {a} and {c}");
+}
+
+/// A connection's Debug names it and its broker, never its buffers (the last request may be
+/// SASL's, with the password).
+#[test]
+fn a_connections_debug_names_it_and_hides_its_buffers() {
+    let b = Broker::start(|_| Answer::Drop);
+    let c = Conn::open(&net(&config(&b.addr)), &b.addr).unwrap();
+    let d = format!("{c:?}");
+    assert!(d.contains("Conn") && d.contains(&b.addr), "{d}");
+    assert!(!d.contains("out") && !d.contains("apis"), "{d}");
+}
