@@ -23,7 +23,7 @@ fn oracle_request<R: Decodable>(out: &[u8], api: i16, corr: i32) -> R {
     let mut b = Bytes::copy_from_slice(&out[4..]);
     let h = km::RequestHeader::decode(&mut b, 1).unwrap();
     assert_eq!((h.request_api_key, h.request_api_version, h.correlation_id), (api, version(api), corr));
-    assert_eq!(h.client_id.as_deref(), Some("brrrrr"));
+    assert_eq!(h.client_id.as_deref(), Some("fastka"));
     let r = R::decode(&mut b, version(api)).unwrap();
     assert!(b.is_empty(), "{} bytes the schema has no field for", b.len());
     r
@@ -98,7 +98,7 @@ fn every_version_sent_has_the_headers_this_client_writes() {
 #[test]
 fn api_versions() {
     let mut out = vec![];
-    request(&mut out, API_VERSIONS, 7, "brrrrr", |_| {});
+    request(&mut out, API_VERSIONS, 7, "fastka", |_| {});
     let _: km::ApiVersionsRequest = oracle_request(&out, API_VERSIONS, 7);
     let r = km::ApiVersionsResponse::default().with_error_code(0).with_api_keys(vec![
         km::api_versions_response::ApiVersion::default().with_api_key(1).with_min_version(4).with_max_version(17),
@@ -112,7 +112,7 @@ fn api_versions() {
 fn metadata() {
     for topics in [None, Some(&["a", "b.c"][..])] {
         let mut out = vec![];
-        request(&mut out, METADATA, 9, "brrrrr", |o| metadata_request(o, topics));
+        request(&mut out, METADATA, 9, "fastka", |o| metadata_request(o, topics));
         let r: km::MetadataRequest = oracle_request(&out, METADATA, 9);
         let names = r.topics.map(|ts| ts.into_iter().map(|t| t.name.unwrap().0.to_string()).collect::<Vec<_>>());
         assert_eq!(names, topics.map(|ts| ts.iter().map(|t| t.to_string()).collect()));
@@ -176,7 +176,7 @@ fn fetch() {
     let l =
         FetchLimits { max_wait_ms: 50, min_bytes: 1, max_bytes: 4 << 20, isolation: 1, partition_max_bytes: 1 << 20 };
     let mut out = vec![];
-    request(&mut out, FETCH, 3, "brrrrr", |o| fetch_request(o, &l, &[("a", (0, 5)), ("b", (2, 0)), ("a", (1, 9))]));
+    request(&mut out, FETCH, 3, "fastka", |o| fetch_request(o, &l, &[("a", (0, 5)), ("b", (2, 0)), ("a", (1, 9))]));
     let r: km::FetchRequest = oracle_request(&out, FETCH, 3);
     assert_eq!((r.replica_id.0, r.max_wait_ms, r.min_bytes, r.max_bytes, r.isolation_level), (-1, 50, 1, 4 << 20, 1));
     assert_eq!((r.session_id, r.session_epoch, r.rack_id.as_str()), (0, -1, ""), "no fetch session, no rack");
@@ -224,7 +224,7 @@ fn fetch() {
 #[test]
 fn list_offsets() {
     let mut out = vec![];
-    request(&mut out, LIST_OFFSETS, 5, "brrrrr", |o| {
+    request(&mut out, LIST_OFFSETS, 5, "fastka", |o| {
         list_offsets_request(o, 1, &[("t", (0, LATEST)), ("t", (1, 1234))])
     });
     let r: km::ListOffsetsRequest = oracle_request(&out, LIST_OFFSETS, 5);
@@ -249,7 +249,7 @@ fn list_offsets() {
 #[test]
 fn produce() {
     let mut out = vec![];
-    request(&mut out, PRODUCE, 11, "brrrrr", |o| {
+    request(&mut out, PRODUCE, 11, "fastka", |o| {
         produce_request(o, -1, 30_000, &[("o", (0, b"B0")), ("o", (3, b"B3"))])
     });
     let r: km::ProduceRequest = oracle_request(&out, PRODUCE, 11);
@@ -300,7 +300,7 @@ fn produce() {
     every_cut_fails(&frame, |c| super::produce(c, 7).map(|r| r.0.len()));
     // the request is the same at both versions
     let mut v7 = vec![];
-    request_at(&mut v7, PRODUCE, 7, 11, "brrrrr", |o| produce_request(o, -1, 30_000, &[("o", (0, b"B0"))]));
+    request_at(&mut v7, PRODUCE, 7, 11, "fastka", |o| produce_request(o, -1, 30_000, &[("o", (0, b"B0"))]));
     let mut b = Bytes::copy_from_slice(&v7[4..]);
     km::RequestHeader::decode(&mut b, 1).unwrap();
     km::ProduceRequest::decode(&mut b, 7).unwrap();
@@ -310,7 +310,7 @@ fn produce() {
 #[test]
 fn init_producer_id() {
     let mut out = vec![];
-    request(&mut out, INIT_PRODUCER_ID, 2, "brrrrr", init_producer_id_request);
+    request(&mut out, INIT_PRODUCER_ID, 2, "fastka", init_producer_id_request);
     let r: km::InitProducerIdRequest = oracle_request(&out, INIT_PRODUCER_ID, 2);
     assert_eq!(r.transactional_id, None, "idempotent, not transactional");
     let r = km::InitProducerIdResponse::default().with_producer_id(km::ProducerId(9001)).with_producer_epoch(3);
@@ -322,7 +322,7 @@ fn init_producer_id() {
 #[test]
 fn create_topics() {
     let mut out = vec![];
-    request(&mut out, CREATE_TOPICS, 4, "brrrrr", |o| create_topics_request(o, &[("x", 1, -1), ("y", 3, 2)], 30_000));
+    request(&mut out, CREATE_TOPICS, 4, "fastka", |o| create_topics_request(o, &[("x", 1, -1), ("y", 3, 2)], 30_000));
     let r: km::CreateTopicsRequest = oracle_request(&out, CREATE_TOPICS, 4);
     let ts: Vec<(String, i32, i16)> =
         r.topics.iter().map(|t| (t.name.0.to_string(), t.num_partitions, t.replication_factor)).collect();
@@ -344,7 +344,7 @@ fn create_topics() {
 #[test]
 fn describe_configs() {
     let mut out = vec![];
-    request(&mut out, DESCRIBE_CONFIGS, 6, "brrrrr", |o| describe_configs_request(o, &["t"]));
+    request(&mut out, DESCRIBE_CONFIGS, 6, "fastka", |o| describe_configs_request(o, &["t"]));
     let r: km::DescribeConfigsRequest = oracle_request(&out, DESCRIBE_CONFIGS, 6);
     assert_eq!(
         (
@@ -382,7 +382,7 @@ fn describe_configs() {
 #[test]
 fn find_coordinator_and_offset_commit() {
     let mut out = vec![];
-    request(&mut out, FIND_COORDINATOR, 1, "brrrrr", |o| find_coordinator_request(o, "g"));
+    request(&mut out, FIND_COORDINATOR, 1, "fastka", |o| find_coordinator_request(o, "g"));
     let r: km::FindCoordinatorRequest = oracle_request(&out, FIND_COORDINATOR, 1);
     assert_eq!((r.key.as_str(), r.key_type), ("g", 0));
     let r = km::FindCoordinatorResponse::default().with_node_id(km::BrokerId(3)).with_host(s("k3")).with_port(9094);
@@ -391,7 +391,7 @@ fn find_coordinator_and_offset_commit() {
     assert_eq!((code, b), (Code::NONE, Broker { id: 3, host: "k3".into(), port: 9094 }));
     every_cut_fails(&frame, super::find_coordinator);
 
-    request(&mut out, OFFSET_COMMIT, 2, "brrrrr", |o| offset_commit_request(o, "g", &[("t", (0, 10)), ("t", (1, 20))]));
+    request(&mut out, OFFSET_COMMIT, 2, "fastka", |o| offset_commit_request(o, "g", &[("t", (0, 10)), ("t", (1, 20))]));
     let r: km::OffsetCommitRequest = oracle_request(&out, OFFSET_COMMIT, 2);
     assert_eq!(
         (r.group_id.0.as_str(), r.generation_id_or_member_epoch, r.member_id.as_str(), r.retention_time_ms),
@@ -418,7 +418,7 @@ fn find_coordinator_and_offset_commit() {
 #[test]
 fn sasl() {
     let mut out = vec![];
-    request(&mut out, SASL_HANDSHAKE, 1, "brrrrr", |o| sasl_handshake_request(o, "SCRAM-SHA-256"));
+    request(&mut out, SASL_HANDSHAKE, 1, "fastka", |o| sasl_handshake_request(o, "SCRAM-SHA-256"));
     let r: km::SaslHandshakeRequest = oracle_request(&out, SASL_HANDSHAKE, 1);
     assert_eq!(r.mechanism.as_str(), "SCRAM-SHA-256");
     let r = km::SaslHandshakeResponse::default().with_mechanisms(vec![s("PLAIN"), s("SCRAM-SHA-512")]);
@@ -429,7 +429,7 @@ fn sasl() {
     );
     every_cut_fails(&frame, super::sasl_handshake);
 
-    request(&mut out, SASL_AUTHENTICATE, 2, "brrrrr", |o| sasl_authenticate_request(o, b"n,,n=u,r=x"));
+    request(&mut out, SASL_AUTHENTICATE, 2, "fastka", |o| sasl_authenticate_request(o, b"n,,n=u,r=x"));
     let r: km::SaslAuthenticateRequest = oracle_request(&out, SASL_AUTHENTICATE, 2);
     assert_eq!(&r.auth_bytes[..], b"n,,n=u,r=x");
     let r = km::SaslAuthenticateResponse::default()

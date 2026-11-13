@@ -71,7 +71,7 @@ which librdkafka has.
 
 ### Consume
 
-```rust
+```rust,no_run
 use fastka::consumer::{Assignment, Consumer, Offset, Polled};
 use std::time::Duration;
 
@@ -99,7 +99,7 @@ still usable, and no record has been skipped; `seek` moves a partition on.
 
 ### Produce
 
-```rust
+```rust,no_run
 use fastka::producer::{Deliveries, Delivery, Producer, Record};
 use std::time::Duration;
 
