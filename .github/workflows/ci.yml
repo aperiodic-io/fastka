@@ -97,3 +97,27 @@ jobs:
       - run: |
           if [ -f /tmp/gate-base ]; then bench/gate/gate.py /tmp/gate-head --base /tmp/gate-base
           else bench/gate/gate.py /tmp/gate-head || echo "no base to compare: the counts above are this runner's, against another machine's baseline"; fi
+
+  perf:
+    # end to end against Redpanda (bench/perf-gate): CPU per message, msgs/s and latency of the
+    # real producer and consumer, base against head on this runner, interleaved; a regression fails
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "bench/perf-gate" }
+      - run: scripts/brokers.sh
+      - name: head
+        run: cd bench/perf-gate && cargo build --release && cp target/release/fastka-perf-gate /tmp/perf-head
+      - name: base
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2>/dev/null && git worktree add /tmp/base "$base" \
+             && [ -f /tmp/base/bench/perf-gate/Cargo.toml ]; then
+            (cd /tmp/base/bench/perf-gate && cargo build --release && cp target/release/fastka-perf-gate /tmp/perf-base)
+          fi
+      - run: |
+          if [ -f /tmp/perf-base ]; then bench/perf-gate/gate.py --head /tmp/perf-head --base /tmp/perf-base --rounds 5
+          else bench/perf-gate/gate.py --head /tmp/perf-head --rounds 3; fi

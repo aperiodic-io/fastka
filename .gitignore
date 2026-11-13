@@ -4,3 +4,6 @@ __pycache__/
 /fuzz/corpus/
 /fuzz/artifacts/
 
+
+/bench/*/target/
+/stress/target/
