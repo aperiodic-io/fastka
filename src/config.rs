@@ -306,8 +306,8 @@ pub struct ProducerSettings {
     /// batch, however large: the due batches longest waiting go first, the rest in the next
     /// request.
     pub max_request: usize,
-    /// Produce requests outstanding to a broker at once, each on a connection (and a thread) of
-    /// its own (`max.in.flight.requests.per.connection` or `max.in.flight`, 1 to 5 as
+    /// Produce requests outstanding to a broker at once, pipelined on its one connection by its
+    /// one thread (`max.in.flight.requests.per.connection` or `max.in.flight`, 1 to 5 as
     /// librdkafka's idempotent producer, default 1). A partition has one batch in flight whatever
     /// this is: its messages stay in the order sent, its sequences without a gap.
     pub max_in_flight: usize,
@@ -564,12 +564,12 @@ impl Config {
                 Some(v) => int("max.request.size", v, 1, 2_147_483_647)? as usize,
                 None => max_batch,
             },
-            max_in_flight: int(
-                "max.in.flight.requests.per.connection",
-                self.aliased("max.in.flight.requests.per.connection", "max.in.flight")?.unwrap_or("1"),
-                1,
-                5,
-            )? as usize,
+            max_in_flight: {
+                let long = "max.in.flight.requests.per.connection";
+                let v = self.aliased(long, "max.in.flight")?.unwrap_or("1");
+                // a value out of range named by the key it was set under
+                int(if self.get(long).is_some() { long } else { "max.in.flight" }, v, 1, 5)? as usize
+            },
             metadata_refresh: match int(
                 "topic.metadata.refresh.interval.ms",
                 g("topic.metadata.refresh.interval.ms", "300000"),
@@ -647,7 +647,7 @@ mod tests {
             ("linger.ms", "soon", "not an integer"),
             ("auto.offset.reset", "middle", "earliest, latest"),
             // librdkafka's idempotent producer's bound
-            ("max.in.flight", "6", "out of range 1..5"),
+            ("max.in.flight", "6", "max.in.flight=6: out of range 1..5"), // named as it was set
             ("max.in.flight.requests.per.connection", "0", "out of range 1..5"),
             ("max.request.size", "0", "out of range"),
         ] {

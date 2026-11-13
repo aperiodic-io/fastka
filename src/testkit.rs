@@ -4,7 +4,8 @@ use crate::wire::{self, Cur, Put};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 /// A request as the broker read it.
@@ -18,6 +19,9 @@ pub struct Req {
     pub conn: usize,
     /// the broker's own address
     pub me: String,
+    /// requests read on its connection and not yet answered, itself included: more than one where
+    /// the client pipelines (plain connections only; 1 behind TLS)
+    pub queued: usize,
 }
 
 pub enum Answer {
@@ -81,11 +85,31 @@ impl Broker {
                 let Ok(sock) = sock else { return };
                 let (h, seen, tls, v, me) = (h.clone(), s2.clone(), tls.clone(), versions.clone(), me.clone());
                 std::thread::spawn(move || {
+                    let (answered, deaf) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
                     let _ = match tls {
-                        None => serve(sock, n, &me, &v, &*h, &seen),
+                        None => {
+                            // requests read as they come, ahead of the answers: what the client
+                            // pipelines is seen queued
+                            let (tx, rx) = mpsc::channel();
+                            let (mut r, a2, d2) = (sock.try_clone().unwrap(), answered.clone(), deaf.clone());
+                            std::thread::spawn(move || {
+                                let mut read = 0;
+                                while let Ok(b) = read_request(&mut r, &d2) {
+                                    read += 1;
+                                    if tx.send((b, read - a2.load(SeqCst))).is_err() {
+                                        return;
+                                    }
+                                }
+                            });
+                            let served =
+                                serve(sock.try_clone().unwrap(), Some(rx), &answered, &deaf, n, &me, &v, &*h, &seen);
+                            let _ = sock.shutdown(std::net::Shutdown::Both);
+                            served
+                        }
                         Some(cfg) => {
                             let conn = rustls::ServerConnection::new(cfg).unwrap();
-                            serve(rustls::StreamOwned::new(conn, sock), n, &me, &v, &*h, &seen)
+                            let s = rustls::StreamOwned::new(conn, sock);
+                            serve(s, None, &answered, &deaf, n, &me, &v, &*h, &seen)
                         }
                     };
                 });
@@ -99,8 +123,27 @@ impl Broker {
     }
 }
 
+/// A request read; none more once the broker is `deaf` (a broker that stopped reading: what the
+/// client writes then backs up), past the next one's size.
+fn read_request(s: &mut impl Read, deaf: &AtomicBool) -> std::io::Result<Vec<u8>> {
+    let mut size = [0; 4];
+    s.read_exact(&mut size)?;
+    while deaf.load(SeqCst) {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+    let mut b = vec![0; i32::from_be_bytes(size) as usize];
+    s.read_exact(&mut b)?;
+    Ok(b)
+}
+
+/// A connection's requests answered in turn: read from `s`, or from `ahead` (read as they came,
+/// with how many were unanswered then).
+#[allow(clippy::too_many_arguments)] // the test broker's own plumbing
 fn serve(
     mut s: impl Read + Write,
+    ahead: Option<mpsc::Receiver<(Vec<u8>, usize)>>,
+    answered: &AtomicUsize,
+    deaf: &AtomicBool,
     conn: usize,
     me: &str,
     versions: &[u8],
@@ -108,14 +151,14 @@ fn serve(
     seen: &Mutex<Vec<Req>>,
 ) -> std::io::Result<()> {
     loop {
-        let mut size = [0; 4];
-        s.read_exact(&mut size)?;
-        let mut b = vec![0; i32::from_be_bytes(size) as usize];
-        s.read_exact(&mut b)?;
+        let (b, queued) = match &ahead {
+            Some(rx) => rx.recv().map_err(|_| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?,
+            None => (read_request(&mut s, deaf)?, 1),
+        };
         let mut c = Cur::new(&b);
         let (api, version, corr) = (c.i16().unwrap(), c.i16().unwrap(), c.i32().unwrap());
         c.nstr().unwrap();
-        let req = Req { api, version, corr, body: b[c.at..].to_vec(), conn, me: me.to_string() };
+        let req = Req { api, version, corr, body: b[c.at..].to_vec(), conn, me: me.to_string(), queued };
         seen.lock().unwrap().push(req.clone());
         let answer = if api == wire::API_VERSIONS { Answer::Body(versions.to_vec()) } else { h(&req) };
         match answer {
@@ -124,14 +167,25 @@ fn serve(
                 out.i32(body.len() as i32 + 4);
                 out.i32(corr);
                 out.extend(body);
+                // counted before it is written: the client may pipeline its next request the moment
+                // it reads this answer, and that one must not count this as unanswered
+                answered.fetch_add(1, SeqCst);
                 s.write_all(&out)?;
                 s.flush()?;
             }
             Answer::Drop => return Ok(()),
-            Answer::Silence => std::thread::sleep(Duration::from_secs(3600)),
+            Answer::Silence => {
+                deaf.store(true, SeqCst);
+                std::thread::sleep(Duration::from_secs(3600));
+            }
             Answer::Watch(closed) => {
-                let mut b = [0; 4096];
-                while matches!(s.read(&mut b), Ok(1..)) {}
+                match &ahead {
+                    Some(rx) => while rx.recv().is_ok() {}, // until the reader sees the close
+                    None => {
+                        let mut b = [0; 4096];
+                        while matches!(s.read(&mut b), Ok(1..)) {}
+                    }
+                }
                 *closed.lock().unwrap() = Some(std::time::Instant::now());
                 return Ok(());
             }

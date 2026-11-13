@@ -34,8 +34,8 @@ runs; [details below](#benchmarks)):
     threads, so a dropped SYN never blocks your loop.
 - **An idempotent producer** with delivery reports, and the semantics of librdkafka where they matter:
   - ordering per partition: one batch of a partition in flight, and a retry is sent with the same
-    sequence number. A broker can have up to `max.in.flight` requests outstanding, each on its own
-    connection;
+    sequence number. A broker can have up to `max.in.flight` requests outstanding, pipelined on
+    its one connection as librdkafka does;
   - batches are encoded (copied, compressed, checksummed) by the broker's thread without holding
     the producer's lock, so `send` and `poll` never wait for a compression;
   - `message.timeout.ms` bounds a message from `send` to its report, retries and the request in
@@ -402,8 +402,9 @@ Settings use librdkafka's names and defaults, except where noted. Unknown keys a
     holds. The batches that have waited longest go first, so none starves. A request always holds
     at least one batch. Default: `message.max.bytes` (Java's default is 1048576).
   - `max.in.flight.requests.per.connection` (or `max.in.flight`), 1 to 5, default 1: how many
-    Produce requests a broker can have outstanding at once, each on its own connection. A
-    partition still has one batch in flight, so its order and sequences are kept. A higher value
+    Produce requests a broker can have outstanding at once, pipelined on its one connection (one
+    thread and one socket a broker, as librdkafka). A broker throttling (KIP-219) holds back all
+    of them. A partition still has one batch in flight, so its order and sequences are kept. A higher value
     helps only when several requests' worth of batches are due at once, so pair it with a
     `max.request.size` below them: 5 and 1048576 give librdkafka's request shape
     (`bench/kafka-stress`).
