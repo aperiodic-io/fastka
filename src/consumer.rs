@@ -189,6 +189,9 @@ struct Broker {
     throttled: Instant,
     /// when its socket, found empty, is read again (`QUIET_READ`)
     quiet_until: Instant,
+    /// its request is on the socket whole: TLS may take a request's bytes and still hold them
+    /// (the kernel's buffer full), which no readiness for reading says the end of
+    flushed: bool,
     /// when its partitions' leaders were last looked up for a Fetch overdue (`OVERDUE`)
     checked: Instant,
     /// its socket's reads, for the tests
@@ -546,6 +549,7 @@ impl Consumer {
                             rotate: 0,
                             throttled: now,
                             quiet_until: now,
+                            flushed: true,
                             checked: now,
                             #[cfg(test)]
                             reads: 0,
@@ -734,7 +738,8 @@ impl Consumer {
     fn flush(&mut self, b: usize) -> std::io::Result<()> {
         let br = &mut self.brokers[b];
         let Link::Ready(s) = &mut br.link else { return Ok(()) };
-        conn::write_all(s, &br.out, &mut br.written).map(|_| ())
+        br.flushed = conn::write_all(s, &br.out, &mut br.written)?;
+        Ok(())
     }
 
     /// A whole response of broker `b`, once its Fetch is written whole.
@@ -973,15 +978,7 @@ impl Consumer {
     /// looked at again within 1 ms, as it was before there was a wait.
     fn wait(&mut self, until: Option<Instant>) {
         let now = Instant::now();
-        let mut slice = until.map_or(WAIT, |u| u.saturating_duration_since(now).min(WAIT));
-        let pending = self.lookup.is_some()
-            || self
-                .brokers
-                .iter()
-                .any(|b| matches!(b.link, Link::Connecting(_)) || b.inflight.is_some() && b.written < b.out.len());
-        if pending {
-            slice = slice.min(Duration::from_millis(1));
-        }
+        let slice = self.wait_slice(now, until);
         #[cfg(unix)]
         if let Some((poll, events)) = &mut self.ready {
             // edge triggered: a broker's socket is read until it would block, or its one
@@ -997,6 +994,30 @@ impl Consumer {
             }
         }
         std::thread::sleep(slice.min(Duration::from_millis(1)));
+    }
+
+    /// How long `wait` may wait from `now`: up to `until` and `WAIT`, and no later than the soonest
+    /// of its timers (a broker's throttle or reconnect, a partition's error backoff, a lookup);
+    /// within 1 ms while what no socket says is under way (a connection or a lookup on a thread, a
+    /// request not on the socket whole).
+    fn wait_slice(&self, now: Instant, until: Option<Instant>) -> Duration {
+        let pending = self.lookup.is_some()
+            || self.brokers.iter().any(|b| {
+                matches!(b.link, Link::Connecting(_)) || b.inflight.is_some() && (b.written < b.out.len() || !b.flushed)
+            });
+        let timers = self
+            .brokers
+            .iter()
+            .flat_map(|b| [Some(b.throttled), if let Link::Idle(at) = b.link { Some(at) } else { None }])
+            .chain(self.parts.iter().map(|p| Some(p.not_before)))
+            .chain([Some(self.lookup_at), until])
+            .flatten()
+            .filter(|t| *t > now);
+        let mut slice = timers.fold(WAIT, |s, t| s.min(t - now));
+        if pending {
+            slice = slice.min(Duration::from_millis(1));
+        }
+        slice
     }
 
     /// The next event of any partition not paused (a message, or an end), waiting up to

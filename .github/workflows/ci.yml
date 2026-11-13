@@ -1,6 +1,7 @@
 name: ci
 on:
-  push: { branches: [main] }
+  push:
+  workflow_dispatch:
   pull_request:
   schedule: [{ cron: "17 3 * * *" }] # nightly: longer fuzzing and stress
 permissions: { contents: read }

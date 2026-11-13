@@ -892,6 +892,33 @@ fn an_idle_consumer_waits_on_its_socket_not_a_timer() {
     assert!(reads <= most, "{reads} reads of an idle socket in {:?}, at most {most}", t.elapsed());
 }
 
+/// `next_event`'s wait ends by the soonest timer it keeps (a broker's throttle, a partition's
+/// error backoff, a reconnect due), not up to `WAIT` past it; and a request TLS holds unwritten (its
+/// bytes taken, not yet on the socket: no readiness says when it can go) is looked at again within
+/// 1 ms.
+#[test]
+fn the_wait_ends_by_the_soonest_timer_and_a_held_write_is_looked_at_soon() {
+    let mut a = Log::default();
+    a.push(0, &["x"]);
+    let br = log_broker(logs(&[("t", 0, a)]), Box::new(|_, _| Some(Answer::Silence)));
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    let until = Instant::now() + Duration::from_secs(5);
+    while br.requests(wire::FETCH).is_empty() {
+        assert!(Instant::now() < until);
+        c.pump(&mut |_| {}).unwrap();
+    }
+    let now = Instant::now();
+    assert_eq!(c.wait_slice(now, None), WAIT, "nothing due: the whole wait");
+    c.brokers[0].throttled = now + Duration::from_millis(3);
+    assert_eq!(c.wait_slice(now, None), Duration::from_millis(3), "a throttle ending");
+    c.brokers[0].throttled = now;
+    c.parts[0].not_before = now + Duration::from_millis(4);
+    assert_eq!(c.wait_slice(now, None), Duration::from_millis(4), "a partition's error backoff ending");
+    c.parts[0].not_before = now;
+    c.brokers[0].flushed = false;
+    assert_eq!(c.wait_slice(now, None), Duration::from_millis(1), "a write TLS holds");
+}
+
 /// A leader cut off from the network (its Fetch unanswered, its connection open) whose
 /// partitions' leadership moves: they are fetched from their new leader within seconds, not after
 /// `socket.timeout.ms`. On staging, a broker cut off for 60 s held its partitions' rows that long:
