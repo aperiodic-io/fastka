@@ -26,6 +26,9 @@
 //! - `fail_queued`: fatal, what is queued fails, and a batch not in a request.
 //! - `take_due`: one batch of a partition at a time; a new one only when none is in flight and the
 //!   producer is not fatal; a batch not answered is sent again with the same sequence.
+//! - `encoded`: a batch sealed is encoded off the lock, then put in its thread's request; or left
+//!   sealed for the next request (past `max.request.size` once encoded), sent then with its
+//!   sequence; or, failing to encode, fails alone (not persisted), its sequence the next batch's.
 //! - `send`: a request is not sent past its first message's deadline (given up as timed out).
 //! - `applied`: NONE or DUPLICATE_SEQUENCE_NUMBER delivers (DUPLICATE at no offset), a retriable
 //!   code sends the batch again, a refusal for good fails it: alone, its sequence the next batch's,
@@ -34,7 +37,9 @@
 //!   a refusal of the sequence (OUT_OF_ORDER_SEQUENCE_NUMBER) fails it with the producer fatal.
 //!
 //! What the model leaves out: other partitions and brokers (each partition's batches are
-//! independent in the code: one in flight a partition), the producer id (fixed), leaders moving
+//! independent in the code: one in flight a partition, however many requests `max.in.flight` has
+//! outstanding to a broker, each on its own connection: a request a connection lost and read late
+//! while the batch is sent again on another is a ghost here), the producer id (fixed), leaders moving
 //! (the broker's log and idempotence state are the partition's, whoever leads it), sequences
 //! wrapping past i32::MAX, and time beyond the order of the deadlines.
 #![allow(clippy::unit_arg)] // an action is `Ok(` the state change it makes `)`
@@ -53,9 +58,13 @@ enum Outcome {
     Refused,
 }
 
-/// Where a sealed batch is: to be sent (taken by a broker thread), on the wire, answered.
+/// Where a sealed batch is: being encoded, to be sent (taken by a broker thread), on the wire,
+/// answered.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Wire {
+    /// sealed (its sequence taken), its messages out with the broker thread that encodes them,
+    /// off the lock (`encode`): no other thread touches it
+    Encoding,
     /// taken (`sending`), not yet written: `send` checks the deadline first
     Taken,
     /// written; the broker has not read it
@@ -249,7 +258,7 @@ impl State {
                             let msgs: Vec<u8> = s.queue.drain(..k).collect();
                             let seq = s.next_seq;
                             s.next_seq += k as u8;
-                            s.inflight = Some(Batch { msgs, seq, wire: Some(Wire::Taken), maybe_written: false });
+                            s.inflight = Some(Batch { msgs, seq, wire: Some(Wire::Encoding), maybe_written: false });
                             Ok(())
                         });
                     }
@@ -258,6 +267,19 @@ impl State {
         }
         let Some(b) = &self.inflight else { return out };
         match b.wire {
+            // `encoded`: in the request; left sealed for the next; or failed to encode, alone
+            Some(Wire::Encoding) => {
+                go(&mut out, &|s| Ok(s.inflight.as_mut().unwrap().wire = Some(Wire::Taken)));
+                go(&mut out, &|s| Ok(s.inflight.as_mut().unwrap().wire = None));
+                go(&mut out, &|s| {
+                    let b = s.inflight.take().unwrap();
+                    for m in b.msgs {
+                        s.report(m, Outcome::Failed(false))?;
+                    }
+                    s.next_seq = b.seq;
+                    Ok(())
+                });
+            }
             // `send`: past its first message's deadline, not written (given up as timed out)
             Some(Wire::Taken) => go(&mut out, &|s| {
                 let b = s.inflight.as_mut().unwrap();
@@ -470,27 +492,39 @@ fn the_idempotent_protocol_keeps_its_invariants_in_every_state() {
     }
 }
 
-/// The first invariant broken where `next` is replaced by `broken` (3 messages), if one is.
-fn first_broken(broken: impl Fn(&State) -> Vec<Step>) -> Option<String> {
+/// The first invariant broken where `next` is replaced by `broken` (3 messages), if one is: in a
+/// state, or (with `steps`) by an action.
+fn first_broken_in(broken: impl Fn(&State) -> Vec<Step>, steps: bool) -> Option<String> {
     let start = State::new(3);
     let (mut seen, mut todo) = (HashSet::from([start.clone()]), VecDeque::from([start]));
     while let Some(s) = todo.pop_front() {
         if let Err(e) = s.check() {
             return Some(e);
         }
-        for t in broken(&s).into_iter().flatten() {
-            if seen.insert(t.clone()) {
-                todo.push_back(t);
+        for t in broken(&s) {
+            match t {
+                Err(e) if steps => return Some(e),
+                Err(_) => {}
+                Ok(t) => {
+                    if seen.insert(t.clone()) {
+                        todo.push_back(t);
+                    }
+                }
             }
         }
     }
     None
 }
 
+fn first_broken(broken: impl Fn(&State) -> Vec<Step>) -> Option<String> {
+    first_broken_in(broken, false)
+}
+
 /// The checker finds what it checks for. A batch past its deadline given up without making the
 /// producer fatal (the broker may have written it) is caught; so is a batch sent again under a new
 /// sequence rather than its own (written twice); so is a batch's sequence given to the next batch
-/// though it may have been written (the producer forgetting `maybe_written`).
+/// though it may have been written (the producer forgetting `maybe_written`); so is a batch that
+/// failed to encode keeping its sequence (a gap at the broker).
 #[test]
 fn the_checker_catches_a_broken_rule() {
     let e = first_broken(|s| {
@@ -526,4 +560,18 @@ fn the_checker_catches_a_broken_rule() {
     });
     // a message written then reported failed, whichever invariant sees it first
     assert!(e.as_deref().is_some_and(|e| e.contains("written, reported")), "{e:?}");
+    // a batch that failed to encode keeping its sequence: the next batch is past the broker's
+    let e = first_broken_in(
+        |s| {
+            let mut out = s.next(3);
+            for t in out.iter_mut().flatten() {
+                if s.inflight.as_ref().is_some_and(|b| b.wire == Some(Wire::Encoding)) && t.inflight.is_none() {
+                    t.next_seq = s.next_seq;
+                }
+            }
+            out
+        },
+        true,
+    );
+    assert!(e.as_deref().is_some_and(|e| e.contains("a gap")), "{e:?}");
 }

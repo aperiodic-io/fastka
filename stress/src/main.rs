@@ -171,6 +171,12 @@ fn main() {
         .set("enable.partition.eof", "true")
         .set("fetch.wait.max.ms", "50")
         .set("isolation.level", "read_uncommitted");
+    // several requests to a leader at once, each a few batches (the producer's defaults otherwise)
+    for (k, var) in [("max.in.flight", "STRESS_MAX_IN_FLIGHT"), ("max.request.size", "STRESS_MAX_REQUEST_SIZE")] {
+        if let Ok(v) = std::env::var(var) {
+            cfg.set(k, &v);
+        }
+    }
     let admin = fastka::client::Client::new(&cfg).unwrap();
     for (t, r) in admin.create_topics(&[(topic.clone(), parts, 1)], Duration::from_secs(20)).unwrap() {
         r.unwrap_or_else(|e| panic!("creating {t}: {e}"));

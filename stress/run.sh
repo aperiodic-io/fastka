@@ -15,6 +15,8 @@ cargo build --release -q
 for codec in ${STRESS_CODECS:-lz4 none zstd}; do
   STRESS_CODEC=$codec target/release/fastka-stress
 done
+# several requests outstanding to the leader, each on its own connection, the faults on each
+STRESS_CODEC=lz4 STRESS_MAX_IN_FLIGHT=5 STRESS_MAX_REQUEST_SIZE=65536 target/release/fastka-stress
 # harsh: stalls past message.timeout.ms, many cuts: batches time out in flight (possibly persisted),
 # producers go fatal and are replaced, and every report must still be true
 STRESS_CODEC=lz4 STRESS_CUT_PPM=30000 STRESS_STALL_PPM=20000 STRESS_STALL_MS=6000 \

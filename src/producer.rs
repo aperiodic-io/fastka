@@ -1,8 +1,10 @@
-//! The idempotent producer. `send` queues a message and returns; a thread a broker sends each
-//! partition's batches to its leader, one batch of a partition in flight at a time, so a
-//! partition keeps its messages in the order sent; a retry sends the same batch with the same
-//! sequence, which the broker writes once. `poll` hands the outcomes to the context's
-//! `delivery`, on the thread that polls.
+//! The idempotent producer. `send` queues a message and returns; a broker's threads
+//! (`max.in.flight`, each with its own connection and request) send each partition's batches to
+//! its leader, one batch of a partition in flight at a time, so a partition keeps its messages in
+//! the order sent; a retry sends the same batch with the same sequence, which the broker writes
+//! once. A batch is encoded by the thread that sends it, off the producer's lock. A request holds
+//! up to `max.request.size` of batches, the longest waiting first. `poll` hands the outcomes to
+//! the context's `delivery`, on the thread that polls.
 //!
 //! Like librdkafka's idempotent producer: messages are given up `message.timeout.ms` after
 //! `send`, retries included; a DUPLICATE_SEQUENCE_NUMBER is a delivery (its offset unknown). A
@@ -142,12 +144,17 @@ impl<O> Pending<O> {
 
 /// A partition's batch sent (or to send again): its messages, its encoded bytes.
 struct Sent<O> {
+    /// empty while the broker thread that sealed it encodes them, off the lock (`Fresh`)
     msgs: Vec<Pending<O>>,
     bytes: Arc<Vec<u8>>,
     /// its first message's sequence
     seq: i32,
-    /// a broker thread has it in a request now
+    /// its first message's deadline (kept here: its messages may be out being encoded)
+    deadline: Instant,
+    /// a broker thread has it (encoding it, or in a request): only that thread touches it then
     sending: bool,
+    /// which broker thread, while `sending` (its panic guard hands back its own alone)
+    by: u64,
     /// may be sent (again) from then
     retry_at: Instant,
     attempts: u32,
@@ -182,9 +189,12 @@ struct State<O> {
     topics: HashMap<String, Topic<O>>,
     pid: Option<(i64, i16)>,
     fatal: Option<(Code, String)>,
-    /// brokers with a thread of their own, and their addresses
+    /// brokers' addresses
     brokers: HashMap<i32, String>,
+    /// a broker's id for each of its threads (`max.in.flight` a broker)
     threads: Vec<i32>,
+    /// the next broker thread's own number (`Sent::by`)
+    next_thread: u64,
     /// messages sent whose outcome `poll` has not handed over (what `queue.buffering.max.messages`
     /// bounds: a report holds its opaque until then)
     outstanding: usize,
@@ -251,6 +261,7 @@ impl<C: Deliveries> Producer<C> {
             fatal: None,
             brokers: HashMap::new(),
             threads: vec![],
+            next_thread: 0,
             outstanding: 0,
             queued: 0,
             queued_bytes: 0,
@@ -306,6 +317,29 @@ impl<C: Deliveries> Producer<C> {
     /// - [`Error::Transport`]: the producer is closing.
     pub fn send(&self, r: Record<'_>, opaque: C::Opaque) -> std::result::Result<(), (Error, C::Opaque)> {
         let sh = &*self.shared;
+        let size = size_of(r.key, r.value, r.headers);
+        // what the record is refused for, whatever the producer's state (refused after a fatal
+        // producer's or a closing one's own error, as before)
+        let refused = if r.topic.is_empty() {
+            Some(Error::Config("a record without a topic".into()))
+        } else if let Err(e) = wire::check_str("a topic name", r.topic) {
+            // queued, a name the protocol cannot carry would fail the Metadata of every topic
+            Some(e)
+        } else if let Some(ms) = r.timestamp.filter(|ms| *ms < 0) {
+            Some(Error::Config(format!("timestamp {ms}: a timestamp is at least 0")))
+        } else if size + records::HEADER > sh.s.max_batch {
+            // what no wait would ever take: refused for what it is, not QueueFull
+            Some(Error::Broker(Code::MESSAGE_TOO_LARGE, format!("a message of {size} bytes")))
+        } else if size > sh.s.queue_bytes {
+            Some(Error::Config(format!("a message of {size} bytes, past queue.buffering.max.kbytes")))
+        } else {
+            None
+        };
+        // copied before the lock, which the broker threads, `poll` and the other senders wait on
+        let copied = refused.is_none().then(|| {
+            let timestamp = r.timestamp.unwrap_or_else(now_ms);
+            (r.key.map(<[u8]>::to_vec), r.value.map(<[u8]>::to_vec), r.headers.to_vec(), timestamp)
+        });
         let mut guard = sh.lock();
         let st = &mut *guard;
         if let Some((c, m)) = &st.fatal {
@@ -314,34 +348,18 @@ impl<C: Deliveries> Producer<C> {
         if st.closing {
             return Err((Error::Transport("the producer is closing".into()), opaque));
         }
-        if r.topic.is_empty() {
-            return Err((Error::Config("a record without a topic".into()), opaque));
-        }
-        // queued, a name the protocol cannot carry would fail the Metadata of every topic
-        if let Err(e) = wire::check_str("a topic name", r.topic) {
-            return Err((e, opaque));
-        }
-        if let Some(ms) = r.timestamp.filter(|ms| *ms < 0) {
-            return Err((Error::Config(format!("timestamp {ms}: a timestamp is at least 0")), opaque));
-        }
-        let size = size_of(r.key, r.value, r.headers);
-        // what no wait would ever take: refused for what it is, not QueueFull
-        if size + records::HEADER > sh.s.max_batch {
-            return Err((Error::Broker(Code::MESSAGE_TOO_LARGE, format!("a message of {size} bytes")), opaque));
-        }
-        if size > sh.s.queue_bytes {
-            let why = format!("a message of {size} bytes, past queue.buffering.max.kbytes");
-            return Err((Error::Config(why), opaque));
-        }
+        let Some((key, value, headers, timestamp)) = copied else {
+            return Err((refused.expect("refused or copied"), opaque));
+        };
         if st.outstanding >= sh.s.queue_messages || st.queued_bytes + size > sh.s.queue_bytes {
             return Err((Error::QueueFull, opaque));
         }
         let now = Instant::now();
         let p = Pending {
-            key: r.key.map(<[u8]>::to_vec),
-            value: r.value.map(<[u8]>::to_vec),
-            headers: r.headers.to_vec(),
-            timestamp: r.timestamp.unwrap_or_else(now_ms),
+            key,
+            value,
+            headers,
+            timestamp,
             partition: r.partition,
             opaque,
             deadline: now + sh.s.message_timeout,
@@ -417,14 +435,16 @@ impl<C: Deliveries> Producer<C> {
         let mut ready = std::mem::take(&mut st.reports).into_iter();
         drop(st);
         let n = ready.len();
+        let mut handed = 0;
         while let Some((topic, partition, offset, error, persisted, opaque)) = ready.next() {
             let d = Delivery { topic: &topic, partition, offset, error: error.as_ref(), persisted };
             let heard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sh.ctx.delivery(&d, opaque)));
-            let mut st = sh.lock();
-            st.outstanding -= 1;
+            handed += 1;
             if let Err(panic) = heard {
                 // the application's panic is its own: the reports after it are handed over at the
                 // next poll, none left counted forever
+                let mut st = sh.lock();
+                st.outstanding -= handed;
                 for r in ready.rev() {
                     st.reports.push_front(r);
                 }
@@ -432,6 +452,8 @@ impl<C: Deliveries> Producer<C> {
                 std::panic::resume_unwind(panic);
             }
         }
+        // their places given back once for them all, not a lock taken beside every send for each
+        sh.lock().outstanding -= n;
         n
     }
 
@@ -709,8 +731,8 @@ fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
                 leader: None,
             });
             part.leader = (p.leader >= 0).then_some(p.leader);
-            if p.leader >= 0 && !st.threads.contains(&p.leader) && !new_leaders.contains(&p.leader) {
-                new_leaders.push(p.leader);
+            if p.leader >= 0 && !new_leaders.contains(&p.leader) {
+                new_leaders.push(p.leader); // its threads counted below
             }
         }
         // keyless messages stick to no partition without a leader, nor one now gone
@@ -744,12 +766,18 @@ fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
         st.report(&t, p, None, Some(e), Persisted::No, m);
     }
     st.refreshed = Instant::now();
+    // `max.in.flight` threads a leader, each with a connection and a request of its own; one that
+    // ended or panicked is made again here
     for id in new_leaders {
-        st.threads.push(id);
-        let sh = sh.clone();
-        let spawned = std::thread::Builder::new().name(format!("fastka-broker-{id}")).spawn(move || broker(&sh, id));
-        if spawned.is_err() {
-            st.threads.retain(|t| *t != id); // tried again at the next metadata
+        for _ in st.threads.iter().filter(|t| **t == id).count()..sh.s.max_in_flight {
+            let (sh, by) = (sh.clone(), st.next_thread);
+            st.next_thread += 1;
+            let spawned =
+                std::thread::Builder::new().name(format!("fastka-broker-{id}")).spawn(move || broker(&sh, id, by));
+            if spawned.is_err() {
+                break; // tried again at the next metadata
+            }
+            st.threads.push(id);
         }
     }
     sh.work.notify_all();
@@ -775,7 +803,7 @@ fn expire<O>(st: &mut State<O>, now: Instant) {
                 let p = part.queue.pop_front().expect("one");
                 gone.push((name.clone(), Some(*id), Error::MessageTimedOut, Persisted::No, p));
             }
-            let timed_out = part.inflight.as_ref().is_some_and(|s| !s.sending && s.msgs[0].deadline <= now);
+            let timed_out = part.inflight.as_ref().is_some_and(|s| !s.sending && s.deadline <= now);
             if timed_out {
                 let s = part.inflight.take().expect("in flight");
                 let persisted = if s.maybe_written {
@@ -824,11 +852,11 @@ fn next_deadline<O>(st: &State<O>) -> Option<Instant> {
     (st.topics.values())
         .flat_map(|t| {
             let parts = t.parts.values().flat_map(|p| {
-                p.queue.front().into_iter().chain(p.inflight.iter().filter(|s| !s.sending).map(|s| &s.msgs[0]))
+                let sent = p.inflight.iter().filter(|s| !s.sending).map(|s| s.deadline);
+                p.queue.front().map(|m| m.deadline).into_iter().chain(sent)
             });
-            t.unassigned.front().into_iter().chain(parts)
+            t.unassigned.front().map(|m| m.deadline).into_iter().chain(parts)
         })
-        .map(|p| p.deadline)
         .min()
 }
 
@@ -884,18 +912,24 @@ fn sequence_broken(c: Code) -> bool {
 /// first message's deadline).
 type Request = Vec<(String, i32, Arc<Vec<u8>>, Instant)>;
 
-/// The batches broker `id` leads that are due, taken (marked sending): sealed from their queues
-/// where none is in flight (once lingered, or full), sent again where one is; the longest waiting
-/// first, up to `message.max.bytes` a request (at least one batch: what does not fit waits for the
-/// next request, sealed if it was).
+/// A batch sealed, for the broker thread that took it to encode off the lock: topic, partition,
+/// its messages, its stamp. Its `Sent` waits in the partition, `sending`, its messages out until
+/// they come back (`encoded`).
+type Fresh<O> = Vec<(String, i32, Vec<Pending<O>>, Stamp)>;
+
+/// The batches broker `id` leads that are due, taken by its thread `by` (marked sending): sealed
+/// from their queues where none is in flight (once lingered, or full; `Fresh`, to encode), sent
+/// again where one is; the longest waiting first, up to `max.request.size` a request (at least one
+/// batch: what does not fit waits for the next request). True if some due were left for it.
 fn take_due<C: Deliveries>(
     sh: &Shared<C>,
     st: &mut State<C::Opaque>,
     id: i32,
+    by: u64,
     now: Instant,
-) -> (Request, Option<Instant>) {
+) -> (Request, Fresh<C::Opaque>, Option<Instant>, bool) {
     let s = &sh.s;
-    let mut out: Request = vec![];
+    let (mut out, mut fresh): (Request, Fresh<C::Opaque>) = (vec![], vec![]);
     let mut next: Option<Instant> = None;
     // what is past its deadline is given up here, whichever thread runs first after a stall:
     // nothing is sent past `message.timeout.ms`
@@ -903,16 +937,17 @@ fn take_due<C: Deliveries>(
     if st.fatal.is_some() {
         // nothing more is sent: what is queued fails with the fatal error (`fail_queued`)
         fail_queued(st);
-        return (out, None);
+        return (out, fresh, None, false);
     }
-    let Some((pid, epoch)) = st.pid else { return (out, None) };
-    // what is due: since when, its partition, how many messages to seal (0: one to send again)
-    let mut due: Vec<(Instant, String, i32, usize)> = vec![];
+    let Some((pid, epoch)) = st.pid else { return (out, fresh, None, false) };
+    // what is due: since when, its partition, how many messages to seal (0: one to send again),
+    // its bytes (a batch to seal: as `size_of` counts them, which its encoding does not pass)
+    let mut due: Vec<(Instant, String, i32, usize, usize)> = vec![];
     for (name, t) in st.topics.iter() {
         for (&pnum, part) in t.parts.iter().filter(|(_, p)| p.leader == Some(id)) {
             if let Some(sent) = &part.inflight {
                 if !sent.sending && sent.retry_at <= now {
-                    due.push((sent.retry_at, name.clone(), pnum, 0));
+                    due.push((sent.retry_at, name.clone(), pnum, 0, sent.bytes.len()));
                 } else if !sent.sending {
                     next = Some(next.map_or(sent.retry_at, |n| n.min(sent.retry_at)));
                 }
@@ -935,70 +970,43 @@ fn take_due<C: Deliveries>(
                 next = Some(next.map_or(ready, |x| x.min(ready)));
                 continue; // lingering: more may join the batch
             }
-            due.push((first.enqueued, name.clone(), pnum, n));
+            due.push((first.enqueued, name.clone(), pnum, n, bytes));
         }
     }
     // the longest waiting first: a request's bound starves no partition
     due.sort_unstable_by_key(|d| d.0);
-    let (mut sealed, mut failed, mut total) = (vec![], vec![], 0);
-    for (_, name, pnum, n) in due {
+    let (mut sealed, mut total, mut more) = (vec![], 0, false);
+    for (_, name, pnum, n, bytes) in due {
+        if !(out.is_empty() && fresh.is_empty()) && total + bytes > s.max_request {
+            more = true; // for the next request (another of the broker's threads, if one is free)
+            break;
+        }
+        total += bytes;
         let part = st.topics.get_mut(&name).and_then(|t| t.parts.get_mut(&pnum)).expect("a partition due");
         if n == 0 {
             let sent = part.inflight.as_mut().expect("a batch to send again");
-            if !out.is_empty() && total + sent.bytes.len() > s.max_batch {
-                break;
-            }
-            total += sent.bytes.len();
-            sent.sending = true;
+            (sent.sending, sent.by) = (true, by);
             sent.attempts += 1;
-            out.push((name, pnum, sent.bytes.clone(), sent.msgs[0].deadline));
+            out.push((name, pnum, sent.bytes.clone(), sent.deadline));
             continue;
         }
         let msgs: Vec<_> = part.queue.drain(..n).collect();
-        let outs: Vec<Out<'_>> = msgs
-            .iter()
-            .map(|p| Out {
-                timestamp: p.timestamp,
-                key: p.key.as_deref(),
-                value: p.value.as_deref(),
-                headers: &p.headers,
-            })
-            .collect();
-        let mut b = vec![];
-        let written = records::write(
-            &mut b,
-            &outs,
-            Stamp { producer_id: pid, epoch, base_sequence: part.seq },
-            s.codec,
-            &mut vec![],
-        );
-        drop(outs);
-        if let Err(e) = written {
-            failed.push((name, pnum, msgs, e));
-            continue;
-        }
         let seq = part.seq;
         // Kafka's sequences wrap to 0 past i32::MAX
         part.seq = part.seq.wrapping_add(n as i32) & i32::MAX;
-        let bytes = Arc::new(b);
-        // past the request's bound: sealed, sent in the next request, as early as it was due
-        let fits = out.is_empty() || total + bytes.len() <= s.max_batch;
-        let (attempts, retry_at) = if fits { (1, now) } else { (0, msgs[0].enqueued) };
-        if fits {
-            total += bytes.len();
-            out.push((name.clone(), pnum, bytes.clone(), msgs[0].deadline));
-        }
-        let maybe_written = false;
-        part.inflight = Some(Sent { msgs, bytes, seq, sending: fits, retry_at, attempts, maybe_written });
+        part.inflight = Some(Sent {
+            msgs: vec![], // out, being encoded
+            bytes: Arc::new(vec![]),
+            seq,
+            deadline: msgs[0].deadline,
+            sending: true,
+            by,
+            retry_at: now,
+            attempts: 1,
+            maybe_written: false,
+        });
+        fresh.push((name.clone(), pnum, msgs, Stamp { producer_id: pid, epoch, base_sequence: seq }));
         sealed.push((name, pnum));
-        if !fits {
-            break;
-        }
-    }
-    for (name, pnum, msgs, e) in failed {
-        for m in msgs {
-            st.report(&name, Some(pnum), None, Some(e.clone()), Persisted::No, m);
-        }
     }
     // the next keyless messages go to another partition: a partition a batch (librdkafka's sticky
     // partitioner)
@@ -1008,28 +1016,104 @@ fn take_due<C: Deliveries>(
             t.rotate(xorshift(&mut st.rng));
         }
     }
-    (out, next)
+    (out, fresh, next, more)
 }
 
-/// A broker's thread: its partitions' batches sent as they are due, the answers applied. It
-/// connects at once, before its first batch is due.
-fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
+/// `fresh`'s batches encoded (copied, compressed, their CRCs taken), off the lock: each its bytes,
+/// or why it could not be (a panic in the codec too: its messages fail, none is lost with it).
+fn encode<O>(fresh: &Fresh<O>, codec: i16, scratch: &mut Vec<u8>) -> Vec<Result<Vec<u8>>> {
+    (fresh.iter())
+        .map(|(_, _, msgs, stamp)| {
+            let outs: Vec<Out<'_>> = (msgs.iter())
+                .map(|p| Out {
+                    timestamp: p.timestamp,
+                    key: p.key.as_deref(),
+                    value: p.value.as_deref(),
+                    headers: &p.headers,
+                })
+                .collect();
+            let mut b = vec![];
+            let write = std::panic::AssertUnwindSafe(|| records::write(&mut b, &outs, *stamp, codec, scratch));
+            match std::panic::catch_unwind(write) {
+                Ok(written) => written.map(|()| b),
+                Err(_) => Err(Error::Protocol("a batch's encoding panicked".into())),
+            }
+        })
+        .collect()
+}
+
+/// Encoded batches back in their partitions and in `req`, up to `max.request.size` (a batch's
+/// bytes encoded may pass what `take_due` counted for it: then it is left sealed, sent in the next
+/// request as early as it was due). One that failed to encode fails its messages, its sequence
+/// given back: nothing was sent at it, and no later batch of its partition was sealed. True if a
+/// batch was left for the next request.
+fn encoded<C: Deliveries>(
+    sh: &Shared<C>,
+    st: &mut State<C::Opaque>,
+    req: &mut Request,
+    fresh: Fresh<C::Opaque>,
+    written: Vec<Result<Vec<u8>>>,
+) -> bool {
+    let (mut total, mut more, mut failed) = (req.iter().map(|r| r.2.len()).sum::<usize>(), false, vec![]);
+    for ((name, pnum, msgs, _), written) in fresh.into_iter().zip(written) {
+        // a partition is never removed, nor a topic with partitions
+        let part = st.topics.get_mut(&name).and_then(|t| t.parts.get_mut(&pnum)).expect("a partition sending");
+        match written {
+            Ok(b) => {
+                let sent = part.inflight.as_mut().expect("its batch, sending");
+                (sent.bytes, sent.msgs) = (Arc::new(b), msgs);
+                if !req.is_empty() && total + sent.bytes.len() > sh.s.max_request {
+                    (sent.sending, sent.attempts, sent.retry_at) = (false, 0, sent.msgs[0].enqueued);
+                    more = true;
+                    continue;
+                }
+                total += sent.bytes.len();
+                req.push((name, pnum, sent.bytes.clone(), sent.deadline));
+            }
+            Err(e) => {
+                let sent = part.inflight.take().expect("its batch, sending");
+                part.seq = sent.seq;
+                failed.push((name, pnum, msgs, e));
+            }
+        }
+    }
+    for (name, pnum, msgs, e) in failed {
+        for m in msgs {
+            st.report(&name, Some(pnum), None, Some(e.clone()), Persisted::No, m);
+        }
+    }
+    more
+}
+
+/// One of broker `id`'s threads (`by`, its own number): its partitions' batches sent as they are
+/// due, encoded off the lock, the answers applied. It connects at once, before its first batch is
+/// due; each of the broker's `max.in.flight` threads has its own connection and request.
+fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32, by: u64) {
     /// A thread that panics is no longer the broker's: a new one is started at the next metadata,
     /// else its partitions would never be sent again.
-    struct Gone<'a, C: Deliveries>(&'a Shared<C>, i32);
+    struct Gone<'a, C: Deliveries>(&'a Shared<C>, i32, u64);
     impl<C: Deliveries> Drop for Gone<'_, C> {
         fn drop(&mut self) {
             if std::thread::panicking() {
                 let mut st = self.0.lock();
-                st.threads.retain(|t| *t != self.1);
+                if let Some(i) = st.threads.iter().position(|t| *t == self.1) {
+                    st.threads.swap_remove(i); // this thread alone: the broker's others go on
+                }
                 st.metadata_due = true;
-                // its batches being sent are its successor's to send again: possibly written
-                // (it may have written them), so a failure of one is fatal, never a rewind
+                // its own batches being sent (the broker's other threads' are theirs) are its
+                // successor's to send again: possibly written (it may have written them), so a
+                // failure of one is fatal, never a rewind
                 let now = Instant::now();
                 for part in st.topics.values_mut().flat_map(|t| t.parts.values_mut()) {
-                    if let Some(sent) = part.inflight.as_mut().filter(|s| s.sending && part.leader == Some(self.1)) {
-                        (sent.sending, sent.retry_at, sent.maybe_written) = (false, now, true);
+                    let Some(sent) = part.inflight.as_mut().filter(|s| s.sending && s.by == self.2) else { continue };
+                    if sent.msgs.is_empty() {
+                        // sealed, its messages out being encoded (`encode` catches a codec's
+                        // panic, so not reached): never sent, its sequence given back
+                        part.seq = sent.seq;
+                        part.inflight = None;
+                        continue;
                     }
+                    (sent.sending, sent.retry_at, sent.maybe_written) = (false, now, true);
                 }
                 drop(st);
                 self.0.work.notify_all();
@@ -1037,22 +1121,28 @@ fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
             }
         }
     }
-    let _gone = Gone(sh, id);
+    let _gone = Gone(sh, id, by);
     let addr = sh.lock().brokers.get(&id).cloned();
     let mut conn: Option<Conn> = addr.and_then(|a| Conn::open(sh.client.net(), &a).ok());
     let mut backoff = sh.s.retry_backoff;
+    let mut scratch = vec![];
     loop {
         let mut st = sh.lock();
-        let req = loop {
+        let (mut req, fresh) = loop {
             if st.closing || !st.topics.values().any(|t| t.parts.values().any(|p| p.leader == Some(id))) {
-                st.threads.retain(|t| *t != id);
+                if let Some(i) = st.threads.iter().position(|t| *t == id) {
+                    st.threads.swap_remove(i); // this thread alone: the broker's others count on theirs
+                }
                 return;
             }
             let now = Instant::now();
-            let (req, next) = take_due(sh, &mut st, id, now);
+            let (req, fresh, next, more) = take_due(sh, &mut st, id, by, now);
             sh.reported.notify_all();
-            if !req.is_empty() {
-                break req;
+            if more && sh.s.max_in_flight > 1 {
+                sh.work.notify_all(); // left for another of the broker's threads, if one is free
+            }
+            if !req.is_empty() || !fresh.is_empty() {
+                break (req, fresh);
             }
             let wait = next.map_or(Duration::from_millis(100), |n| n.saturating_duration_since(now));
             st = sh
@@ -1063,6 +1153,21 @@ fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
         };
         let addr = st.brokers.get(&id).cloned();
         drop(st);
+        if !fresh.is_empty() {
+            // the batches sealed are encoded off the lock: `send`, `poll` and the other threads go
+            // on meanwhile; only this thread touches a batch it is sending
+            let written = encode(&fresh, sh.s.codec, &mut scratch);
+            let mut st = sh.lock();
+            let more = encoded(sh, &mut st, &mut req, fresh, written);
+            drop(st);
+            sh.reported.notify_all();
+            if more && sh.s.max_in_flight > 1 {
+                sh.work.notify_all();
+            }
+            if req.is_empty() {
+                continue; // every batch failed to encode
+            }
+        }
         let answer = send(sh, &mut conn, id, addr, &req);
         let mut st = sh.lock();
         match answer {
