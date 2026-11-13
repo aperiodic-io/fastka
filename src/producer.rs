@@ -13,6 +13,9 @@
 //! renumbers; this producer is fatal instead (`fatal_error`): every message after fails, and a new
 //! producer is made to go on. Each failed delivery says whether it may be on the log
 //! (`Persisted`).
+//!
+//! The entry point is [`Producer::new`], with a [`Deliveries`] context; build each message with
+//! [`Record::to`] and queue it with [`Producer::send`].
 use crate::client::Client;
 use crate::config::{Config, ProducerSettings};
 use crate::conn::Conn;
@@ -41,6 +44,7 @@ impl<'a> Record<'a> {
         Record { topic, key: None, value: None, partition: None, timestamp: None, headers: &[] }
     }
 
+    /// Its value.
     pub fn value(self, v: &'a [u8]) -> Self {
         Record { value: Some(v), ..self }
     }
@@ -61,6 +65,7 @@ impl<'a> Record<'a> {
         Record { timestamp: Some(ms), ..self }
     }
 
+    /// Its headers in order: (name, value; None for null). A name may repeat.
     pub fn headers(self, h: &'a [(String, Option<Vec<u8>>)]) -> Self {
         Record { headers: h, ..self }
     }
@@ -81,18 +86,30 @@ pub enum Persisted {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Delivery<'a> {
+    /// The message's topic.
     pub topic: &'a str,
-    /// None: never given a partition
+    /// Its partition; None: never given one (its topic's partitions never known, or purged first).
     pub partition: Option<i32>,
-    /// None: not delivered, or delivered at an offset the broker did not say
+    /// Its offset; None: not delivered, or delivered at an offset the broker did not say (a
+    /// DUPLICATE_SEQUENCE_NUMBER).
     pub offset: Option<i64>,
+    /// Why it was not delivered; None: delivered.
     pub error: Option<&'a Error>,
+    /// Whether it is on the broker's log.
     pub persisted: Persisted,
 }
 
 /// What hears the deliveries (librdkafka's delivery report callback).
+///
+/// It is the producer's context, shared with its threads; [`delivery`](Deliveries::delivery) is
+/// called only from [`Producer::poll`] (and [`Producer::flush`]), on the polling thread.
 pub trait Deliveries: Send + Sync + 'static {
+    /// What the application attaches to each message at [`Producer::send`], handed back with
+    /// its outcome.
     type Opaque: Send + 'static;
+    /// Hears one message's outcome `d`, with the `opaque` it was sent with. A panic here
+    /// propagates out of [`Producer::poll`]; the outcomes after it are handed over at the next
+    /// poll.
     fn delivery(&self, d: &Delivery<'_>, opaque: Self::Opaque);
 }
 
@@ -192,7 +209,9 @@ struct Shared<C: Deliveries> {
     reported: Condvar,
 }
 
-/// An idempotent producer of `C`'s messages.
+/// An idempotent producer of `C`'s messages, made with [`Producer::new`]. `send` from any thread;
+/// `poll` (or `flush`) to hand outcomes to `C`. Dropping it fails what is still queued
+/// ([`Error::Purged`], handed to no one) without waiting: [`flush`](Producer::flush) first.
 pub struct Producer<C: Deliveries> {
     shared: Arc<Shared<C>>,
 }
@@ -208,7 +227,13 @@ fn now_ms() -> i64 {
 }
 
 impl<C: Deliveries> Producer<C> {
-    /// A producer of `cfg`'s cluster; it connects at its first message.
+    /// A producer of `cfg`'s cluster, its outcomes to `ctx`; it connects at its first message.
+    /// It starts a thread to manage the producer (and later one per broker).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`]: what [`Config::producer`] or [`Config::net`] refuses.
+    /// [`Error::Transport`]: the thread could not be started. No broker is contacted.
     pub fn new(cfg: &Config, ctx: C) -> Result<Producer<C>> {
         let s = cfg.producer()?;
         let client = Client::new(cfg)?;
@@ -244,6 +269,7 @@ impl<C: Deliveries> Producer<C> {
         Ok(Producer { shared })
     }
 
+    /// Its context, as given to [`Producer::new`].
     pub fn context(&self) -> &C {
         &self.shared.ctx
     }
@@ -257,6 +283,19 @@ impl<C: Deliveries> Producer<C> {
     /// neither one this producer picks); its outcome to `delivery` with `opaque`. QueueFull: the
     /// queue is at its bound (`queue.buffering.max.messages`, `.kbytes`): `poll` and send it again.
     /// Fatal: the producer can deliver nothing more.
+    ///
+    /// A partition the topic does not have is not an error here: it is reported to `delivery`
+    /// (UNKNOWN_TOPIC_OR_PARTITION).
+    ///
+    /// # Errors
+    ///
+    /// The error with `opaque` handed back, the message not queued:
+    /// - [`Error::QueueFull`]: at `queue.buffering.max.messages` or `.kbytes`; poll, then retry.
+    /// - [`Error::Fatal`]: the producer is fatal ([`fatal_error`](Producer::fatal_error)).
+    /// - [`Error::Broker`] with [`Code::MESSAGE_TOO_LARGE`]: the message cannot fit a batch of
+    ///   `message.max.bytes`.
+    /// - [`Error::Config`]: an empty topic, or a message larger than `queue.buffering.max.kbytes`.
+    /// - [`Error::Transport`]: the producer is closing.
     pub fn send(&self, r: Record<'_>, opaque: C::Opaque) -> std::result::Result<(), (Error, C::Opaque)> {
         let sh = &*self.shared;
         let mut guard = sh.lock();
@@ -336,7 +375,11 @@ impl<C: Deliveries> Producer<C> {
 
     /// Hands the outcomes ready to the context's `delivery`, waiting up to `timeout` for one:
     /// how many. What is past `message.timeout.ms` is timed out here too, when due: the threads
-    /// may be in a lookup, or waiting out its backoff.
+    /// may be in a lookup, or waiting out its backoff. `Duration::MAX`: until one is ready.
+    ///
+    /// # Panics
+    ///
+    /// If the context's [`delivery`](Deliveries::delivery) panics: the panic is resumed here.
     pub fn poll(&self, timeout: Duration) -> usize {
         let sh = &*self.shared;
         // None: forever (a timeout past what an Instant holds)
@@ -382,7 +425,17 @@ impl<C: Deliveries> Producer<C> {
         self.shared.lock().outstanding
     }
 
-    /// Polls until every message's outcome is handed over, within `timeout`.
+    /// Polls until every message's outcome is handed over, within `timeout`
+    /// (`Duration::MAX`: no limit).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`]: messages are still in flight when `timeout` passes. A message that
+    /// failed is not an error here: its outcome went to `delivery`.
+    ///
+    /// # Panics
+    ///
+    /// As [`poll`](Producer::poll) does.
     pub fn flush(&self, timeout: Duration) -> Result<()> {
         let until = Instant::now().checked_add(timeout);
         while self.in_flight_count() > 0 {
@@ -395,7 +448,8 @@ impl<C: Deliveries> Producer<C> {
         Ok(())
     }
 
-    /// Fails every message not yet in a request (Purged): what is in flight may still land.
+    /// Fails every message not yet in a request ([`Error::Purged`], [`Persisted::No`]), their
+    /// outcomes handed over at the next `poll`: what is in flight may still land.
     pub fn purge_queue(&self) {
         let mut st = self.shared.lock();
         let st = &mut *st;
@@ -413,7 +467,8 @@ impl<C: Deliveries> Producer<C> {
         self.shared.reported.notify_all();
     }
 
-    /// The error that made the producer fatal, if one did.
+    /// The error that made the producer fatal, (code, why); None if it is not fatal. Once
+    /// fatal, every message fails: make a new producer to go on.
     pub fn fatal_error(&self) -> Option<(Code, String)> {
         self.shared.lock().fatal.clone()
     }
