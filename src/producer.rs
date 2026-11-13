@@ -234,8 +234,7 @@ struct State<O> {
     /// messages sent whose outcome `poll` has not handed over (what `queue.buffering.max.messages`
     /// bounds: a report holds its opaque until then)
     outstanding: usize,
-    /// of those, still in a queue or a batch, and their bytes (what `.kbytes` bounds)
-    queued: usize,
+    /// the bytes of those still in a queue or a batch (what `.kbytes` bounds)
     queued_bytes: usize,
     reports: VecDeque<Report<O>>,
     metadata_due: bool,
@@ -299,7 +298,6 @@ impl<C: Deliveries> Producer<C> {
             threads: vec![],
             next_thread: 0,
             outstanding: 0,
-            queued: 0,
             queued_bytes: 0,
             reports: VecDeque::new(),
             metadata_due: false,
@@ -402,7 +400,6 @@ impl<C: Deliveries> Producer<C> {
             enqueued: now,
         };
         st.outstanding += 1;
-        st.queued += 1;
         st.queued_bytes += size;
         // looked up by the name given, no copy of it made but for a topic not seen before
         if !st.topics.contains_key(r.topic) {
@@ -541,7 +538,6 @@ impl<C: Deliveries> Producer<C> {
                 gone.extend(part.queue.drain(..).map(|p| (Some(*id), p)));
             }
             for (partition, p) in gone {
-                st.queued -= 1;
                 st.queued_bytes -= p.size();
                 st.reports.push_back((name.clone(), partition, None, Some(Error::Purged), Persisted::No, p.opaque));
             }
@@ -581,7 +577,6 @@ impl<O> State<O> {
         persisted: Persisted,
         p: Pending<O>,
     ) {
-        self.queued -= 1;
         self.queued_bytes -= p.size();
         self.reports.push_back((topic.clone(), partition, offset, error, persisted, p.opaque));
     }
@@ -748,7 +743,7 @@ fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
     for b in &md.brokers {
         st.brokers.insert(b.id, format!("{}:{}", b.host, b.port));
     }
-    let (mut new_leaders, mut gone) = (vec![], vec![]);
+    let (mut new_leaders, mut gone) = (std::collections::BTreeSet::new(), vec![]);
     for (name, t) in st.topics.iter_mut() {
         let Some(m) = md.topic(name) else { continue };
         if m.error != Code::NONE {
@@ -776,8 +771,8 @@ fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
                 leader: None,
             });
             part.leader = (p.leader >= 0).then_some(p.leader);
-            if p.leader >= 0 && !new_leaders.contains(&p.leader) {
-                new_leaders.push(p.leader); // its threads counted below
+            if p.leader >= 0 {
+                new_leaders.insert(p.leader);
             }
         }
         // keyless messages stick to no partition without a leader, nor one now gone
@@ -1140,43 +1135,45 @@ struct Asked {
     until: Instant,
 }
 
+/// A thread that panics is no longer the broker's: a new one is started at the next metadata,
+/// else its partitions would never be sent again.
+struct Gone<'a, C: Deliveries>(&'a Shared<C>, i32, u64);
+impl<C: Deliveries> Drop for Gone<'_, C> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let mut st = self.0.lock();
+            if let Some(i) = st.threads.iter().position(|t| *t == self.1) {
+                st.threads.swap_remove(i);
+            }
+            st.metadata_due = true;
+            // its batches being sent (a thread before it of the same broker may have panicked
+            // too: those are handed back by its own guard) are its successor's to send again:
+            // possibly written (it may have written them), so a failure of one is fatal, never a
+            // rewind
+            let now = Instant::now();
+            for part in st.topics.values_mut().flat_map(|t| t.parts.values_mut()) {
+                let Some(sent) = part.inflight.as_mut().filter(|s| s.sending && s.by == self.2) else { continue };
+                if sent.msgs.is_empty() {
+                    // sealed, its messages out being encoded (`encode` catches a codec's
+                    // panic, so not reached): never sent, its sequence given back
+                    part.seq = sent.seq;
+                    part.inflight = None;
+                    continue;
+                }
+                (sent.sending, sent.retry_at, sent.maybe_written) = (false, now, true);
+            }
+            drop(st);
+            self.0.work.notify_all();
+            self.0.reported.notify_all();
+        }
+    }
+}
+
 /// Broker `id`'s thread (`by`, its own number): its partitions' batches sent as they are due,
 /// encoded off the lock, on one connection with up to `max.in.flight` requests outstanding
 /// (librdkafka's pipelining); the answers, which come in the order asked, applied. It connects at
 /// once, before its first batch is due.
 fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32, by: u64) {
-    /// A thread that panics is no longer the broker's: a new one is started at the next metadata,
-    /// else its partitions would never be sent again.
-    struct Gone<'a, C: Deliveries>(&'a Shared<C>, i32, u64);
-    impl<C: Deliveries> Drop for Gone<'_, C> {
-        fn drop(&mut self) {
-            if std::thread::panicking() {
-                let mut st = self.0.lock();
-                if let Some(i) = st.threads.iter().position(|t| *t == self.1) {
-                    st.threads.swap_remove(i);
-                }
-                st.metadata_due = true;
-                // its batches being sent (a thread before it of the same broker may have panicked
-                // too: those are handed back by its own guard) are its successor's to send again: possibly written (it may have written them), so a
-                // failure of one is fatal, never a rewind
-                let now = Instant::now();
-                for part in st.topics.values_mut().flat_map(|t| t.parts.values_mut()) {
-                    let Some(sent) = part.inflight.as_mut().filter(|s| s.sending && s.by == self.2) else { continue };
-                    if sent.msgs.is_empty() {
-                        // sealed, its messages out being encoded (`encode` catches a codec's
-                        // panic, so not reached): never sent, its sequence given back
-                        part.seq = sent.seq;
-                        part.inflight = None;
-                        continue;
-                    }
-                    (sent.sending, sent.retry_at, sent.maybe_written) = (false, now, true);
-                }
-                drop(st);
-                self.0.work.notify_all();
-                self.0.reported.notify_all();
-            }
-        }
-    }
     let _gone = Gone(sh, id, by);
     let addr = sh.lock().brokers.get(&id).cloned();
     let mut conn: Option<Conn> = addr.and_then(|a| Conn::open(sh.client.net(), &a).ok());

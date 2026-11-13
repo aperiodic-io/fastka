@@ -12,4 +12,23 @@ profile = "mutants"
 # The Kani proofs: only Kani compiles them (`#[cfg(kani)]`), so a mutant of one builds the same
 # binary and no test can catch it. CI's kani job checks them.
 exclude_globs = ["src/proofs.rs"]
-exclude_re = []
+exclude_re = [
+  # Equivalent: a send waking the broker's thread when its partition has a batch in flight too
+  # (`&&` to `||`) only wakes it for nothing: it cannot send another batch of that partition until
+  # the one in flight is answered. More wakes, the same requests.
+  "producer\\.rs:\\d+:46: replace && with \\|\\| in Producer<C>::send$",
+  # Equivalent: `poll`'s least wait of 1 ms past a deadline already gone (a batch in a request
+  # past it), and its second-long nap when nothing is due and it waits forever, only keep it from
+  # spinning; without them it spins, handing over the same reports.
+  "producer\\.rs:\\d+:(61|49): replace \\+ with - in Producer<C>::poll$",
+  # Equivalent: a producer's first keyless partition drawn out of range (`%` to `+`) is moved into
+  # range, still at random, by the check after it; one in range moved on at a metadata refresh
+  # (`>=` to `<`) is another partition of the same topic. Where keyless records go, never whether.
+  "producer\\.rs:\\d+:47: replace % with \\+ in apply_metadata$",
+  "producer\\.rs:\\d+:41: replace >= with < in apply_metadata$",
+  # Equivalent: which batches' deadlines wake `poll` sets how soon `poll` times them out itself;
+  # the producer's own thread and the broker threads time them out too, within 100 ms.
+  "producer\\.rs:.*delete ! in next_deadline$",
+  # Equivalent: a throttle of 0 ms (`>` to `>=`) waits until now.
+  "producer\\.rs:\\d+:40: replace > with >= in broker$",
+]
