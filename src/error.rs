@@ -47,18 +47,24 @@ impl Code {
     pub const NOT_ENOUGH_REPLICAS: Code = Code(19);
     /// The write was appended, but fewer in-sync replicas than `min.insync.replicas` acknowledged it.
     pub const NOT_ENOUGH_REPLICAS_AFTER_APPEND: Code = Code(20);
+    /// A Produce's acks is not one the broker takes (-1, 0 or 1).
+    pub const INVALID_REQUIRED_ACKS: Code = Code(21);
     /// Not authorized to access the topic.
     pub const TOPIC_AUTHORIZATION_FAILED: Code = Code(29);
     /// Not authorized to access the consumer group.
     pub const GROUP_AUTHORIZATION_FAILED: Code = Code(30);
     /// Not authorized for a cluster-level operation.
     pub const CLUSTER_AUTHORIZATION_FAILED: Code = Code(31);
+    /// A record's timestamp is outside what the topic accepts (`message.timestamp.*.ms`).
+    pub const INVALID_TIMESTAMP: Code = Code(32);
     /// The broker does not enable the SASL mechanism asked for.
     pub const UNSUPPORTED_SASL_MECHANISM: Code = Code(33);
     /// The broker does not support the version of the API asked for.
     pub const UNSUPPORTED_VERSION: Code = Code(35);
     /// A topic of that name already exists.
     pub const TOPIC_ALREADY_EXISTS: Code = Code(36);
+    /// The request needs a newer message format than the topic's.
+    pub const UNSUPPORTED_FOR_MESSAGE_FORMAT: Code = Code(43);
     /// The request breaks a broker-side policy (e.g. a create-topic policy).
     pub const POLICY_VIOLATION: Code = Code(44);
     /// The idempotent producer's sequence number is not the next the broker expects: records may be lost.
@@ -77,6 +83,8 @@ impl Code {
     pub const FENCED_LEADER_EPOCH: Code = Code(74);
     /// The leader epoch in the request is newer than the broker's: the broker is behind.
     pub const UNKNOWN_LEADER_EPOCH: Code = Code(75);
+    /// The topic's compression does not read the records' (or the request is too old for it).
+    pub const UNSUPPORTED_COMPRESSION_TYPE: Code = Code(76);
     /// The leader cannot serve the offset yet (its high watermark not caught up after an election).
     pub const OFFSET_NOT_AVAILABLE: Code = Code(78);
     /// The broker refused a record as invalid (e.g. a compacted topic's record without a key).

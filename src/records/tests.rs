@@ -172,6 +172,15 @@ fn log_append_time_is_the_batchs_max_timestamp() {
     assert_eq!(all(&b, &opts()).unwrap().iter().map(|g| g.1).collect::<Vec<_>>(), [9_999, 9_999]);
 }
 
+/// Any timestamps are written without a panic, however far apart: the delta wraps, as the
+/// reader's sum does, so they read back as written.
+#[test]
+fn timestamps_at_the_extremes_are_written_and_read_back() {
+    let r = |timestamp| Out { timestamp, key: None, value: Some(b"v"), headers: &[] };
+    let b = written(NONE, &[r(i64::MAX), r(i64::MIN), r(0)]);
+    assert_eq!(all(&b, &opts()).unwrap().iter().map(|g| g.1).collect::<Vec<_>>(), [i64::MAX, i64::MIN, 0]);
+}
+
 /// A batch changed after it was written is refused (its CRC-32C), not read as other records.
 #[test]
 fn a_corrupt_batch_is_refused() {

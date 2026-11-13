@@ -60,7 +60,8 @@ impl<'a> Record<'a> {
         Record { partition: Some(p), ..self }
     }
 
-    /// Its timestamp (CreateTime, ms since the epoch), rather than when it is sent.
+    /// Its timestamp (CreateTime, ms since the epoch), rather than when it is sent: at least 0, or
+    /// [`Producer::send`] refuses it (as Java's producer does).
     pub fn timestamp(self, ms: i64) -> Self {
         Record { timestamp: Some(ms), ..self }
     }
@@ -300,7 +301,8 @@ impl<C: Deliveries> Producer<C> {
     /// - [`Error::Fatal`]: the producer is fatal ([`fatal_error`](Producer::fatal_error)).
     /// - [`Error::Broker`] with [`Code::MESSAGE_TOO_LARGE`]: the message cannot fit a batch of
     ///   `message.max.bytes`.
-    /// - [`Error::Config`]: an empty topic, or a message larger than `queue.buffering.max.kbytes`.
+    /// - [`Error::Config`]: an empty topic or one over 32767 bytes, a timestamp below 0, or a
+    ///   message larger than `queue.buffering.max.kbytes`.
     /// - [`Error::Transport`]: the producer is closing.
     pub fn send(&self, r: Record<'_>, opaque: C::Opaque) -> std::result::Result<(), (Error, C::Opaque)> {
         let sh = &*self.shared;
@@ -314,6 +316,13 @@ impl<C: Deliveries> Producer<C> {
         }
         if r.topic.is_empty() {
             return Err((Error::Config("a record without a topic".into()), opaque));
+        }
+        // queued, a name the protocol cannot carry would fail the Metadata of every topic
+        if let Err(e) = wire::check_str("a topic name", r.topic) {
+            return Err((e, opaque));
+        }
+        if let Some(ms) = r.timestamp.filter(|ms| *ms < 0) {
+            return Err((Error::Config(format!("timestamp {ms}: a timestamp is at least 0")), opaque));
         }
         let size = size_of(r.key, r.value, r.headers);
         // what no wait would ever take: refused for what it is, not QueueFull
@@ -808,11 +817,15 @@ fn fail_queued<O>(st: &mut State<O>) {
     }
 }
 
+/// The soonest a message is due to be timed out. A batch being sent is not timed out until its
+/// attempt ends (which wakes the waiters), so it is left out: else its deadline, once past, would
+/// be waited for again and again at once.
 fn next_deadline<O>(st: &State<O>) -> Option<Instant> {
     (st.topics.values())
         .flat_map(|t| {
-            let parts =
-                t.parts.values().flat_map(|p| p.queue.front().into_iter().chain(p.inflight.iter().map(|s| &s.msgs[0])));
+            let parts = t.parts.values().flat_map(|p| {
+                p.queue.front().into_iter().chain(p.inflight.iter().filter(|s| !s.sending).map(|s| &s.msgs[0]))
+            });
             t.unassigned.front().into_iter().chain(parts)
         })
         .map(|p| p.deadline)
@@ -831,6 +844,26 @@ fn unwritten(c: Code) -> bool {
             | Code::FENCED_LEADER_EPOCH
             | Code::UNKNOWN_LEADER_EPOCH
             | Code::THROTTLING_QUOTA_EXCEEDED
+    )
+}
+
+/// Whether a refusal for good says its batch was not appended: the broker checks the request and
+/// each batch for these before it appends. Any other (one this list or this crate does not know,
+/// one a newer broker gives) may come after: its sequence may be the broker's.
+fn refused_before_append(c: Code) -> bool {
+    matches!(
+        c,
+        Code::CORRUPT_MESSAGE
+            | Code::MESSAGE_TOO_LARGE
+            | Code::INVALID_TOPIC_EXCEPTION
+            | Code::RECORD_LIST_TOO_LARGE
+            | Code::INVALID_REQUIRED_ACKS
+            | Code::TOPIC_AUTHORIZATION_FAILED
+            | Code::INVALID_TIMESTAMP
+            | Code::UNSUPPORTED_FOR_MESSAGE_FORMAT
+            | Code::POLICY_VIOLATION
+            | Code::UNSUPPORTED_COMPRESSION_TYPE
+            | Code::INVALID_RECORD
     )
 }
 
@@ -981,6 +1014,21 @@ fn take_due<C: Deliveries>(
 /// A broker's thread: its partitions' batches sent as they are due, the answers applied. It
 /// connects at once, before its first batch is due.
 fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
+    /// A thread that panics is no longer the broker's: a new one is started at the next metadata,
+    /// else its partitions would never be sent again.
+    struct Gone<'a, C: Deliveries>(&'a Shared<C>, i32);
+    impl<C: Deliveries> Drop for Gone<'_, C> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let mut st = self.0.lock();
+                st.threads.retain(|t| *t != self.1);
+                st.metadata_due = true;
+                drop(st);
+                self.0.work.notify_all();
+            }
+        }
+    }
+    let _gone = Gone(sh, id);
     let addr = sh.lock().brokers.get(&id).cloned();
     let mut conn: Option<Conn> = addr.and_then(|a| Conn::open(sh.client.net(), &a).ok());
     let mut backoff = sh.s.retry_backoff;
@@ -1020,7 +1068,7 @@ fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
                     continue;
                 }
             }
-            Err((e, written)) => {
+            Err((_, written)) => {
                 conn = None;
                 // every batch of the request sent again, after a backoff and a metadata refresh
                 let at = Instant::now() + backoff;
@@ -1034,9 +1082,8 @@ fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
                         sent.maybe_written |= written;
                     }
                 }
-                if matches!(e, Error::Auth(_) | Error::Unsupported(_)) {
-                    st.set_fatal(Code::AUTHENTICATION, format!("broker {id}: {e}"));
-                }
+                // an authentication refused (credentials reach a broker late) or versions not
+                // spoken (a broker mid-upgrade) too: retried until the messages' deadline
                 st.metadata_due = true;
             }
         }
@@ -1055,18 +1102,23 @@ fn send<C: Deliveries>(
 ) -> std::result::Result<(Vec<wire::Produced>, i32), (Error, bool)> {
     // the error, and whether the request may have been written
     let unsent = |e| (e, false);
-    if conn.is_none() {
-        let addr = addr.ok_or_else(|| unsent(Error::Transport(format!("broker {id}: no address"))))?;
-        *conn = Some(Conn::open(sh.client.net(), &addr).map_err(unsent)?);
-    }
-    let c = conn.as_mut().expect("connected");
     // given up at the first message's deadline (message.timeout.ms bounds a request in flight,
-    // as librdkafka bounds it): the broker is asked to answer by then, and the connection is
-    // dropped if it has not
+    // as librdkafka bounds it): a reconnect is given no longer, the broker is asked to answer by
+    // then, and the connection is dropped if it has not
     let first = req.iter().map(|r| r.3).min().expect("a batch");
     let left = first.saturating_duration_since(Instant::now());
     if left.is_zero() {
         // stalled between taking it and sending it: not sent, given up as timed out
+        return Err(unsent(Error::Timeout("past the message timeout before it was sent".into())));
+    }
+    if conn.is_none() {
+        let addr = addr.ok_or_else(|| unsent(Error::Transport(format!("broker {id}: no address"))))?;
+        *conn = Some(Conn::open_within(sh.client.net(), &addr, left).map_err(unsent)?);
+    }
+    let c = conn.as_mut().expect("connected");
+    // what the connecting took
+    let left = first.saturating_duration_since(Instant::now());
+    if left.is_zero() {
         return Err(unsent(Error::Timeout("past the message timeout before it was sent".into())));
     }
     let timeout = sh.s.request_timeout.min(left);
@@ -1110,8 +1162,9 @@ fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Reque
                 part.inflight = Some(sent);
             }
             c => {
-                // one batch a partition in flight: refused, and no attempt of it written, no later
-                // sequence was sent, and the broker's next is this batch's
+                // one batch a partition in flight: refused before it was appended, and no attempt
+                // of it written, no later sequence was sent, and the broker's next is this batch's
+                sent.maybe_written |= !refused_before_append(c) && !sequence_broken(c);
                 let gap = sent.maybe_written || sequence_broken(c);
                 if !gap {
                     part.seq = sent.seq;

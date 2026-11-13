@@ -61,7 +61,7 @@ loudly at startup, not half-supported:
 | **async/await** | It is synchronous by design. In an async program, run it on a dedicated thread (`spawn_blocking`), or use rskafka. |
 | **GSSAPI/Kerberos, OAUTHBEARER, encrypted private keys, JKS/PKCS#12** | rdkafka. |
 | **Flexible protocol versions (KIP-482 tagged fields), Fetch sessions (KIP-227), leader epochs (KIP-320), SASL re-authentication (KIP-368)** | Every broker from Kafka 2.4 to 4.1, and Redpanda, still speaks the versions used here. A broker that drops them is refused at connect, naming the API. |
-| **Epoch bump on a sequence gap** | Where librdkafka bumps the producer epoch and renumbers, a fastka producer becomes *fatal* (`fatal_error()`), and you create a new one. This only happens when a batch may have been written but its answer was lost. |
+| **Epoch bump on a sequence gap** | Where librdkafka bumps the producer epoch and renumbers, a fastka producer becomes *fatal* (`fatal_error()`), and you create a new one. This only happens when a batch may have been written but its outcome is unknown: its answer lost, or a refusal with a code not known to come before the broker appends. |
 
 Two further limits. fastka has not been run by anyone except its authors, and its API is 0.x. The
 verification below is thorough, but it doesn't replace years of other people's production traffic,
@@ -216,7 +216,8 @@ Settings use librdkafka's names and defaults, except where noted. Unknown keys a
 - **Consumer:**
   - `auto.offset.reset`, `enable.partition.eof`, `isolation.level` (default `read_committed`);
   - `fetch.wait.max.ms`, `fetch.min.bytes`, `fetch.max.bytes`, `max.partition.fetch.bytes`;
-  - `queued.min.messages`, `queued.max.messages.kbytes`;
+  - `queued.min.messages`, `queued.max.messages.kbytes` (each a bound on a partition's queue);
+  - `fetch.error.backoff.ms`;
   - `check.crcs` (default `true`);
   - `group.id` (for `Client::commit`).
   - `enable.auto.commit=true` is refused: fastka commits only when you ask it to.

@@ -1596,3 +1596,155 @@ fn retries_back_off_exponentially_to_the_max() {
     assert_eq!(waits, [100, 200, 400, 800, 1000, 1000]);
     assert_eq!(super::retry_wait(&s, u32::MAX).as_millis(), 1000, "no overflow");
 }
+
+/// A reconnect in a broker thread, its batches already taken (`sending`: `poll` cannot time them
+/// out meanwhile), is given what is left of their message.timeout.ms, not the whole
+/// socket.connection.setup.timeout.ms: they are reported timed out on time.
+#[test]
+fn a_reconnect_while_sending_is_bounded_by_the_message_timeout() {
+    use std::net::TcpListener;
+    // the leader: its first connection closed at once, the next ones accepted and never answered
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let leader = l.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let mut held = vec![];
+        for (n, s) in l.incoming().enumerate() {
+            let s = s.unwrap();
+            if n == 0 {
+                drop(s);
+            } else {
+                held.push(s);
+            }
+        }
+    });
+    let leader2 = leader.clone();
+    let b = Broker::start(move |r| match r.api {
+        wire::METADATA => Answer::Body(metadata(&[(0, &r.me), (1, &leader2)], &[("o", &[(0, 1)])])),
+        wire::INIT_PRODUCER_ID => {
+            let mut out = vec![];
+            out.i32(0);
+            out.i16(0);
+            out.i64(1000);
+            out.i16(0);
+            Answer::Body(out)
+        }
+        _ => Answer::Drop,
+    });
+    let p = producer(&b, &[("message.timeout.ms", "300"), ("socket.connection.setup.timeout.ms", "4000")]);
+    // wait for the producer id and the leader's thread to have failed its first connection
+    std::thread::sleep(Duration::from_millis(300));
+    let t = Instant::now();
+    send(&p, "o", "x", 1);
+    let h = heard(&p, 1);
+    let late = t.elapsed();
+    assert_eq!(h[0].3.as_deref(), Some("message timed out (message.timeout.ms)"), "{h:?}");
+    assert!(late < Duration::from_millis(1500), "message.timeout.ms=300, reported after {late:?}");
+}
+
+/// A timestamp below 0 is refused at `send`, as Java's producer refuses it; any two others share a
+/// batch however far apart (their delta is never an overflow, which panicked a broker thread
+/// holding the state lock: its batch never reported, the broker never produced to again).
+#[test]
+fn negative_timestamps_are_refused_and_far_apart_ones_share_a_batch() {
+    let (b, logs) = sink(&["o"], 1, no_fault());
+    let p = producer(&b, &[("linger.ms", "50")]);
+    let refused = p.send(Record::to("o").value(b"n").timestamp(-1), 9).unwrap_err();
+    assert!(matches!(refused, (Error::Config(_), 9)), "{refused:?}");
+    p.send(Record::to("o").value(b"a").timestamp(0), 1).unwrap();
+    p.send(Record::to("o").value(b"b").timestamp(i64::MAX), 2).unwrap();
+    let h = heard(&p, 2);
+    assert!(h.iter().all(|o| o.3.is_none()), "{h:?}");
+    assert_eq!(log_of(&logs)[&("o".to_string(), 0)].stamps, [0, i64::MAX]);
+}
+
+/// A batch refused for good with a code not known to come before the broker appends it (here
+/// INVALID_REQUEST, and one no Kafka has) may be on the log: it fails possibly persisted, with the
+/// producer fatal, its sequence never given to the next batch (which would then be taken as its
+/// duplicate). Those known to be checked first (MESSAGE_TOO_LARGE above) fail alone.
+#[test]
+fn a_batch_refused_with_a_code_not_known_before_append_is_fatal() {
+    for code in [42, 999] {
+        let fault: Fault = Box::new(move |r, _, _| {
+            let mut c = Cur::new(&r.body);
+            c.nstr().unwrap();
+            c.i16().unwrap();
+            c.i32().unwrap();
+            c.i32().unwrap();
+            Some(Answer::Body(refusal(c.str().unwrap(), 0, code)))
+        });
+        let (b, _) = sink(&["o"], 1, fault);
+        let p = producer(&b, &[]);
+        send(&p, "o", "x", 1);
+        let h = heard(&p, 1);
+        assert_eq!((h[0].4, h[0].6), (Some(Code(code)), Persisted::Possibly), "{code}: {h:?}");
+        assert_eq!(p.fatal_error().map(|f| f.0), Some(Code(code)), "{code}");
+    }
+}
+
+/// A leader's connection refused by SASL (credentials not yet propagated to it) is retried as a
+/// lost one, until the messages' deadline: not fatal, the message delivered once it authenticates.
+#[test]
+fn a_leader_refusing_authentication_for_a_while_is_retried() {
+    let logs: Logs = Arc::default();
+    // refuses its first `refusals` authentications; leads o/0 as broker 1 at `leader`
+    let start = |refusals: usize, leader: Option<String>, logs: Logs| {
+        let n = AtomicUsize::new(0);
+        Broker::start(move |r| {
+            let mut out = vec![];
+            match r.api {
+                wire::SASL_HANDSHAKE => {
+                    out.i16(0);
+                    out.count(1);
+                    out.str("PLAIN");
+                }
+                wire::SASL_AUTHENTICATE => {
+                    let ok = n.fetch_add(1, Ordering::SeqCst) >= refusals;
+                    out.i16(if ok { 0 } else { 58 });
+                    out.nstr(Some(if ok { "" } else { "not yet" }));
+                    out.bytes(b"");
+                }
+                wire::METADATA => {
+                    let l = leader.clone().unwrap_or_else(|| r.me.clone());
+                    out = metadata(&[(0, &r.me), (1, &l)], &[("o", &[(0, 1)])]);
+                }
+                wire::INIT_PRODUCER_ID => {
+                    out.i32(0);
+                    out.i16(0);
+                    out.i64(1000);
+                    out.i16(0);
+                }
+                wire::PRODUCE => out = produce(r, &logs),
+                _ => return Answer::Drop,
+            }
+            Answer::Body(out)
+        })
+    };
+    let leader = start(2, None, logs.clone());
+    let b = start(0, Some(leader.addr.clone()), logs.clone());
+    let sasl = [
+        ("security.protocol", "sasl_plaintext"),
+        ("sasl.mechanisms", "PLAIN"),
+        ("sasl.username", "u"),
+        ("sasl.password", "p"),
+    ];
+    let p = producer(&b, &sasl);
+    send(&p, "o", "x", 1);
+    let h = heard(&p, 1);
+    assert_eq!((h[0].3.as_deref(), h[0].6), (None, Persisted::Yes), "{h:?}");
+    assert_eq!(p.fatal_error(), None);
+    assert_eq!(values(&logs, "o", 0), ["x"]);
+}
+
+/// A topic name longer than the protocol carries (32767 bytes) is refused at `send`: queued, it
+/// would fail every Metadata request, for every topic's messages.
+#[test]
+fn a_topic_name_too_long_for_the_protocol_is_refused() {
+    let (b, _) = sink(&["o"], 1, no_fault());
+    let p = producer(&b, &[]);
+    let long = "t".repeat(32_768);
+    let refused = p.send(Record::to(&long).value(b"x"), 9).unwrap_err();
+    assert!(matches!(refused, (Error::Config(_), 9)), "{refused:?}");
+    send(&p, "o", "x", 1);
+    let h = heard(&p, 1);
+    assert_eq!(h[0].3, None, "{h:?}");
+}

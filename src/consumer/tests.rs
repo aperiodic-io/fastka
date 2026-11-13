@@ -1409,3 +1409,46 @@ fn seek_drops_what_is_queued_and_in_flight() {
     let (got, _) = drain(&mut c, 1);
     assert_eq!(vals(&got, 0), ["m0", "m1", "m2", "m3", "m4", "EOF"]);
 }
+
+/// `queued.max.messages.kbytes` bounds what a partition queues, not only one Fetch: a partition
+/// at it is fetched no more until what it holds is taken (as librdkafka's partition queue, which
+/// stops fetching at either bound), else large messages not taken grow `queued.min.messages` big.
+#[test]
+fn a_partitions_queue_is_bounded_by_its_bytes() {
+    let mut a = Log::default();
+    let big = "x".repeat(64 * 1024);
+    for _ in 0..200 {
+        a.push(0, &[big.as_str()]);
+    }
+    let br = log_broker(logs(&[("t", 0, a)]), no_fault());
+    let mut c =
+        consumer(&br, &[("queued.max.messages.kbytes", "1024")], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    let queued = |c: &Consumer| c.parts[0].queue.iter().map(|m| m.value.as_ref().map_or(0, Vec::len)).sum::<usize>();
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        c.pump(&mut |_| {}).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let bytes = queued(&c);
+    assert!(bytes > 0 && bytes <= 2 * 1024 * 1024, "queued.max.messages.kbytes=1024, yet {bytes} bytes queued");
+    // taken, it is fetched on to the end
+    let (got, _) = drain(&mut c, 1);
+    assert_eq!(got.iter().filter(|g| g.1 != "EOF").count(), 200);
+}
+
+/// A partition error that persists (here NOT_LEADER_OR_FOLLOWER while the metadata still names
+/// the same leader, as during an election) is looked up and fetched again only after
+/// `fetch.error.backoff.ms`, not at once: the broker is not hammered.
+#[test]
+fn a_partition_error_that_persists_is_retried_after_a_backoff() {
+    let mut a = Log::default();
+    a.push(0, &["x"]);
+    let br = log_broker(logs(&[("t", 0, a)]), Box::new(|_, _| Some(Answer::Body(fetch_answer("t", 0, 6, 1, None)))));
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::At(0))]);
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_millis(500) {
+        let _ = c.next_event(Duration::from_millis(10), &mut |_| {});
+    }
+    let (f, m) = (br.requests(wire::FETCH).len(), br.requests(wire::METADATA).len());
+    assert!(f < 20 && m < 20, "in 500 ms: {f} Fetches, {m} Metadata requests");
+}

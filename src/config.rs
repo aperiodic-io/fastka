@@ -248,6 +248,13 @@ pub struct ConsumerSettings {
     /// A partition is fetched again while it holds fewer queued (`queued.min.messages`,
     /// default 100000).
     pub queued_min: usize,
+    /// ... and while its queued messages' keys, values and headers are fewer bytes
+    /// (`queued.max.messages.kbytes` × 1024, default 64 MiB): a bound per partition, as
+    /// librdkafka's on a partition's own queue, overshot by at most one Fetch's worth.
+    pub queued_max_bytes: usize,
+    /// A partition whose Fetch met an error is neither looked up nor fetched again before this
+    /// (`fetch.error.backoff.ms`, default 500), longer while its errors go on.
+    pub fetch_error_backoff: Duration,
     /// read_committed: aborted transactions' records and control records are skipped, and a
     /// partition is read only up to its last stable offset (`isolation.level`, default
     /// `read_committed`).
@@ -429,7 +436,7 @@ impl Config {
         let partition_max =
             self.get("max.partition.fetch.bytes").or(self.get("fetch.message.max.bytes")).unwrap_or("1048576");
         int("fetch.queue.backoff.ms", g("fetch.queue.backoff.ms", "1000"), 0, 300_000)?;
-        int("fetch.error.backoff.ms", g("fetch.error.backoff.ms", "500"), 0, 300_000)?;
+        let fetch_error_backoff = ms("fetch.error.backoff.ms", g("fetch.error.backoff.ms", "500"), 0, 300_000)?;
         let committed = match g("isolation.level", "read_committed") {
             "read_committed" => true,
             "read_uncommitted" => false,
@@ -444,6 +451,8 @@ impl Config {
             max_bytes: fetch_max.min(queue_kb * 1024).max(1) as i32,
             partition_max_bytes: int("fetch.message.max.bytes", partition_max, 1, 1_000_000_000)? as i32,
             queued_min: int("queued.min.messages", g("queued.min.messages", "100000"), 1, 10_000_000)? as usize,
+            queued_max_bytes: queue_kb as usize * 1024,
+            fetch_error_backoff,
             committed,
             check_crcs: boolean("check.crcs", g("check.crcs", "true"))?,
         })

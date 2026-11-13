@@ -12,6 +12,7 @@
 //! connection dropped, a client timeout); a retriable refusal, either before the broker appended
 //! the batch (NOT_ENOUGH_REPLICAS) or after (REQUEST_TIMED_OUT, NOT_ENOUGH_REPLICAS_AFTER_APPEND);
 //! a refusal for good of the batch (MESSAGE_TOO_LARGE, TOPIC_AUTHORIZATION_FAILED: never appended);
+//! a refusal for good with a code not known to come before appending, appended or not;
 //! a batch sent again answered either as Kafka does for its last batches (NONE, the offset it was
 //! written at) or as DUPLICATE_SEQUENCE_NUMBER.
 //!
@@ -28,8 +29,9 @@
 //! - `send`: a request is not sent past its first message's deadline (given up as timed out).
 //! - `applied`: NONE or DUPLICATE_SEQUENCE_NUMBER delivers (DUPLICATE at no offset), a retriable
 //!   code sends the batch again, a refusal for good fails it: alone, its sequence the next batch's,
-//!   if it may not have been written; else with the producer fatal; a refusal of the sequence
-//!   (OUT_OF_ORDER_SEQUENCE_NUMBER) fails it with the producer fatal.
+//!   if it may not have been written; else with the producer fatal; a refusal with a code not
+//!   known to come before appending (`refused_before_append`) may have been written, so likewise;
+//!   a refusal of the sequence (OUT_OF_ORDER_SEQUENCE_NUMBER) fails it with the producer fatal.
 //!
 //! What the model leaves out: other partitions and brokers (each partition's batches are
 //! independent in the code: one in flight a partition), the producer id (fixed), leaders moving
@@ -74,6 +76,8 @@ enum Answer {
     RetriableWritten,
     /// a refusal of the batch for good (MESSAGE_TOO_LARGE and the like): not written
     Refused,
+    /// a refusal for good with a code not known to come before appending: written or not
+    Unknown,
     /// OUT_OF_ORDER_SEQUENCE_NUMBER: a sequence past the broker's next
     OutOfOrder,
 }
@@ -269,8 +273,9 @@ impl State {
             }),
             Some(Wire::Request) => {
                 // the broker reads it, as Kafka's idempotence keeps a producer's sequences, and
-                // answers as it wrote it, or with a retriable code it gives after appending
-                for after_append in [false, true] {
+                // answers as it wrote it, or with a retriable code it gives after appending, or
+                // with a refusal for good the producer does not know comes before appending
+                for then in [None, Some(Answer::RetriableWritten), Some(Answer::Unknown)] {
                     go(&mut out, &move |s: &mut State| {
                         let (msgs, seq) = (b.msgs.clone(), b.seq);
                         let answer = s.broker_reads(&msgs, seq);
@@ -279,7 +284,7 @@ impl State {
                             // its last: never past it, so its own requests never find a gap
                             return Err(format!("batch {msgs:?} at sequence {seq}: a gap, the broker at {}", s.b_next));
                         }
-                        let answer = if after_append { Answer::RetriableWritten } else { answer };
+                        let answer = then.unwrap_or(answer);
                         s.inflight.as_mut().unwrap().wire = Some(Wire::Answer(answer));
                         Ok(())
                     });
@@ -289,7 +294,7 @@ impl State {
                     go(&mut out, &|s| Ok(s.inflight.as_mut().unwrap().wire = Some(Wire::Answer(Answer::Duplicate))));
                 }
                 // ... or refuses it, unwritten, for now or for good (whatever it wrote before)
-                for a in [Answer::Retriable, Answer::Refused] {
+                for a in [Answer::Retriable, Answer::Refused, Answer::Unknown] {
                     go(&mut out, &move |s: &mut State| Ok(s.inflight.as_mut().unwrap().wire = Some(Wire::Answer(a))));
                 }
                 // ... or the request is lost (the connection dropped, the client timed out)
@@ -343,6 +348,14 @@ impl State {
                                 true => s.fatal = true,
                                 false => s.next_seq = b.seq,
                             }
+                        }
+                        // `refused_before_append` false: it may have been written
+                        Answer::Unknown => {
+                            let b = s.inflight.take().unwrap();
+                            for m in b.msgs {
+                                s.report(m, Outcome::Failed(true))?;
+                            }
+                            s.fatal = true;
                         }
                         Answer::OutOfOrder => {
                             let b = s.inflight.take().unwrap();
