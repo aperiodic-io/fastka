@@ -119,7 +119,7 @@ fn what_the_spec_writes_this_reads_in_every_codec() {
             ],
             "{codec}"
         );
-        assert_eq!(scan(&b), (Some(103), 3));
+        assert_eq!(scan(&b, true).unwrap(), (Some(103), 3));
     }
 }
 
@@ -145,11 +145,11 @@ fn a_batch_cut_short_is_left_for_the_next_fetch() {
     let two = at(written(ZSTD, &[Out { timestamp: 1, key: None, value: Some(b"w"), headers: &[] }; 3]), 12);
     let both = [one.clone(), two.clone()].concat();
     for cut in [one.len() + 1, one.len() + 11, one.len() + 12, both.len() - 1] {
-        assert_eq!(scan(&both[..cut]), (Some(12), 2), "cut at {cut}");
+        assert_eq!(scan(&both[..cut], true).unwrap(), (Some(12), 2), "cut at {cut}");
         assert_eq!(all(&both[..cut], &opts()).unwrap().len(), 2, "cut at {cut}");
     }
-    assert_eq!(scan(&both), (Some(15), 5));
-    assert_eq!(scan(&both[..5]), (None, 0), "not even a whole header");
+    assert_eq!(scan(&both, true).unwrap(), (Some(15), 5));
+    assert_eq!(scan(&both[..5], true).unwrap(), (None, 0), "not even a whole header");
 }
 
 /// A compressed batch comes whole, from its base offset: the records before the Fetch's offset
@@ -237,7 +237,7 @@ fn reading_committed_skips_aborted_transactions_as_kafka_does() {
     let committed = ReadOpts { committed: true, aborted: &aborted, ..opts() };
     assert_eq!(vals(&committed), [b"c1".to_vec(), b"plain".to_vec(), b"n1".to_vec()]);
     assert_eq!(vals(&opts()).len(), 5, "uncommitted: all but the markers");
-    assert_eq!(scan(&log).0, Some(8), "the markers' offsets are read past");
+    assert_eq!(scan(&log, true).unwrap().0, Some(8), "the markers' offsets are read past");
 }
 
 proptest::proptest! {
@@ -259,8 +259,8 @@ proptest::proptest! {
     /// No bytes make the reader panic, the CRC checked or not.
     #[test]
     fn no_bytes_panic(b in proptest::collection::vec(0u8..=255, 0..400), check in proptest::bool::ANY) {
-        let _ = all(&b, &ReadOpts { check_crcs: check, committed: true, aborted: &[(1, 0)], from: 0 });
-        let _ = scan(&b);
+        let _ = all(&b, &ReadOpts { check_crcs: check, committed: true, aborted: &[(1, 0)], from: 0, max_decompressed: 1 << 16 });
+        let _ = scan(&b, check);
     }
 
     /// A valid batch with any one byte changed, its CRC not checked, never panics either: the
@@ -321,7 +321,7 @@ fn an_empty_batch_is_read_past_and_a_short_one_refused() {
     let crc = crc32c::crc32c(&b[CRC_FROM..]);
     b[17..21].copy_from_slice(&crc.to_be_bytes());
     assert_eq!(all(&b, &opts()).unwrap(), []);
-    assert_eq!(scan(&b), (Some(1), 0), "the offset past it, no record");
+    assert_eq!(scan(&b, true).unwrap(), (Some(1), 0), "the offset past it, no record");
     for (magic, old) in [(0, true), (1, true), (2, false)] {
         let mut s = vec![0u8; 30];
         s[8..12].copy_from_slice(&18i32.to_be_bytes());
@@ -434,4 +434,86 @@ fn all_offsets(b: &[u8], o: &ReadOpts<'_>) -> Vec<i64> {
     let mut out = vec![];
     read(b, o, &mut vec![], |r| out.push(r.offset)).unwrap();
     out
+}
+
+/// A decompression bomb (a few KB of zstd from the broker, or any producer to the topic,
+/// gigabytes once decompressed) is refused at the most allowed, never held whole, in each codec.
+#[test]
+fn a_decompression_bomb_is_refused() {
+    let mut z = vec![];
+    zstd::stream::copy_encode(std::io::repeat(0).take(256 << 20), &mut z, 3).unwrap();
+    assert!(z.len() < 64 << 10, "{}", z.len());
+    let mut plain = vec![];
+    let e = decompress(ZSTD, &z, &mut plain, 1 << 20).unwrap_err();
+    assert!(e.contains("decompressed past 1048576 bytes") && plain.len() <= (1 << 20) + 1, "{e}: {}", plain.len());
+    let zeros = &vec![0u8; 2 << 20][..];
+    let xerial = {
+        let mut x = b"\x82SNAPPY\x00\x00\x00\x00\x01\x00\x00\x00\x01".to_vec();
+        for half in zeros.chunks(1 << 20) {
+            let block = snap::raw::Encoder::new().compress_vec(half).unwrap();
+            x.extend((block.len() as i32).to_be_bytes());
+            x.extend(block);
+        }
+        x
+    };
+    for codec in [GZIP, SNAPPY, LZ4, ZSTD] {
+        let mut c = vec![];
+        compress(codec, zeros, &mut c).unwrap();
+        let b = if codec == SNAPPY { xerial.clone() } else { c.clone() };
+        for b in [&c, &b] {
+            plain.clear();
+            assert!(decompress(codec, b, &mut plain, (2 << 20) - 1).is_err(), "{codec}");
+            assert!(plain.len() <= 2 << 20, "{codec}: {} held", plain.len());
+            plain.clear();
+            decompress(codec, b, &mut plain, 2 << 20).unwrap();
+            assert_eq!(plain, zeros, "{codec}: its most is allowed");
+        }
+    }
+    let b = written(LZ4, &[Out { timestamp: 1, key: None, value: Some(&[0; 1000]), headers: &[] }; 3]);
+    let e = all(&b, &ReadOpts { max_decompressed: 2000, ..opts() }).unwrap_err();
+    assert!(matches!(&e, Error::Protocol(m) if m.contains("decompressed past 2000")), "{e}");
+    assert_eq!(all(&b, &opts()).unwrap().len(), 3, "the default allows it");
+}
+
+/// A broker's base offset near i64::MAX, where base + delta overflows: refused, no panic.
+#[test]
+fn offsets_past_i64_are_refused() {
+    let b = at(written(NONE, &[Out { timestamp: 1, key: None, value: Some(b"v"), headers: &[] }; 3]), i64::MAX - 1);
+    assert!(matches!(scan(&b, false), Err(Error::Protocol(_))));
+    assert!(matches!(all(&b, &ReadOpts { check_crcs: false, ..opts() }), Err(Error::Protocol(_))));
+    let mut b = at(written(NONE, &[Out { timestamp: 1, key: None, value: Some(b"v"), headers: &[] }]), i64::MAX - 1);
+    assert_eq!(scan(&b, false).unwrap().0, Some(i64::MAX), "the last offset there is");
+    b[HEADER + 3] = 4; // the record's offset delta: 2 in zigzag, past i64's end
+    assert!(matches!(all(&b, &ReadOpts { check_crcs: false, ..opts() }), Err(Error::Protocol(_))));
+    // a timestamp past it is the broker's to give (Kafka's wraps): read as it is, no panic
+    let mut b = written(NONE, &[Out { timestamp: 0, key: None, value: Some(b"v"), headers: &[] }]);
+    b[27..35].copy_from_slice(&i64::MAX.to_be_bytes()); // base timestamp
+    b[HEADER + 2] = 2; // the record's timestamp delta: 1 in zigzag
+    assert_eq!(all(&b, &ReadOpts { check_crcs: false, ..opts() }).unwrap()[0].1, i64::MIN);
+}
+
+/// A record count that disagrees with the records (fewer: those after would be skipped once
+/// fetched past) or a record's offset outside the batch's range (given twice, or past where the
+/// next Fetch starts): refused, as Kafka's `DefaultRecordBatch` refuses them.
+#[test]
+fn a_batch_whose_count_or_offsets_disagree_is_refused() {
+    let b = written(NONE, &[Out { timestamp: 1, key: None, value: Some(b"v"), headers: &[] }; 2]);
+    let changed = |at: usize, v: i32| {
+        let mut c = b.clone();
+        c[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        let crc = crc32c::crc32c(&c[CRC_FROM..]);
+        c[17..21].copy_from_slice(&crc.to_be_bytes());
+        c
+    };
+    // the count (57), one record held past it; the last offset delta (23) below the last record's
+    for (at, v) in [(57, 1), (23, 0), (23, -1)] {
+        assert!(matches!(all(&changed(at, v), &opts()), Err(Error::Protocol(_))), "field at {at} = {v}");
+    }
+    // the second record's offset delta: 0, the first's again
+    let mut c = b.clone();
+    let second = HEADER + 1 + (c[HEADER] as usize >> 1);
+    assert_eq!(c[second + 3], 2, "1 in zigzag");
+    c[second + 3] = 0;
+    assert!(matches!(all(&c, &ReadOpts { check_crcs: false, ..opts() }), Err(Error::Protocol(_))));
+    assert_eq!(all(&changed(23, 5), &opts()).unwrap().len(), 2, "a gap after them (compaction) is a batch's");
 }

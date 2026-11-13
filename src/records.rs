@@ -9,7 +9,7 @@
 //! lengths as zigzag varints, -1 for null.
 use crate::error::{Error, Result};
 use crate::wire::{put_var, Cur, Put};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 
 /// The size of a batch's header, base offset to record count.
 pub const HEADER: usize = 61;
@@ -44,6 +44,7 @@ pub struct Batch<'a> {
 }
 
 impl Batch<'_> {
+    /// The offset after its last (`parse_header` checked it is one).
     pub fn next_offset(&self) -> i64 {
         self.base_offset + self.last_offset_delta as i64 + 1
     }
@@ -103,6 +104,12 @@ fn parse_header(all: &[u8]) -> Result<Batch<'_>> {
     c.i16()?; // epoch
     c.i32()?; // base sequence
     let count = c.i32()?;
+    // a broker's offsets, read as they are: past i64's end, `next_offset` would overflow
+    if base_offset < 0 || last_offset_delta < 0 || base_offset.checked_add(last_offset_delta as i64 + 1).is_none() {
+        return Err(Error::Protocol(format!(
+            "a record batch at offset {base_offset}, its last offset delta {last_offset_delta}"
+        )));
+    }
     Ok(Batch {
         base_offset,
         last_offset_delta,
@@ -119,15 +126,25 @@ fn parse_header(all: &[u8]) -> Result<Batch<'_>> {
 }
 
 /// The offset after the last whole batch of `records`, and the records they hold, from the
-/// batches' headers alone (the next Fetch is sent from there before these are parsed).
-pub fn scan(records: &[u8]) -> (Option<i64>, usize) {
+/// batches' headers alone (the next Fetch is sent from there before these are parsed), each
+/// batch's CRC checked if `check_crcs`: a Fetch is never sent from past a batch that may be
+/// refused once read.
+pub fn scan(records: &[u8], check_crcs: bool) -> Result<(Option<i64>, usize)> {
     let (mut next, mut count) = (None, 0);
     for b in batches(records) {
-        let Ok(b) = b else { break };
+        let b = b?;
+        check_crc(&b, check_crcs)?;
         next = Some(b.next_offset());
         count += b.count.max(0) as usize;
     }
-    (next, count)
+    Ok((next, count))
+}
+
+fn check_crc(b: &Batch<'_>, check: bool) -> Result<()> {
+    if check && crc32c::crc32c(b.checked) != b.crc {
+        return Err(Error::Protocol(format!("the record batch at offset {}: its CRC does not match", b.base_offset)));
+    }
+    Ok(())
 }
 
 /// A record, its key, value and headers where they lie (in the response, or in the batch's
@@ -165,13 +182,31 @@ impl<'a> Record<'a> {
 
 /// How a partition's records are read: at or after `from`, uncommitted or committed (then the
 /// aborted transactions of the Fetch's answer, (producer id, first offset), are skipped).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ReadOpts<'a> {
     pub from: i64,
     pub committed: bool,
     pub aborted: &'a [(i64, i64)],
     /// a batch whose CRC-32C does not match is refused (`check.crcs`, on by default here)
     pub check_crcs: bool,
+    /// the most a batch's records may decompress to: a few KB of zstd from any producer to the
+    /// topic can be gigabytes (`DEFAULT_MAX_DECOMPRESSED` by default)
+    pub max_decompressed: usize,
+}
+
+/// `ReadOpts::max_decompressed`'s default, `receive.message.max.bytes`'s.
+pub const DEFAULT_MAX_DECOMPRESSED: usize = 100_000_000;
+
+impl Default for ReadOpts<'_> {
+    fn default() -> Self {
+        ReadOpts {
+            from: 0,
+            committed: false,
+            aborted: &[],
+            check_crcs: false,
+            max_decompressed: DEFAULT_MAX_DECOMPRESSED,
+        }
+    }
 }
 
 /// Every record of `records`' whole batches at or after `o.from`, to `f`; control batches and,
@@ -183,12 +218,7 @@ pub fn read(records: &[u8], o: &ReadOpts<'_>, plain: &mut Vec<u8>, mut f: impl F
     let mut aborting: Vec<i64> = vec![];
     for b in batches(records) {
         let b = b?;
-        if o.check_crcs && crc32c::crc32c(b.checked) != b.crc {
-            return Err(Error::Protocol(format!(
-                "the record batch at offset {}: its CRC does not match",
-                b.base_offset
-            )));
-        }
+        check_crc(&b, o.check_crcs)?;
         if o.committed && b.producer_id >= 0 {
             // the aborted transactions begun by the batch's last offset
             while aborted.last().is_some_and(|a| a.1 < b.next_offset()) {
@@ -196,7 +226,7 @@ pub fn read(records: &[u8], o: &ReadOpts<'_>, plain: &mut Vec<u8>, mut f: impl F
                 aborting.push(pid);
             }
             if b.control() {
-                if is_abort_marker(&b, plain)? {
+                if is_abort_marker(&b, plain, o.max_decompressed)? {
                     aborting.retain(|p| *p != b.producer_id);
                 }
                 continue;
@@ -208,14 +238,21 @@ pub fn read(records: &[u8], o: &ReadOpts<'_>, plain: &mut Vec<u8>, mut f: impl F
         if b.control() {
             continue; // a transaction's marker, read uncommitted
         }
-        let body = decompressed(&b, plain)?;
+        let body = decompressed(&b, plain, o.max_decompressed)?;
         let mut c = Cur::new(body);
+        let mut after = 0; // the least offset delta the next record may have
         for _ in 0..b.count.max(0) {
             let len = c.var()?;
             let mut r = Cur::new(c.take(usize::try_from(len).map_err(|_| bad(&b, "a record's length"))?)?);
             r.i8()?; // attributes
             let ts_delta = r.var()?;
-            let offset = b.base_offset + r.var()?;
+            // in the batch's range and rising, or what `scan` fetched past is not what is read
+            let delta = r.var()?;
+            if delta < after || delta > b.last_offset_delta as i64 {
+                return Err(bad(&b, "a record's offset delta"));
+            }
+            after = delta + 1;
+            let offset = b.base_offset + delta; // at most `next_offset`'s, checked
             let key = nullable(&mut r, &b)?;
             let value = nullable(&mut r, &b)?;
             let header_count = usize::try_from(r.var()?).map_err(|_| bad(&b, "a header count"))?;
@@ -229,9 +266,16 @@ pub fn read(records: &[u8], o: &ReadOpts<'_>, plain: &mut Vec<u8>, mut f: impl F
             if offset < o.from {
                 continue; // before the Fetch's offset (a compressed batch comes whole)
             }
-            let timestamp =
-                if b.attributes & LOG_APPEND_TIME != 0 { b.max_timestamp } else { b.base_timestamp + ts_delta };
+            let timestamp = if b.attributes & LOG_APPEND_TIME != 0 {
+                b.max_timestamp
+            } else {
+                b.base_timestamp.wrapping_add(ts_delta)
+            };
             f(Record { offset, timestamp, key, value, headers, header_count });
+        }
+        if c.left() > 0 {
+            // as Kafka's `DefaultRecordBatch` refuses it: records past the count would be skipped
+            return Err(bad(&b, "the record count"));
         }
     }
     Ok(())
@@ -249,8 +293,8 @@ fn nullable<'a>(r: &mut Cur<'a>, b: &Batch<'_>) -> Result<Option<&'a [u8]>> {
 }
 
 /// A control batch's marker: its one record's key is (version, type), type 0 an abort.
-fn is_abort_marker(b: &Batch<'_>, plain: &mut Vec<u8>) -> Result<bool> {
-    let body = decompressed(b, plain)?;
+fn is_abort_marker(b: &Batch<'_>, plain: &mut Vec<u8>, max: usize) -> Result<bool> {
+    let body = decompressed(b, plain, max)?;
     let mut c = Cur::new(body);
     if b.count < 1 {
         return Ok(false);
@@ -267,39 +311,83 @@ fn is_abort_marker(b: &Batch<'_>, plain: &mut Vec<u8>) -> Result<bool> {
 }
 
 /// The batch's records, decompressed into `plain` if they are compressed.
-fn decompressed<'r: 'p, 'p>(b: &Batch<'r>, plain: &'p mut Vec<u8>) -> Result<&'p [u8]> {
+fn decompressed<'r: 'p, 'p>(b: &Batch<'r>, plain: &'p mut Vec<u8>, max: usize) -> Result<&'p [u8]> {
     if b.codec() == NONE {
         return Ok(b.records);
     }
     plain.clear();
-    decompress(b.codec(), b.records, plain).map_err(|e| {
+    decompress(b.codec(), b.records, plain, max).map_err(|e| {
         Error::Protocol(format!("the record batch at offset {}, codec {}: {e}", b.base_offset, b.codec()))
     })?;
     Ok(plain)
 }
 
-/// Records compressed by `codec` (1 gzip, 2 snappy, 3 lz4, 4 zstd), into `out`.
-pub fn decompress(codec: i16, b: &[u8], out: &mut Vec<u8>) -> std::result::Result<(), String> {
+/// Records compressed by `codec` (1 gzip, 2 snappy, 3 lz4, 4 zstd), appended to `out`, no more
+/// than `max` bytes of them: past it, an error (a decompression bomb).
+pub fn decompress(codec: i16, b: &[u8], out: &mut Vec<u8>, max: usize) -> std::result::Result<(), String> {
     let e = |e: &dyn std::fmt::Display| e.to_string();
+    let (from, over) = (out.len(), || format!("decompressed past {max} bytes"));
+    let snappy = |block: &[u8], out: &mut Vec<u8>| {
+        let n = snap::raw::decompress_len(block).map_err(|x| e(&x))?;
+        if out.len() - from + n > max {
+            return Err(over());
+        }
+        out.extend(snap::raw::Decoder::new().decompress_vec(block).map_err(|x| e(&x))?);
+        Ok(())
+    };
     match codec {
-        GZIP => drop(flate2::read::MultiGzDecoder::new(b).read_to_end(out).map_err(|x| e(&x))?),
+        // one byte past the most read: more is an error, not a cut
+        GZIP => drop(flate2::read::MultiGzDecoder::new(b).take(max as u64 + 1).read_to_end(out).map_err(|x| e(&x))?),
         // Java's producers frame snappy as xerial's snappy-java does: a magic, then blocks
         SNAPPY if b.starts_with(b"\x82SNAPPY\x00") => {
             let mut c = Cur::new(b);
             c.take(16).map_err(|x| e(&x))?; // magic, version, compatible version
-            let mut d = snap::raw::Decoder::new();
             while c.left() > 0 {
                 let n = c.i32().map_err(|x| e(&x))?;
-                let block = c.take(usize::try_from(n).map_err(|_| "a snappy block's length")?).map_err(|x| e(&x))?;
-                out.extend(d.decompress_vec(block).map_err(|x| e(&x))?);
+                snappy(c.take(usize::try_from(n).map_err(|_| "a snappy block's length")?).map_err(|x| e(&x))?, out)?;
             }
         }
-        SNAPPY => out.extend(snap::raw::Decoder::new().decompress_vec(b).map_err(|x| e(&x))?),
-        LZ4 => drop(lz4_flex::frame::FrameDecoder::new(b).read_to_end(out).map_err(|x| e(&x))?),
-        ZSTD => zstd::stream::copy_decode(b, &mut *out).map_err(|x| e(&x))?,
+        SNAPPY => snappy(b, out)?,
+        // each block as it is decompressed, into `out` (`Read::take` costs a copy of each, and
+        // reads zstd's in small pieces)
+        LZ4 => {
+            let (mut d, mut w) = (lz4_flex::frame::FrameDecoder::new(b), Most { out, left: max, max });
+            loop {
+                let block = d.fill_buf().map_err(|x| e(&x))?;
+                let n = block.len();
+                if n == 0 {
+                    break;
+                }
+                w.write_all(block).map_err(|x| e(&x))?;
+                d.consume(n);
+            }
+        }
+        ZSTD => zstd::stream::copy_decode(b, Most { out, left: max, max }).map_err(|x| e(&x))?,
         c => return Err(format!("compression {c}: not one Kafka writes")),
     }
+    if out.len() - from > max {
+        return Err(over());
+    }
     Ok(())
+}
+
+/// A `Write` into `out` of `max` bytes at most (`left` of them left): past it, an error.
+struct Most<'a> {
+    out: &'a mut Vec<u8>,
+    left: usize,
+    max: usize,
+}
+
+impl Write for Most<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let over = || std::io::Error::other(format!("decompressed past {} bytes", self.max));
+        self.left = self.left.checked_sub(b.len()).ok_or_else(over)?;
+        self.out.extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// `plain` compressed by `codec` into `out`, as Kafka's own producer writes each (snappy raw,

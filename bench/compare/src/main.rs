@@ -119,15 +119,14 @@ fn fastka_produce(a: &Args) -> usize {
 }
 
 fn fastka_consume(a: &Args) -> usize {
-    use fastka::consumer::{Consumer, Offset, Polled};
+    use fastka::consumer::{Assignment, Consumer, Offset, Polled};
     let cfg = fastka_cfg(a);
-    let client = std::sync::Arc::new(fastka::client::Client::new(&cfg).unwrap());
-    let assign = (0..a.partitions).map(|p| (a.topic.clone(), p, Offset::Beginning, false)).collect();
-    let mut k = Consumer::new(client, cfg.consumer().unwrap(), assign, false);
+    let assign = (0..a.partitions).map(|p| Assignment::new(a.topic.as_str(), p, Offset::Beginning)).collect();
+    let mut k = Consumer::from_config(&cfg, assign).unwrap();
     let (mut n, mut bytes) = (0, 0);
     let until = Instant::now() + T;
     while n < a.n && Instant::now() < until {
-        match k.next_event(Duration::from_millis(100), &mut |w| eprintln!("lost: {w}")).unwrap() {
+        match k.next_event(Duration::from_millis(100), &mut |n| eprintln!("notice: {n}")).unwrap() {
             Some((_, Polled::Msg(m))) => {
                 bytes += m.value.map_or(0, |v| v.len());
                 n += 1;

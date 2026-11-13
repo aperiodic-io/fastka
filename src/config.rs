@@ -159,7 +159,9 @@ pub enum Reset {
     Error,
 }
 
+/// A consumer's settings, made by `Config::consumer`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ConsumerSettings {
     pub group: Option<String>,
     pub reset: Reset,
