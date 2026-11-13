@@ -1,0 +1,94 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+  schedule: [{ cron: "17 3 * * *" }] # nightly: longer fuzzing and stress
+permissions: { contents: read }
+concurrency: { group: "${{ github.workflow }}-${{ github.ref }}", cancel-in-progress: true }
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+      - run: cargo publish --dry-run --allow-dirty
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # unit tests against an in-process broker that drops, stalls, moves leaders, refuses and
+      # corrupts; the protocol checked against kafka-protocol; the producer's exhaustive model
+      - run: cargo test
+      - run: cargo test --release --test produce_model
+
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install "$(grep -oP '^rust-version = "\K[^"]+' Cargo.toml)" --profile minimal
+      - run: cargo +"$(grep -oP '^rust-version = "\K[^"]+' Cargo.toml)" check --lib
+
+  brokers:
+    # Redpanda; rpk (franz-go) both ways in every codec; Apache Kafka 4.1; Redpanda with SASL/SCRAM
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/brokers.sh | tee -a "$GITHUB_ENV.sh" && sed 's/^export //; s/ /\n/g' "$GITHUB_ENV.sh" >> "$GITHUB_ENV"
+      - run: cargo test --test brokers -- --nocapture
+      - if: failure()
+        run: for c in fastka-rp fastka-apache fastka-sasl; do docker logs $c 2>&1 | tail -30; done
+
+  stress:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "stress" }
+      - run: STRESS_SECS=${{ github.event_name == 'schedule' && 900 || 90 }} STRESS_SEED=${{ github.run_id }} stress/run.sh
+
+  kani:
+    # the decoders' properties proved for every input up to their bounds (src/proofs.rs)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: model-checking/kani-github-action@v1
+        with: { args: "--output-format terse" }
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    strategy: { matrix: { target: [kafka_responses, kafka_records] } }
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal && cargo +nightly install cargo-fuzz --locked
+      - run: cd fuzz && cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${{ github.event_name == 'schedule' && 1800 || 120 }} -rss_limit_mb=2048
+
+  gate:
+    # instruction counts of the hot paths (benches/gate.rs) against the base branch's, same runner
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get install -y valgrind
+      - name: head
+        run: cp "$(cargo bench --bench gate --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "gate") | .executable')" /tmp/gate-head
+      - name: base
+        run: |
+          git worktree add /tmp/base "${{ github.event.pull_request.base.sha }}"
+          if [ -f /tmp/base/benches/gate.rs ]; then
+            (cd /tmp/base && cp "$(cargo bench --bench gate --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "gate") | .executable')" /tmp/gate-base)
+          fi
+      - run: |
+          if [ -f /tmp/gate-base ]; then bench/gate/gate.py /tmp/gate-head --base /tmp/gate-base
+          else bench/gate/gate.py /tmp/gate-head; fi

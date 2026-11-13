@@ -9,6 +9,8 @@ pub mod records;
 pub mod sasl;
 #[cfg(test)]
 mod testkit;
+#[cfg(kani)]
+mod proofs;
 mod tls;
 pub mod wire;
 
