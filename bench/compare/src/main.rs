@@ -103,7 +103,7 @@ fn fastka_produce(a: &Args) -> usize {
     for i in 0..a.n {
         let v = value(i, a.size);
         loop {
-            match p.send(&a.topic, &v, &[], ()) {
+            match p.send(fastka::producer::Record::to(&a.topic).value(&v), ()) {
                 Ok(()) => break,
                 Err((fastka::Error::QueueFull, ())) => drop(p.poll(Duration::from_millis(1))),
                 Err((e, _)) => panic!("{e}"),

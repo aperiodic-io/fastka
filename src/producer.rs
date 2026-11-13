@@ -19,8 +19,63 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
+/// A message to send: its topic, and what the builder gives it (by default no key, no value, a
+/// partition the producer picks, the time it is sent, no headers).
+#[derive(Clone, Copy, Debug)]
+pub struct Record<'a> {
+    topic: &'a str,
+    key: Option<&'a [u8]>,
+    value: Option<&'a [u8]>,
+    partition: Option<i32>,
+    timestamp: Option<i64>,
+    headers: &'a [(String, Option<Vec<u8>>)],
+}
+
+impl<'a> Record<'a> {
+    /// A record to `topic`: no value (a tombstone) until one is given.
+    pub fn to(topic: &'a str) -> Self {
+        Record { topic, key: None, value: None, partition: None, timestamp: None, headers: &[] }
+    }
+
+    pub fn value(self, v: &'a [u8]) -> Self {
+        Record { value: Some(v), ..self }
+    }
+
+    /// Its key: without a partition, the partition is the key's (as Java's default partitioner
+    /// picks it: murmur2 of the key, modulo the partitions).
+    pub fn key(self, k: &'a [u8]) -> Self {
+        Record { key: Some(k), ..self }
+    }
+
+    /// Its partition: one the topic has not fails it (UNKNOWN_TOPIC_OR_PARTITION).
+    pub fn partition(self, p: i32) -> Self {
+        Record { partition: Some(p), ..self }
+    }
+
+    /// Its timestamp (CreateTime, ms since the epoch), rather than when it is sent.
+    pub fn timestamp(self, ms: i64) -> Self {
+        Record { timestamp: Some(ms), ..self }
+    }
+
+    pub fn headers(self, h: &'a [(String, Option<Vec<u8>>)]) -> Self {
+        Record { headers: h, ..self }
+    }
+}
+
+/// Whether a message is on the broker's log (librdkafka's message status).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Persisted {
+    /// not written: never sent, or refused
+    No,
+    /// it may be: sent, its answer never had (a timeout, a connection lost)
+    Possibly,
+    /// written: the broker said so
+    Yes,
+}
+
 /// A message's outcome, to `Deliveries::delivery`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Delivery<'a> {
     pub topic: &'a str,
     /// None: never given a partition
@@ -28,6 +83,7 @@ pub struct Delivery<'a> {
     /// None: not delivered, or delivered at an offset the broker did not say
     pub offset: Option<i64>,
     pub error: Option<&'a Error>,
+    pub persisted: Persisted,
 }
 
 /// What hears the deliveries (librdkafka's delivery report callback).
@@ -37,23 +93,27 @@ pub trait Deliveries: Send + Sync + 'static {
 }
 
 struct Pending<O> {
-    value: Vec<u8>,
+    key: Option<Vec<u8>>,
+    value: Option<Vec<u8>>,
     headers: Vec<(String, Option<Vec<u8>>)>,
     timestamp: i64,
+    /// the partition the application named, if it named one
+    partition: Option<i32>,
     opaque: O,
     deadline: Instant,
     enqueued: Instant,
 }
 
-/// What a message counts for against `queue.buffering.max.kbytes`: its value and headers, and a
-/// record's overhead.
-fn size_of(value: &[u8], headers: &[(String, Option<Vec<u8>>)]) -> usize {
-    value.len() + headers.iter().map(|(k, v)| k.len() + v.as_ref().map_or(0, Vec::len)).sum::<usize>() + 16
+/// What a message counts for against `queue.buffering.max.kbytes`: its key, value and headers,
+/// and a record's overhead.
+fn size_of(key: Option<&[u8]>, value: Option<&[u8]>, headers: &[(String, Option<Vec<u8>>)]) -> usize {
+    let hs = headers.iter().map(|(k, v)| k.len() + v.as_ref().map_or(0, Vec::len)).sum::<usize>();
+    key.map_or(0, <[u8]>::len) + value.map_or(0, <[u8]>::len) + hs + 16
 }
 
 impl<O> Pending<O> {
     fn size(&self) -> usize {
-        size_of(&self.value, &self.headers)
+        size_of(self.key.as_deref(), self.value.as_deref(), &self.headers)
     }
 }
 
@@ -85,8 +145,9 @@ struct Topic<O> {
     missing: Option<Code>,
 }
 
-/// An outcome for `poll` to hand over: topic, partition, offset, error, the message's opaque.
-type Report<O> = (String, Option<i32>, Option<i64>, Option<Error>, O);
+/// An outcome for `poll` to hand over: topic, partition, offset, error, whether it is on the log,
+/// the message's opaque.
+type Report<O> = (String, Option<i32>, Option<i64>, Option<Error>, Persisted, O);
 
 struct State<O> {
     topics: HashMap<String, Topic<O>>,
@@ -177,17 +238,11 @@ impl<C: Deliveries> Producer<C> {
         &self.shared.client
     }
 
-    /// Queues `value` (with `headers`) for `topic`, to a partition this producer picks (no key);
-    /// its outcome to `delivery` with `opaque`. QueueFull: the queue is at its bound
-    /// (`queue.buffering.max.messages`, `.kbytes`): `poll` and send it again. Fatal: the producer
-    /// can deliver nothing more.
-    pub fn send(
-        &self,
-        topic: &str,
-        value: &[u8],
-        headers: &[(String, Option<Vec<u8>>)],
-        opaque: C::Opaque,
-    ) -> std::result::Result<(), (Error, C::Opaque)> {
+    /// Queues `r` for its topic, to its partition (the one it names, its key's, or for a record of
+    /// neither one this producer picks); its outcome to `delivery` with `opaque`. QueueFull: the
+    /// queue is at its bound (`queue.buffering.max.messages`, `.kbytes`): `poll` and send it again.
+    /// Fatal: the producer can deliver nothing more.
+    pub fn send(&self, r: Record<'_>, opaque: C::Opaque) -> std::result::Result<(), (Error, C::Opaque)> {
         let sh = &*self.shared;
         let mut guard = sh.lock();
         let st = &mut *guard;
@@ -197,7 +252,7 @@ impl<C: Deliveries> Producer<C> {
         if st.closing {
             return Err((Error::Transport("the producer is closing".into()), opaque));
         }
-        let size = size_of(value, headers);
+        let size = size_of(r.key, r.value, r.headers);
         if st.queued >= sh.s.queue_messages || st.queued_bytes + size > sh.s.queue_bytes {
             return Err((Error::QueueFull, opaque));
         }
@@ -206,9 +261,11 @@ impl<C: Deliveries> Producer<C> {
         }
         let now = Instant::now();
         let p = Pending {
-            value: value.to_vec(),
-            headers: headers.to_vec(),
-            timestamp: now_ms(),
+            key: r.key.map(<[u8]>::to_vec),
+            value: r.value.map(<[u8]>::to_vec),
+            headers: r.headers.to_vec(),
+            timestamp: r.timestamp.unwrap_or_else(now_ms),
+            partition: r.partition,
             opaque,
             deadline: now + sh.s.message_timeout,
             enqueued: now,
@@ -216,7 +273,7 @@ impl<C: Deliveries> Producer<C> {
         st.outstanding += 1;
         st.queued += 1;
         st.queued_bytes += size;
-        let t = st.topics.entry(topic.to_string()).or_insert_with(|| Topic {
+        let t = st.topics.entry(r.topic.to_string()).or_insert_with(|| Topic {
             partitions: vec![],
             sticky: 0,
             unassigned: VecDeque::new(),
@@ -226,18 +283,26 @@ impl<C: Deliveries> Producer<C> {
         // the threads woken only when something is due sooner than they wait for: a partition's
         // first message (its linger starts), a batch filled, a topic to look up
         let mut wake = true;
-        match t.partitions.get(t.sticky) {
-            Some(&part) => {
+        let sticky = r.partition.is_none() && r.key.is_none();
+        match t.route(r.partition, r.key) {
+            Ok(Some(part)) => {
                 let q = &mut t.parts.get_mut(&part).expect("a partition of the topic").queue;
                 q.push_back(p);
-                wake = q.len() == 1 || q.len().is_multiple_of(sh.s.batch_messages);
-                // a batch's worth on this partition: the next go to another (KIP-480's sticky
-                // partitioner, as librdkafka's)
-                if q.len().is_multiple_of(sh.s.batch_messages) {
+                wake = q.len() == 1 || q.len() % sh.s.batch_messages == 0;
+                // a batch's worth on this partition: the next keyless go to another (KIP-480's
+                // sticky partitioner, as librdkafka's)
+                if sticky && q.len() % sh.s.batch_messages == 0 {
                     t.rotate(xorshift(&mut st.rng));
                 }
             }
-            None => t.unassigned.push_back(p), // a topic without partitions is looked up
+            Ok(None) => t.unassigned.push_back(p), // a topic without partitions is looked up
+            Err(()) => {
+                let e = Error::Broker(Code::UNKNOWN_TOPIC_OR_PARTITION, format!("{}/{:?}", r.topic, r.partition));
+                st.report(r.topic, r.partition, None, Some(e), Persisted::No, p);
+                drop(guard);
+                sh.reported.notify_all();
+                return Ok(());
+            }
         }
         drop(guard);
         if wake {
@@ -266,8 +331,8 @@ impl<C: Deliveries> Producer<C> {
         let ready: Vec<_> = st.reports.drain(..).collect();
         drop(st);
         let n = ready.len();
-        for (topic, partition, offset, error, opaque) in ready {
-            sh.ctx.delivery(&Delivery { topic: &topic, partition, offset, error: error.as_ref() }, opaque);
+        for (topic, partition, offset, error, persisted, opaque) in ready {
+            sh.ctx.delivery(&Delivery { topic: &topic, partition, offset, error: error.as_ref(), persisted }, opaque);
             sh.lock().outstanding -= 1;
         }
         n
@@ -303,7 +368,7 @@ impl<C: Deliveries> Producer<C> {
             for (partition, p) in gone {
                 st.queued -= 1;
                 st.queued_bytes -= p.size();
-                st.reports.push_back((name.clone(), partition, None, Some(Error::Purged), p.opaque));
+                st.reports.push_back((name.clone(), partition, None, Some(Error::Purged), Persisted::No, p.opaque));
             }
         }
         self.shared.reported.notify_all();
@@ -337,11 +402,12 @@ impl<O> State<O> {
         partition: Option<i32>,
         offset: Option<i64>,
         error: Option<Error>,
+        persisted: Persisted,
         p: Pending<O>,
     ) {
         self.queued -= 1;
         self.queued_bytes -= p.size();
-        self.reports.push_back((topic.to_string(), partition, offset, error, p.opaque));
+        self.reports.push_back((topic.to_string(), partition, offset, error, persisted, p.opaque));
     }
 
     fn set_fatal(&mut self, code: Code, why: String) {
@@ -360,7 +426,44 @@ fn xorshift(rng: &mut u64) -> u64 {
     *rng
 }
 
+/// Kafka's `Utils.murmur2`, which Java's default partitioner picks a key's partition with.
+fn murmur2(data: &[u8]) -> i32 {
+    const M: u32 = 0x5bd1e995;
+    let mut h = 0x9747b28c_u32 ^ data.len() as u32;
+    let mut chunks = data.chunks_exact(4);
+    for c in &mut chunks {
+        let mut k = u32::from_le_bytes([c[0], c[1], c[2], c[3]]).wrapping_mul(M);
+        k ^= k >> 24;
+        h = h.wrapping_mul(M) ^ k.wrapping_mul(M);
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        for (i, b) in rest.iter().enumerate() {
+            h ^= (*b as u32) << (8 * i);
+        }
+        h = h.wrapping_mul(M);
+    }
+    h ^= h >> 13;
+    h = h.wrapping_mul(M);
+    (h ^ (h >> 15)) as i32
+}
+
 impl<O> Topic<O> {
+    /// Where a message goes: its partition, none yet (the topic's partitions not known), or none
+    /// at all (a partition the topic has not).
+    fn route(&self, partition: Option<i32>, key: Option<&[u8]>) -> std::result::Result<Option<i32>, ()> {
+        let n = self.partitions.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        match (partition, key) {
+            (Some(p), _) => self.partitions.binary_search(&p).map(|_| Some(p)).map_err(drop),
+            // Java's default partitioner: every partition, led or not
+            (None, Some(k)) => Ok(Some(self.partitions[(murmur2(k) & 0x7fffffff) as usize % n])),
+            (None, None) => Ok(Some(self.partitions[self.sticky])),
+        }
+    }
+
     /// Keyless messages go to another partition from now on (`r` picks which), if there is one.
     fn rotate(&mut self, r: u64) {
         let n = self.partitions.len();
@@ -453,7 +556,7 @@ fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
     for b in &md.brokers {
         st.brokers.insert(b.id, format!("{}:{}", b.host, b.port));
     }
-    let mut new_leaders = vec![];
+    let (mut new_leaders, mut gone) = (vec![], vec![]);
     for (name, t) in st.topics.iter_mut() {
         let Some(m) = md.topic(name) else { continue };
         if m.error != Code::NONE {
@@ -479,16 +582,31 @@ fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
                 new_leaders.push(p.leader);
             }
         }
-        // what was sent before the topic's partitions were known: a batch's worth a partition
-        while !t.unassigned.is_empty() && !t.partitions.is_empty() {
-            let part = t.partitions[t.sticky % t.partitions.len()];
-            let n = t.unassigned.len().min(sh.s.batch_messages);
-            let moved: Vec<_> = t.unassigned.drain(..n).collect();
-            t.parts.get_mut(&part).expect("a partition").queue.extend(moved);
-            if n == sh.s.batch_messages {
-                t.rotate(xorshift(&mut st.rng));
+        // what was sent before the topic's partitions were known, each to its partition; the
+        // keyless a batch's worth a partition
+        if t.partitions.is_empty() {
+            continue;
+        }
+        let mut keyless = 0;
+        for p in std::mem::take(&mut t.unassigned) {
+            let sticky = p.partition.is_none() && p.key.is_none();
+            match t.route(p.partition, p.key.as_deref()) {
+                Ok(Some(part)) => {
+                    t.parts.get_mut(&part).expect("a partition").queue.push_back(p);
+                    keyless += sticky as usize;
+                    if sticky && keyless % sh.s.batch_messages == 0 {
+                        t.rotate(xorshift(&mut st.rng));
+                    }
+                }
+                _ => {
+                    let e = Error::Broker(Code::UNKNOWN_TOPIC_OR_PARTITION, format!("{name}/{:?}", p.partition));
+                    gone.push((name.clone(), p.partition, e, p));
+                }
             }
         }
+    }
+    for (t, p, e, m) in gone {
+        st.report(&t, p, None, Some(e), Persisted::No, m);
     }
     for id in new_leaders {
         st.threads.push(id);
@@ -514,22 +632,24 @@ fn expire<O>(st: &mut State<O>, now: Instant) {
             None => Error::MessageTimedOut,
         };
         while t.unassigned.front().is_some_and(|p| p.deadline <= now) {
-            gone.push((name.clone(), None, why(), t.unassigned.pop_front().expect("one")));
+            gone.push((name.clone(), None, why(), Persisted::No, t.unassigned.pop_front().expect("one")));
         }
         for (id, part) in t.parts.iter_mut() {
             while part.queue.front().is_some_and(|p| p.deadline <= now) {
-                gone.push((name.clone(), Some(*id), Error::MessageTimedOut, part.queue.pop_front().expect("one")));
+                let p = part.queue.pop_front().expect("one");
+                gone.push((name.clone(), Some(*id), Error::MessageTimedOut, Persisted::No, p));
             }
             let timed_out = part.inflight.as_ref().is_some_and(|s| !s.sending && s.msgs[0].deadline <= now);
             if timed_out {
                 let s = part.inflight.take().expect("in flight");
                 gap = Some(format!("{name}/{id}: a batch timed out in flight (message.timeout.ms)"));
-                gone.extend(s.msgs.into_iter().map(|p| (name.clone(), Some(*id), Error::MessageTimedOut, p)));
+                let lost = |p| (name.clone(), Some(*id), Error::MessageTimedOut, Persisted::Possibly, p);
+                gone.extend(s.msgs.into_iter().map(lost));
             }
         }
     }
-    for (t, p, e, m) in gone {
-        st.report(&t, p, None, Some(e), m);
+    for (t, p, e, persisted, m) in gone {
+        st.report(&t, p, None, Some(e), persisted, m);
     }
     if let Some(why) = gap {
         st.set_fatal(Code::MSG_TIMED_OUT, why);
@@ -540,16 +660,17 @@ fn fail_queued<O>(st: &mut State<O>) {
     let (c, m) = st.fatal.clone().expect("fatal");
     let mut gone = vec![];
     for (name, t) in st.topics.iter_mut() {
-        gone.extend(t.unassigned.drain(..).map(|p| (name.clone(), None, p)));
+        gone.extend(t.unassigned.drain(..).map(|p| (name.clone(), None, Persisted::No, p)));
         for (id, part) in t.parts.iter_mut() {
-            gone.extend(part.queue.drain(..).map(|p| (name.clone(), Some(*id), p)));
+            gone.extend(part.queue.drain(..).map(|p| (name.clone(), Some(*id), Persisted::No, p)));
             if part.inflight.as_ref().is_some_and(|s| !s.sending) {
-                gone.extend(part.inflight.take().expect("one").msgs.into_iter().map(|p| (name.clone(), Some(*id), p)));
+                let lost = |p| (name.clone(), Some(*id), Persisted::Possibly, p);
+                gone.extend(part.inflight.take().expect("one").msgs.into_iter().map(lost));
             }
         }
     }
-    for (t, p, msg) in gone {
-        st.report(&t, p, None, Some(Error::Fatal(c, m.clone())), msg);
+    for (t, p, persisted, msg) in gone {
+        st.report(&t, p, None, Some(Error::Fatal(c, m.clone())), persisted, msg);
     }
 }
 
@@ -613,7 +734,7 @@ fn take_due<C: Deliveries>(
             }
             // full: a message left for the next batch, as many as a batch takes, or no room for
             // even an empty record (`size_of`)
-            let full = n < part.queue.len() || n == s.batch_messages || bytes + size_of(&[], &[]) > limit;
+            let full = n < part.queue.len() || n == s.batch_messages || bytes + size_of(None, None, &[]) > limit;
             if ready > now && !full {
                 next = Some(next.map_or(ready, |x| x.min(ready)));
                 continue; // lingering: more may join the batch
@@ -621,7 +742,12 @@ fn take_due<C: Deliveries>(
             let msgs: Vec<_> = part.queue.drain(..n).collect();
             let outs: Vec<Out<'_>> = msgs
                 .iter()
-                .map(|p| Out { timestamp: p.timestamp, key: None, value: Some(&p.value), headers: &p.headers })
+                .map(|p| Out {
+                    timestamp: p.timestamp,
+                    key: p.key.as_deref(),
+                    value: p.value.as_deref(),
+                    headers: &p.headers,
+                })
                 .collect();
             let mut b = vec![];
             let written = records::write(
@@ -647,7 +773,7 @@ fn take_due<C: Deliveries>(
     }
     for (name, pnum, msgs, e) in failed {
         for m in msgs {
-            st.report(&name, Some(pnum), None, Some(e.clone()), m);
+            st.report(&name, Some(pnum), None, Some(e.clone()), Persisted::No, m);
         }
     }
     // the next keyless messages go to another partition: a partition a batch (librdkafka's sticky
@@ -792,13 +918,13 @@ fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Reque
         match r {
             Ok(base) => {
                 for (i, m) in msgs.into_iter().enumerate() {
-                    st.report(&t, Some(p), base.map(|b| b + i as i64), None, m);
+                    st.report(&t, Some(p), base.map(|b| b + i as i64), None, Persisted::Yes, m);
                 }
             }
             Err((c, why)) => {
                 // refused for good: the broker's sequence for the partition has a gap now
                 for m in msgs {
-                    st.report(&t, Some(p), None, Some(Error::Broker(c, why.clone())), m);
+                    st.report(&t, Some(p), None, Some(Error::Broker(c, why.clone())), Persisted::No, m);
                 }
                 st.set_fatal(
                     c,
