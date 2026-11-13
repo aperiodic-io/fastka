@@ -60,6 +60,7 @@ jobs:
   kani:
     # the decoders' properties proved for every input up to their bounds (src/proofs.rs)
     runs-on: ubuntu-24.04
+    env: { RUSTFLAGS: "--cap-lints=warn" } # Kani's macros trip -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: model-checking/kani-github-action@v1
@@ -74,8 +75,10 @@ jobs:
       - run: cd fuzz && cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${{ github.event_name == 'schedule' && 1800 || 120 }} -rss_limit_mb=2048
 
   gate:
-    # instruction counts of the hot paths (benches/gate.rs) against the base branch's, same runner
-    if: github.event_name == 'pull_request'
+    # instruction counts of the hot paths (benches/gate.rs) against the base's, built on the same
+    # runner (the codecs and CRC pick their CPU's instructions at run time: counts are per machine).
+    # The base: a PR's base branch, a push's previous head
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -86,10 +89,11 @@ jobs:
         run: cp "$(cargo bench --bench gate --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "gate") | .executable')" /tmp/gate-head
       - name: base
         run: |
-          git worktree add /tmp/base "${{ github.event.pull_request.base.sha }}"
-          if [ -f /tmp/base/benches/gate.rs ]; then
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2>/dev/null && git worktree add /tmp/base "$base" \
+             && [ -f /tmp/base/benches/gate.rs ]; then
             (cd /tmp/base && cp "$(cargo bench --bench gate --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "gate") | .executable')" /tmp/gate-base)
           fi
       - run: |
           if [ -f /tmp/gate-base ]; then bench/gate/gate.py /tmp/gate-head --base /tmp/gate-base
-          else bench/gate/gate.py /tmp/gate-head; fi
+          else bench/gate/gate.py /tmp/gate-head || echo "no base to compare: the counts above are this runner's, against another machine's baseline"; fi

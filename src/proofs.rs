@@ -6,6 +6,7 @@ use crate::wire::{self, put_var, Cur};
 
 /// The decoders' error messages, formatted from symbolic integers, are what makes CBMC slow and
 /// none of the properties: stubbed to an empty string (`-Z stubbing`).
+#[allow(dead_code)] // named by the stubs only
 fn no_format(_: std::fmt::Arguments<'_>) -> String {
     String::new()
 }

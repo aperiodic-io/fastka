@@ -46,6 +46,8 @@ struct Chaos {
     cut_ppm: AtomicU64,
     stall_ppm: AtomicU64,
     stall_ms: AtomicU64,
+    /// chunks held in a stall now: bytes a closed client may still have land on the broker
+    stalling: AtomicU64,
     seed: AtomicU64,
     cuts: AtomicU64,
     stalls: AtomicU64,
@@ -95,7 +97,9 @@ fn pipe(mut from: TcpStream, mut to: TcpStream, chaos: &Chaos, rng: &mut Rng) {
             }
             if rng.chance(chaos.stall_ppm.load(Relaxed)) {
                 chaos.stalls.fetch_add(1, Relaxed);
+                chaos.stalling.fetch_add(1, Relaxed);
                 std::thread::sleep(Duration::from_millis(rng.next() % chaos.stall_ms.load(Relaxed).max(1)));
+                chaos.stalling.fetch_sub(1, Relaxed);
             } else if rng.chance(20_000) {
                 std::thread::sleep(Duration::from_millis(rng.next() % 20));
             }
@@ -147,6 +151,7 @@ fn main() {
         cut_ppm: AtomicU64::new(env("STRESS_CUT_PPM", 3_000)),
         stall_ppm: AtomicU64::new(env("STRESS_STALL_PPM", 1_000)),
         stall_ms: AtomicU64::new(env("STRESS_STALL_MS", 3_000)),
+        stalling: AtomicU64::new(0),
         seed: AtomicU64::new(seed),
         cuts: AtomicU64::new(0),
         stalls: AtomicU64::new(0),
@@ -216,6 +221,12 @@ fn main() {
 
     // ---- read the log back without faults, then through them ----
     chaos.on.store(false, Relaxed);
+    // a request given up by the client (its message reported failed, possibly persisted) may still
+    // be held in a stall and land after: the log is read once nothing is held
+    while chaos.stalling.load(Relaxed) > 0 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_secs(1));
     let clean = read_all(&cfg, &topic, parts, Duration::from_secs(120));
     // the read through the faults at the default rates: at the harsh ones a Fetch of
     // fetch.max.bytes (~800 chunks) would almost never arrive whole, on any client
