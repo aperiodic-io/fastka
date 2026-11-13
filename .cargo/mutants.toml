@@ -47,4 +47,6 @@ exclude_re = [
   # Not reached by a test: a Fetch is far smaller than a socket's send buffer, so it is always
   # written whole and the 1 ms slice for one half written (`<` to `>`) is never taken.
   "consumer\\.rs:\\d+:93: replace < with > in Consumer::wait_slice$",
+  # Equivalent: a call retried when its next wait ends at the deadline's very nanosecond.
+  "client\\.rs:.*replace < with <= in Client::retried$",
 ]

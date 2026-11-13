@@ -601,3 +601,17 @@ fn create_topics_asks_the_controller_to_answer_in_time() {
     // T is 5 s: a second short of it, at most
     assert!((3_500..=4_000).contains(&ms), "the controller asked to answer in {ms} ms of a {T:?} call");
 }
+
+/// `call_any` hands back the answer of whichever broker it asked: the body after its correlation
+/// id, as the broker wrote it.
+#[test]
+fn call_any_gives_the_brokers_answer() {
+    let b = Broker::start(|r| match r.api {
+        wire::METADATA => Answer::Body(metadata(&[(0, &r.me)], &[])),
+        wire::INIT_PRODUCER_ID => Answer::Body(vec![0, 0, 0, 7, 9, 9]),
+        _ => Answer::Drop,
+    });
+    let c = Client::new(&config(&b.addr)).unwrap();
+    let got = c.call_any(wire::INIT_PRODUCER_ID, &wire::init_producer_id_request, T).unwrap();
+    assert_eq!(got, [0, 0, 0, 7, 9, 9]);
+}
