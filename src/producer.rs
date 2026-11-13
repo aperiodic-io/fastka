@@ -1023,8 +1023,17 @@ fn broker<C: Deliveries>(sh: &Arc<Shared<C>>, id: i32) {
                 let mut st = self.0.lock();
                 st.threads.retain(|t| *t != self.1);
                 st.metadata_due = true;
+                // its batches being sent are its successor's to send again: possibly written
+                // (it may have written them), so a failure of one is fatal, never a rewind
+                let now = Instant::now();
+                for part in st.topics.values_mut().flat_map(|t| t.parts.values_mut()) {
+                    if let Some(sent) = part.inflight.as_mut().filter(|s| s.sending && part.leader == Some(self.1)) {
+                        (sent.sending, sent.retry_at, sent.maybe_written) = (false, now, true);
+                    }
+                }
                 drop(st);
                 self.0.work.notify_all();
+                self.0.reported.notify_all();
             }
         }
     }

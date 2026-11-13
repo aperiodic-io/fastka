@@ -511,6 +511,18 @@ impl Config {
                 message_timeout.as_millis()
             )));
         }
+        let (retry_backoff, retry_backoff_max) = (
+            ms("retry.backoff.ms", g("retry.backoff.ms", "100"), 1, 300_000)?,
+            ms("retry.backoff.max.ms", g("retry.backoff.max.ms", "1000"), 1, 300_000)?,
+        );
+        if retry_backoff_max < retry_backoff {
+            // librdkafka's rule: the backoff doubles from retry.backoff.ms up to the max
+            return Err(Error::Config(format!(
+                "retry.backoff.max.ms={} must not be less than retry.backoff.ms={}",
+                retry_backoff_max.as_millis(),
+                retry_backoff.as_millis()
+            )));
+        }
         Ok(ProducerSettings {
             linger,
             batch_bytes: int("batch.size", g("batch.size", "1000000"), 1, 2_147_483_647)? as usize,
@@ -531,8 +543,8 @@ impl Config {
                 * 1024,
             message_timeout,
             request_timeout: ms("request.timeout.ms", g("request.timeout.ms", "30000"), 1, 900_000)?,
-            retry_backoff: ms("retry.backoff.ms", g("retry.backoff.ms", "100"), 1, 300_000)?,
-            retry_backoff_max: ms("retry.backoff.max.ms", g("retry.backoff.max.ms", "1000"), 1, 300_000)?,
+            retry_backoff,
+            retry_backoff_max,
             codec,
             max_batch: int("message.max.bytes", g("message.max.bytes", "1000000"), 1000, 1_000_000_000)? as usize,
             metadata_refresh: match int(
@@ -639,6 +651,13 @@ mod tests {
         assert!(!d.contains("PRIVATE") && d.contains("PUBLIC"), "a key hidden, a CA shown: {d}");
         let n = cfg(&[]).net().unwrap();
         assert!(format!("{n:?}").starts_with(r#"Net { bootstrap: ["k1:9092", "k2:9092"], tls: false"#), "{n:?}");
+    }
+
+    /// librdkafka's rule: the longest retry backoff is not below the first.
+    #[test]
+    fn a_retry_backoff_max_below_the_backoff_is_refused() {
+        let e = cfg(&[("retry.backoff.ms", "500"), ("retry.backoff.max.ms", "100")]).producer().unwrap_err();
+        assert!(e.to_string().contains("retry.backoff.max.ms"), "{e}");
     }
 
     /// Sizes and levels as librdkafka reads them: kbytes are 1024 bytes; compression.level -1 is
