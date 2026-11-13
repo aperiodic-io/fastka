@@ -205,8 +205,14 @@ struct Part {
     queue: VecDeque<Message>,
     paused: bool,
     broker: Option<usize>,
-    /// the records of a response not yet queued
+    /// the records of a response not yet queued, and its bytes
     incoming: usize,
+    incoming_bytes: usize,
+    /// what its queued messages hold (`size`): `queued.max.messages.kbytes` bounds it
+    bytes: usize,
+    /// neither looked up nor fetched before then: its Fetch met an error, `errors` in a row
+    not_before: Instant,
+    errors: u32,
     at_end: bool,
     eof: bool,
     /// one more at each `seek`: what was asked before it is not taken
@@ -281,6 +287,10 @@ impl Consumer {
                 paused: a.paused,
                 broker: None,
                 incoming: 0,
+                incoming_bytes: 0,
+                bytes: 0,
+                not_before: Instant::now(),
+                errors: 0,
                 at_end: false,
                 eof: false,
                 epoch: 0,
@@ -352,7 +362,8 @@ impl Consumer {
         checked(&p.topic, p.partition, offset)?;
         p.epoch = p.epoch.wrapping_add(1);
         p.queue.clear();
-        (p.incoming, p.at_end, p.eof, p.reset_from, p.want) = (0, false, false, None, offset);
+        (p.incoming, p.incoming_bytes, p.bytes) = (0, 0, 0);
+        (p.at_end, p.eof, p.reset_from, p.want) = (false, false, None, offset);
         p.next = match offset {
             Offset::At(o) => Some(o),
             _ => None,
@@ -409,8 +420,9 @@ impl Consumer {
         let overdue: Vec<usize> = (0..self.brokers.len())
             .filter(|&b| self.overdue(b, now) && now >= self.brokers[b].checked + OVERDUE)
             .collect();
-        if now < self.lookup_at
-            || (overdue.is_empty() && self.parts.iter().all(|p| p.broker.is_some() && p.next.is_some()))
+        // a partition backing off an error (`not_before`) is not looked up meanwhile
+        let leaderless = |p: &Part| p.broker.is_none() && now >= p.not_before;
+        if now < self.lookup_at || (overdue.is_empty() && self.parts.iter().all(|p| !leaderless(p) && p.next.is_some()))
         {
             return;
         }
@@ -418,7 +430,9 @@ impl Consumer {
             self.brokers[b].checked = now;
         }
         self.looking = (self.parts.iter().enumerate())
-            .map(|(i, p)| (i, p.epoch, p.next.is_none(), p.broker.is_none_or(|b| overdue.contains(&b))))
+            .map(|(i, p)| {
+                (i, p.epoch, p.next.is_none(), leaderless(p) || p.broker.is_some_and(|b| overdue.contains(&b)))
+            })
             .filter(|l| l.2 || l.3)
             .collect();
         let unresolved: Vec<(String, i32, i64)> = (self.parts.iter())
@@ -426,7 +440,7 @@ impl Consumer {
             .map(|p| (p.topic.clone(), p.partition, if p.want == Offset::End { wire::LATEST } else { wire::EARLIEST }))
             .collect();
         let mut topics: Vec<String> = (self.parts.iter())
-            .filter(|p| p.broker.is_none_or(|b| overdue.contains(&b)))
+            .filter(|p| leaderless(p) || p.broker.is_some_and(|b| overdue.contains(&b)))
             .map(|p| p.topic.clone())
             .collect();
         topics.sort_unstable();
@@ -576,20 +590,23 @@ impl Consumer {
         br.buf.clear();
         for p in self.parts.iter_mut().filter(|p| p.broker == Some(b)) {
             p.broker = None;
-            p.incoming = 0;
+            (p.incoming, p.incoming_bytes) = (0, 0);
         }
         self.lookup_at = self.lookup_at.min(now);
     }
 
-    /// The Fetch for broker `b`'s partitions that are resolved, neither paused nor full, unless
-    /// the broker asked for a wait.
+    /// The Fetch for broker `b`'s partitions that are resolved, neither paused, full (in
+    /// messages or bytes) nor backing off an error, unless the broker asked for a wait.
     fn send(&mut self, b: usize) {
-        if Instant::now() < self.brokers[b].throttled {
+        let now = Instant::now();
+        if now < self.brokers[b].throttled {
             return;
         }
         let s = &self.s;
+        let room =
+            |p: &Part| p.queue.len() + p.incoming < s.queued_min && p.bytes + p.incoming_bytes < s.queued_max_bytes;
         let mut asked: Vec<(usize, i64, u32)> = (self.parts.iter().enumerate())
-            .filter(|(_, p)| p.broker == Some(b) && !p.paused && p.queue.len() + p.incoming < s.queued_min)
+            .filter(|(_, p)| p.broker == Some(b) && !p.paused && room(p) && now >= p.not_before)
             .filter_map(|(i, p)| Some((i, p.next?, p.epoch)))
             .collect();
         if asked.is_empty() {
@@ -614,7 +631,7 @@ impl Consumer {
             wire::fetch_request(o, &limits, &wire_parts)
         });
         br.written = 0;
-        br.inflight = Some(InFlight { corr: br.corr, asked, since: Instant::now() });
+        br.inflight = Some(InFlight { corr: br.corr, asked, since: now });
     }
 
     /// Reads what has arrived and sends the Fetches due, without blocking; `notice` hears what
@@ -805,14 +822,14 @@ impl Consumer {
             answers.push((i, asked, error, end, fp.aborted.clone(), range, scanned));
         }
         let mut fatal = None;
-        for (i, asked, err, _, _, _, scanned) in &answers {
+        for (i, asked, err, _, _, range, scanned) in &answers {
             let p = &mut self.parts[*i];
             match *err {
                 Code::NONE => {
                     // a partition refused (`corrupt`) stays where it was asked
                     if let Some((next, count)) = *scanned {
                         p.next = Some(p.next.unwrap_or(*asked).max(next.unwrap_or(*asked)));
-                        p.incoming = count;
+                        (p.incoming, p.incoming_bytes, p.errors) = (count, range.len(), 0);
                     }
                 }
                 Code::OFFSET_OUT_OF_RANGE => {
@@ -830,10 +847,18 @@ impl Consumer {
                     self.lookup_at = Instant::now();
                 }
                 c if c.stale_metadata() || c.retriable() => {
-                    let why = format!("{}/{}: fetch error {c}: looking up its leader again", p.topic, p.partition);
+                    // not at once: an error that persists (a leader being elected, the metadata
+                    // naming the old one meanwhile) would be fetched and looked up without end;
+                    // longer while it goes on
+                    p.errors += 1;
+                    let wait = BACKOFF.saturating_mul(1 << (p.errors - 1).min(16)).min(MAX_BACKOFF);
+                    let wait = wait.max(self.s.fetch_error_backoff);
+                    let why = format!(
+                        "{}/{}: fetch error {c}: looking up its leader again in {wait:?}",
+                        p.topic, p.partition
+                    );
                     notice(Notice::Retrying(why));
-                    p.broker = None;
-                    self.lookup_at = Instant::now();
+                    (p.broker, p.not_before) = (None, Instant::now() + wait);
                 }
                 c => drop(fatal.get_or_insert(Error::Broker(c, format!("fetching {}/{}", p.topic, p.partition)))),
             }
@@ -849,8 +874,8 @@ impl Consumer {
                 continue;
             }
             let p = &mut self.parts[i];
-            p.incoming = 0;
-            let before = p.queue.len();
+            (p.incoming, p.incoming_bytes) = (0, 0);
+            let (before, bytes) = (p.queue.len(), p.bytes);
             let o = ReadOpts {
                 from: asked,
                 committed: self.s.committed,
@@ -859,17 +884,20 @@ impl Consumer {
                 max_decompressed: self.net.max_response,
             };
             let read = records::read(&frame[range], &o, &mut plain, |r| {
-                p.queue.push_back(Message {
+                let m = Message {
                     offset: r.offset,
                     timestamp: r.timestamp,
                     key: r.key.map(<[u8]>::to_vec),
                     value: r.value.map(<[u8]>::to_vec),
                     headers: r.headers().map(|(k, v)| (k.to_string(), v.map(<[u8]>::to_vec))).collect(),
-                })
+                };
+                p.bytes += size(&m);
+                p.queue.push_back(m)
             });
             if let Err(e) = read {
                 // fetched again from where it was asked (the Fetch sent dropped with the broker):
                 // none of this response's records given
+                (p.bytes, p.incoming_bytes) = (bytes, 0);
                 p.queue.truncate(before);
                 p.next = Some(asked);
                 corrupt.get_or_insert(in_part(p, e));
@@ -902,7 +930,10 @@ impl Consumer {
             return Polled::Empty;
         }
         match p.queue.pop_front() {
-            Some(m) => Polled::Msg(m),
+            Some(m) => {
+                p.bytes -= size(&m);
+                Polled::Msg(m)
+            }
             None if std::mem::take(&mut p.eof) => Polled::Eof,
             None => Polled::Empty,
         }
@@ -926,6 +957,7 @@ impl Consumer {
                 continue;
             }
             if let Some(m) = self.parts[i].queue.pop_front() {
+                self.parts[i].bytes -= size(&m);
                 if i != self.turn % n {
                     self.run = 0;
                 }
@@ -995,6 +1027,12 @@ impl Consumer {
             }
         }
     }
+}
+
+/// What a message counts for against `queued.max.messages.kbytes`: its key, value and headers.
+fn size(m: &Message) -> usize {
+    let hs = m.headers.iter().map(|(k, v)| k.len() + v.as_ref().map_or(0, Vec::len)).sum::<usize>();
+    m.key.as_ref().map_or(0, Vec::len) + m.value.as_ref().map_or(0, Vec::len) + hs
 }
 
 /// A partition's read error, naming it.

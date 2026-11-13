@@ -216,7 +216,8 @@ Settings use librdkafka's names and defaults, except where noted. Unknown keys a
 - **Consumer:**
   - `auto.offset.reset`, `enable.partition.eof`, `isolation.level` (default `read_committed`);
   - `fetch.wait.max.ms`, `fetch.min.bytes`, `fetch.max.bytes`, `max.partition.fetch.bytes`;
-  - `queued.min.messages`, `queued.max.messages.kbytes`;
+  - `queued.min.messages`, `queued.max.messages.kbytes` (each a bound on a partition's queue);
+  - `fetch.error.backoff.ms`;
   - `check.crcs` (default `true`);
   - `group.id` (for `Client::commit`).
   - `enable.auto.commit=true` is refused: fastka commits only when you ask it to.
