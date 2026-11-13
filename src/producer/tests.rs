@@ -1656,3 +1656,27 @@ fn negative_timestamps_are_refused_and_far_apart_ones_share_a_batch() {
     assert!(h.iter().all(|o| o.3.is_none()), "{h:?}");
     assert_eq!(log_of(&logs)[&("o".to_string(), 0)].stamps, [0, i64::MAX]);
 }
+
+/// A batch refused for good with a code not known to come before the broker appends it (here
+/// INVALID_REQUEST, and one no Kafka has) may be on the log: it fails possibly persisted, with the
+/// producer fatal, its sequence never given to the next batch (which would then be taken as its
+/// duplicate). Those known to be checked first (MESSAGE_TOO_LARGE above) fail alone.
+#[test]
+fn a_batch_refused_with_a_code_not_known_before_append_is_fatal() {
+    for code in [42, 999] {
+        let fault: Fault = Box::new(move |r, _, _| {
+            let mut c = Cur::new(&r.body);
+            c.nstr().unwrap();
+            c.i16().unwrap();
+            c.i32().unwrap();
+            c.i32().unwrap();
+            Some(Answer::Body(refusal(c.str().unwrap(), 0, code)))
+        });
+        let (b, _) = sink(&["o"], 1, fault);
+        let p = producer(&b, &[]);
+        send(&p, "o", "x", 1);
+        let h = heard(&p, 1);
+        assert_eq!((h[0].4, h[0].6), (Some(Code(code)), Persisted::Possibly), "{code}: {h:?}");
+        assert_eq!(p.fatal_error().map(|f| f.0), Some(Code(code)), "{code}");
+    }
+}

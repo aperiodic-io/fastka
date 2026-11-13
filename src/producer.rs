@@ -843,6 +843,26 @@ fn unwritten(c: Code) -> bool {
     )
 }
 
+/// Whether a refusal for good says its batch was not appended: the broker checks the request and
+/// each batch for these before it appends. Any other (one this list or this crate does not know,
+/// one a newer broker gives) may come after: its sequence may be the broker's.
+fn refused_before_append(c: Code) -> bool {
+    matches!(
+        c,
+        Code::CORRUPT_MESSAGE
+            | Code::MESSAGE_TOO_LARGE
+            | Code::INVALID_TOPIC_EXCEPTION
+            | Code::RECORD_LIST_TOO_LARGE
+            | Code::INVALID_REQUIRED_ACKS
+            | Code::TOPIC_AUTHORIZATION_FAILED
+            | Code::INVALID_TIMESTAMP
+            | Code::UNSUPPORTED_FOR_MESSAGE_FORMAT
+            | Code::POLICY_VIOLATION
+            | Code::UNSUPPORTED_COMPRESSION_TYPE
+            | Code::INVALID_RECORD
+    )
+}
+
 /// Whether a refusal is about the producer's sequences or id, not the batch: whatever was sent,
 /// what the broker holds for the partition no longer follows on.
 fn sequence_broken(c: Code) -> bool {
@@ -1139,8 +1159,9 @@ fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Reque
                 part.inflight = Some(sent);
             }
             c => {
-                // one batch a partition in flight: refused, and no attempt of it written, no later
-                // sequence was sent, and the broker's next is this batch's
+                // one batch a partition in flight: refused before it was appended, and no attempt
+                // of it written, no later sequence was sent, and the broker's next is this batch's
+                sent.maybe_written |= !refused_before_append(c) && !sequence_broken(c);
                 let gap = sent.maybe_written || sequence_broken(c);
                 if !gap {
                     part.seq = sent.seq;
