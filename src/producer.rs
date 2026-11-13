@@ -301,8 +301,8 @@ impl<C: Deliveries> Producer<C> {
     /// - [`Error::Fatal`]: the producer is fatal ([`fatal_error`](Producer::fatal_error)).
     /// - [`Error::Broker`] with [`Code::MESSAGE_TOO_LARGE`]: the message cannot fit a batch of
     ///   `message.max.bytes`.
-    /// - [`Error::Config`]: an empty topic, a timestamp below 0, or a message larger than
-    ///   `queue.buffering.max.kbytes`.
+    /// - [`Error::Config`]: an empty topic or one over 32767 bytes, a timestamp below 0, or a
+    ///   message larger than `queue.buffering.max.kbytes`.
     /// - [`Error::Transport`]: the producer is closing.
     pub fn send(&self, r: Record<'_>, opaque: C::Opaque) -> std::result::Result<(), (Error, C::Opaque)> {
         let sh = &*self.shared;
@@ -316,6 +316,10 @@ impl<C: Deliveries> Producer<C> {
         }
         if r.topic.is_empty() {
             return Err((Error::Config("a record without a topic".into()), opaque));
+        }
+        // queued, a name the protocol cannot carry would fail the Metadata of every topic
+        if let Err(e) = wire::check_str("a topic name", r.topic) {
+            return Err((e, opaque));
         }
         if let Some(ms) = r.timestamp.filter(|ms| *ms < 0) {
             return Err((Error::Config(format!("timestamp {ms}: a timestamp is at least 0")), opaque));

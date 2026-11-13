@@ -1734,3 +1734,17 @@ fn a_leader_refusing_authentication_for_a_while_is_retried() {
     assert_eq!(p.fatal_error(), None);
     assert_eq!(values(&logs, "o", 0), ["x"]);
 }
+
+/// A topic name longer than the protocol carries (32767 bytes) is refused at `send`: queued, it
+/// would fail every Metadata request, for every topic's messages.
+#[test]
+fn a_topic_name_too_long_for_the_protocol_is_refused() {
+    let (b, _) = sink(&["o"], 1, no_fault());
+    let p = producer(&b, &[]);
+    let long = "t".repeat(32_768);
+    let refused = p.send(Record::to(&long).value(b"x"), 9).unwrap_err();
+    assert!(matches!(refused, (Error::Config(_), 9)), "{refused:?}");
+    send(&p, "o", "x", 1);
+    let h = heard(&p, 1);
+    assert_eq!(h[0].3, None, "{h:?}");
+}
