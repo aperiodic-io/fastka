@@ -106,7 +106,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get install -y valgrind
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
       - name: head
         run: cp "$(cargo bench --bench gate --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "gate") | .executable')" /tmp/gate-head
       - name: base
