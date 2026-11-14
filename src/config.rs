@@ -150,7 +150,9 @@ fn broker(s: &str) -> Result<String> {
         {
             rest
         }
-        _ => s,
+        // not Kafka's: refused, not read as a host (`http://k1:9092` has two colons, a bare IPv6's)
+        Some(_) => return Err(bad("not a scheme a Kafka client takes")),
+        None => s,
     };
     let port = |p: &str| p.parse::<u16>().map_err(|_| bad("not a port"));
     let (host, port) = if let Some(v6) = rest.strip_prefix('[') {
@@ -628,6 +630,28 @@ mod tests {
             (Duration::from_millis(20), Duration::from_millis(1500)),
             "the aliases"
         );
+    }
+
+    /// A broker's scheme is one of Kafka's four (any case), stripped; any other is not, and the
+    /// address with it is refused rather than read as a host.
+    #[test]
+    fn only_kafkas_schemes_are_stripped_from_a_broker() {
+        assert_eq!(broker("SASL_SSL://k1:9093").unwrap(), "k1:9093");
+        assert_eq!(broker("plaintext://k1").unwrap(), "k1:9092");
+        for s in ["http://k1:9092", "tcp://k1"] {
+            assert!(matches!(broker(s), Err(Error::Config(_))), "{s}");
+        }
+    }
+
+    /// The consumer's queue bound is `queued.max.messages.kbytes` in KiB; the producer's retry
+    /// backoff may grow to a max equal to where it starts, not below it.
+    #[test]
+    fn the_queues_bound_is_in_kib_and_a_flat_backoff_is_allowed() {
+        let s = cfg(&[("queued.max.messages.kbytes", "3")]).consumer().unwrap();
+        assert_eq!(s.queued_max_bytes, 3072);
+        let p = cfg(&[("retry.backoff.ms", "500"), ("retry.backoff.max.ms", "500")]).producer().unwrap();
+        assert_eq!((p.retry_backoff, p.retry_backoff_max), (Duration::from_millis(500), Duration::from_millis(500)));
+        assert!(cfg(&[("retry.backoff.ms", "500"), ("retry.backoff.max.ms", "499")]).producer().is_err());
     }
 
     /// What a misspelling or a setting this client does not honour would silently change is

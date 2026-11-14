@@ -49,6 +49,10 @@ exclude_re = [
   "consumer\\.rs:\\d+:93: replace < with > in Consumer::wait_slice$",
   # Equivalent: a call retried when its next wait ends at the deadline's very nanosecond.
   "client\\.rs:.*replace < with <= in Client::retried$",
+  # Equivalent (from brrrrr-kafka's list): a commit marker taken for an abort ends its producer's
+  # skipping, and a committed transaction's producer is never being skipped at its marker: the
+  # broker lists only aborted transactions, each begun after that producer's last marker.
+  "records\\.rs:.*replace is_abort_marker -> Result<bool> with Ok\\(true\\)$",
   # Equivalent: a TCP socket's flush does nothing (`Sock`), and rustls' `write` sends what it
   # buffers (a blocking socket's whole, a non-blocking one's as far as it takes), so a flush of
   # `Until` or `Stream` that sends nothing more is not seen (from brrrrr-kafka's list).
