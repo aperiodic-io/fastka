@@ -413,8 +413,7 @@ impl Consumer {
                     p.epoch == e && ((offset && p.next.is_none()) || (leader && p.broker.is_none()))
                 });
             if failed {
-                self.lookup_at = now + self.lookup_backoff;
-                self.lookup_backoff = (self.lookup_backoff * 2).min(MAX_BACKOFF);
+                self.lookup_failed(now);
             } else {
                 (self.lookup_at, self.lookup_backoff) = (now, BACKOFF);
             }
@@ -459,7 +458,7 @@ impl Consumer {
             Ok(_) => self.lookup = Some(rx),
             Err(e) => {
                 notice(Notice::Retrying(format!("a thread to look up leaders and offsets: {e}")));
-                self.lookup_at = now + self.lookup_backoff;
+                self.lookup_failed(now);
             }
         }
     }
@@ -994,6 +993,12 @@ impl Consumer {
             }
         }
         std::thread::sleep(slice.min(Duration::from_millis(1)));
+    }
+
+    /// A lookup failed (or its thread could not start): the next after its backoff, which doubles.
+    fn lookup_failed(&mut self, now: Instant) {
+        self.lookup_at = now + self.lookup_backoff;
+        self.lookup_backoff = (self.lookup_backoff * 2).min(MAX_BACKOFF);
     }
 
     /// How long `wait` may wait from `now`: up to `until` and `WAIT`, and no later than the soonest

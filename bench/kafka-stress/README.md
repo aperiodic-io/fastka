@@ -104,5 +104,30 @@ never fills. "Enqueue" is how long a pipeline takes to hand over its burst.
 Every run read back exactly once, in order. `kafka-stress` prints the send path's own numbers
 (`send path:`): each burst's enqueue time and each `send()` call's.
 
+## max.in.flight pipelined on one connection
+
+At first `max.in.flight` gave each broker N threads and N connections (brrrrr #355's review).
+It is now librdkafka's: one thread and one connection per broker, with up to N requests
+pipelined on it. Measured on brrrrr-kafka before the move, same scenario as above, at 2 CPUs,
+2 runs:
+
+| client | delivery p50 | delivery p99 | requests outstanding on a connection, at most |
+| --- | --- | --- | --- |
+| pinned (`max.in.flight=1`, unbounded requests) | 104-117 ms | 207-239 ms | 1 |
+| `max.in.flight=5`, `max.request.size=1048576`, pipelined | 94-150 ms | 233-277 ms | 3 |
+| librdkafka | 171-190 ms | 270-276 ms | 5 |
+
+With the knobs, p99 is level with librdkafka. It was 167-204 ms with N connections, because a
+broker works through one connection's requests in turn.
+
+fastka with the same knobs (one producer, 16 pipelines, 24 partitions; `-F max.in.flight=5
+-F max.request.size=1048576`):
+
+| scenario | requests outstanding, at most | delivery p99 | failed | read back |
+| --- | --- | --- | --- | --- |
+| answers at 300 ms | 4 | 2.29 s | 0 | exactly once, in order |
+| a 3 s stall | 5 | 2.83 s | 0 | exactly once, in order |
+| a 6 s stall (past `message.timeout.ms` 4.5 s) | 5 | - | 89,760 (fatal, as designed) | exactly once, in order |
+
 Not modelled: an application's recovery from a fatal producer (the harness counts its failures), many
 topics, staging's broker settings.

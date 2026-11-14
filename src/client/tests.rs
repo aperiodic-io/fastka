@@ -520,3 +520,98 @@ fn duration_max_is_no_limit_not_a_panic() {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.metadata(None, Duration::MAX)));
     assert!(r.is_ok(), "metadata(None, Duration::MAX) panicked");
 }
+
+/// A topic the metadata does not know yet (being created) is looked up once more before it is
+/// said unknown: one that is there at the second look has its partitions.
+#[test]
+fn a_topic_known_at_the_second_look_has_its_partitions() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let a2 = asked.clone();
+    let b = Broker::start(move |r| match r.api {
+        wire::METADATA => {
+            let first = a2.fetch_add(1, Ordering::SeqCst) == 0;
+            let parts: &[(i32, i32)] = if first { &[] } else { &[(0, 0), (1, 0)] };
+            Answer::Body(md_of(&r.me, &[(if first { 3 } else { 0 }, "t", parts)]))
+        }
+        _ => Answer::Drop,
+    });
+    let mut cfg = config(&b.addr);
+    cfg.set("reconnect.backoff.ms", "1").set("retry.backoff.ms", "1");
+    let c = Client::new(&cfg).unwrap();
+    assert_eq!(c.partitions("t", T).unwrap(), [0, 1]);
+    assert!(asked.load(Ordering::SeqCst) >= 2, "looked up again");
+}
+
+/// A ListOffsets answer naming another partition of the topic than the one asked is the broker's
+/// mistake, said as such: not taken as the asked partition's.
+#[test]
+fn list_offsets_answering_another_partition_is_an_error() {
+    let b = Broker::start(|r| match r.api {
+        wire::METADATA => Answer::Body(metadata(&[(0, &r.me)], &[("t", &[(0, 0), (1, 0)])])),
+        wire::LIST_OFFSETS => {
+            // asked t/0, answers t/1
+            let mut out = vec![];
+            out.i32(0);
+            out.i32(1);
+            out.str("t");
+            out.i32(1);
+            out.i32(1);
+            out.i16(0);
+            out.i64(-1);
+            out.i64(42);
+            Answer::Body(out)
+        }
+        _ => Answer::Drop,
+    });
+    let c = Client::new(&config(&b.addr)).unwrap();
+    let e = c.list_offsets(&[("t".into(), 0, -1)], false, T).unwrap_err();
+    assert!(e.to_string().contains("without t/0"), "{e}");
+}
+
+/// CreateTopics asks the controller to answer before the client gives up waiting (its timeout a
+/// quarter, at most a second, short of the call's), so that a slow creation is answered, not lost.
+#[test]
+fn create_topics_asks_the_controller_to_answer_in_time() {
+    let asked_ms = Arc::new(AtomicUsize::new(0));
+    let a2 = asked_ms.clone();
+    let b = Broker::start(move |r| match r.api {
+        wire::METADATA => Answer::Body(metadata(&[(0, &r.me)], &[])),
+        wire::CREATE_TOPICS => {
+            let mut c = Cur::new(&r.body);
+            let n = c.i32().unwrap();
+            let mut out = vec![];
+            out.i32(0);
+            out.i32(n);
+            for _ in 0..n {
+                let name = c.str().unwrap().to_string();
+                // partitions, replication, assignments, configs
+                let _ = (c.i32().unwrap(), c.i16().unwrap(), c.i32().unwrap(), c.i32().unwrap());
+                out.str(&name);
+                out.i16(0);
+                out.nstr(None);
+            }
+            a2.store(c.i32().unwrap() as usize, Ordering::SeqCst); // its timeout_ms
+            Answer::Body(out)
+        }
+        _ => Answer::Drop,
+    });
+    let c = Client::new(&config(&b.addr)).unwrap();
+    c.create_topics(&[("new".into(), 1, -1)], T).unwrap();
+    let ms = asked_ms.load(Ordering::SeqCst);
+    // T is 5 s: a second short of it, at most
+    assert!((3_500..=4_000).contains(&ms), "the controller asked to answer in {ms} ms of a {T:?} call");
+}
+
+/// `call_any` hands back the answer of whichever broker it asked: the body after its correlation
+/// id, as the broker wrote it.
+#[test]
+fn call_any_gives_the_brokers_answer() {
+    let b = Broker::start(|r| match r.api {
+        wire::METADATA => Answer::Body(metadata(&[(0, &r.me)], &[])),
+        wire::INIT_PRODUCER_ID => Answer::Body(vec![0, 0, 0, 7, 9, 9]),
+        _ => Answer::Drop,
+    });
+    let c = Client::new(&config(&b.addr)).unwrap();
+    let got = c.call_any(wire::INIT_PRODUCER_ID, &wire::init_producer_id_request, T).unwrap();
+    assert_eq!(got, [0, 0, 0, 7, 9, 9]);
+}

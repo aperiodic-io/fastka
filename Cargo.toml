@@ -61,3 +61,8 @@ debug = "line-tables-only"
 [[bench]]
 name = "gate"
 harness = false
+
+# cargo-mutants (.cargo/mutants.toml): the crate is rebuilt once per mutant, so no debug info
+[profile.mutants]
+inherits = "dev"
+debug = false

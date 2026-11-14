@@ -1479,3 +1479,74 @@ fn a_partition_error_that_persists_is_retried_after_a_backoff() {
     let (f, m) = (br.requests(wire::FETCH).len(), br.requests(wire::METADATA).len());
     assert!(f < 20 && m < 20, "in 500 ms: {f} Fetches, {m} Metadata requests");
 }
+
+/// What a message counts for against `queued.max.messages.kbytes`: its key, its value, and each
+/// header's name and value.
+#[test]
+fn a_messages_size_is_its_key_value_and_headers() {
+    let mut m = Message::default();
+    (m.key, m.value) = (Some(vec![0; 3]), Some(vec![0; 5]));
+    m.headers = vec![("ab".into(), Some(vec![0; 7])), ("c".into(), None)];
+    assert_eq!(size(&m), 3 + 5 + (2 + 7) + 1);
+    assert_eq!(size(&Message::default()), 0);
+}
+
+/// `poll` gives a message's bytes back to its partition's bound: a partition polled one message
+/// at a time is fetched on past `queued.max.messages.kbytes`, to its end.
+#[test]
+fn polling_frees_the_queues_bytes() {
+    let mut a = Log::default();
+    let big = "x".repeat(64 * 1024);
+    for _ in 0..100 {
+        a.push(0, &[big.as_str()]);
+    }
+    let br = log_broker(logs(&[("t", 0, a)]), no_fault());
+    let mut c =
+        consumer(&br, &[("queued.max.messages.kbytes", "256")], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    let (mut n, until) = (0, Instant::now() + Duration::from_secs(10));
+    loop {
+        assert!(Instant::now() < until, "{n} of 100 polled: the queue's bytes never given back");
+        c.pump(&mut |_| {}).unwrap();
+        let held: usize = c.parts[0].queue.iter().map(size).sum();
+        assert_eq!(c.parts[0].bytes, held, "a partition's bytes are its queue's");
+        match c.poll(0) {
+            Polled::Msg(_) => n += 1,
+            Polled::Eof if n == 100 => break,
+            _ => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert_eq!(c.parts[0].bytes, 0, "every byte given back");
+}
+
+/// A partition whose Fetch keeps failing with a retriable error is fetched again after a backoff
+/// that starts at 100 ms and doubles: not at once (an error that persists would be fetched
+/// without end), nor at the longest wait from the first.
+#[test]
+fn a_retriable_fetch_error_backs_off_and_doubles() {
+    let times = Arc::new(Mutex::new(vec![]));
+    let t2 = times.clone();
+    let fault: Fault = Box::new(move |r, _| {
+        (r.api == wire::FETCH).then(|| {
+            t2.lock().unwrap().push(Instant::now());
+            Answer::Body(fetch_answer("t", 0, 6, -1, None)) // NOT_LEADER_OR_FOLLOWER
+        })
+    });
+    let mut a = Log::default();
+    a.push(0, &["m"]);
+    let br = log_broker(logs(&[("t", 0, a)]), fault);
+    let mut c = consumer(&br, &[("fetch.error.backoff.ms", "1")], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    let until = Instant::now() + Duration::from_secs(5);
+    while times.lock().unwrap().len() < 4 && Instant::now() < until {
+        c.pump(&mut |_| {}).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let t = times.lock().unwrap().clone();
+    assert!(t.len() >= 4, "{} Fetches in 5 s", t.len());
+    let gaps: Vec<Duration> = t.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(
+        gaps[0] >= Duration::from_millis(90) && gaps[0] < Duration::from_millis(195),
+        "the first wait {:?}, not ~100 ms: {gaps:?}",
+        gaps[0]
+    );
+    assert!(gaps[1] > gaps[0] * 3 / 2 && gaps[2] > gaps[1] * 3 / 2, "the waits not doubling: {gaps:?}");
+}

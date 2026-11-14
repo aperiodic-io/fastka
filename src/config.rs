@@ -150,7 +150,9 @@ fn broker(s: &str) -> Result<String> {
         {
             rest
         }
-        _ => s,
+        // not Kafka's: refused, not read as a host (`http://k1:9092` has two colons, a bare IPv6's)
+        Some(_) => return Err(bad("not a scheme a Kafka client takes")),
+        None => s,
     };
     let port = |p: &str| p.parse::<u16>().map_err(|_| bad("not a port"));
     let (host, port) = if let Some(v6) = rest.strip_prefix('[') {
@@ -306,8 +308,8 @@ pub struct ProducerSettings {
     /// batch, however large: the due batches longest waiting go first, the rest in the next
     /// request.
     pub max_request: usize,
-    /// Produce requests outstanding to a broker at once, each on a connection (and a thread) of
-    /// its own (`max.in.flight.requests.per.connection` or `max.in.flight`, 1 to 5 as
+    /// Produce requests outstanding to a broker at once, pipelined on its one connection by its
+    /// one thread (`max.in.flight.requests.per.connection` or `max.in.flight`, 1 to 5 as
     /// librdkafka's idempotent producer, default 1). A partition has one batch in flight whatever
     /// this is: its messages stay in the order sent, its sequences without a gap.
     pub max_in_flight: usize,
@@ -564,12 +566,12 @@ impl Config {
                 Some(v) => int("max.request.size", v, 1, 2_147_483_647)? as usize,
                 None => max_batch,
             },
-            max_in_flight: int(
-                "max.in.flight.requests.per.connection",
-                self.aliased("max.in.flight.requests.per.connection", "max.in.flight")?.unwrap_or("1"),
-                1,
-                5,
-            )? as usize,
+            max_in_flight: {
+                let long = "max.in.flight.requests.per.connection";
+                let v = self.aliased(long, "max.in.flight")?.unwrap_or("1");
+                // a value out of range named by the key it was set under
+                int(if self.get(long).is_some() { long } else { "max.in.flight" }, v, 1, 5)? as usize
+            },
             metadata_refresh: match int(
                 "topic.metadata.refresh.interval.ms",
                 g("topic.metadata.refresh.interval.ms", "300000"),
@@ -630,6 +632,28 @@ mod tests {
         );
     }
 
+    /// A broker's scheme is one of Kafka's four (any case), stripped; any other is not, and the
+    /// address with it is refused rather than read as a host.
+    #[test]
+    fn only_kafkas_schemes_are_stripped_from_a_broker() {
+        assert_eq!(broker("SASL_SSL://k1:9093").unwrap(), "k1:9093");
+        assert_eq!(broker("plaintext://k1").unwrap(), "k1:9092");
+        for s in ["http://k1:9092", "tcp://k1"] {
+            assert!(matches!(broker(s), Err(Error::Config(_))), "{s}");
+        }
+    }
+
+    /// The consumer's queue bound is `queued.max.messages.kbytes` in KiB; the producer's retry
+    /// backoff may grow to a max equal to where it starts, not below it.
+    #[test]
+    fn the_queues_bound_is_in_kib_and_a_flat_backoff_is_allowed() {
+        let s = cfg(&[("queued.max.messages.kbytes", "3")]).consumer().unwrap();
+        assert_eq!(s.queued_max_bytes, 3072);
+        let p = cfg(&[("retry.backoff.ms", "500"), ("retry.backoff.max.ms", "500")]).producer().unwrap();
+        assert_eq!((p.retry_backoff, p.retry_backoff_max), (Duration::from_millis(500), Duration::from_millis(500)));
+        assert!(cfg(&[("retry.backoff.ms", "500"), ("retry.backoff.max.ms", "499")]).producer().is_err());
+    }
+
     /// What a misspelling or a setting this client does not honour would silently change is
     /// refused at start, naming the key, never its value.
     #[test]
@@ -647,7 +671,7 @@ mod tests {
             ("linger.ms", "soon", "not an integer"),
             ("auto.offset.reset", "middle", "earliest, latest"),
             // librdkafka's idempotent producer's bound
-            ("max.in.flight", "6", "out of range 1..5"),
+            ("max.in.flight", "6", "max.in.flight=6: out of range 1..5"), // named as it was set
             ("max.in.flight.requests.per.connection", "0", "out of range 1..5"),
             ("max.request.size", "0", "out of range"),
         ] {

@@ -608,3 +608,29 @@ fn an_overlong_string_is_refused_before_it_is_written() {
     let e = check_str("group.id", &"g".repeat(32768)).unwrap_err();
     assert!(matches!(&e, Error::Config(m) if m.starts_with("group.id: 32768 bytes")), "{e}");
 }
+
+/// The version both sides speak is the newest within both ranges, of that API's own range, and
+/// none where the ranges do not meet or the broker lacks the API.
+#[test]
+fn negotiate_takes_the_newest_version_both_speak() {
+    let &(_, lo, hi, _) = VERSIONS.iter().find(|v| v.0 == PRODUCE).unwrap();
+    let other = (FETCH, 0, 100); // another API's range, first: not taken for Produce's
+    assert_eq!(negotiate(PRODUCE, &[other, (PRODUCE, 0, hi + 5)]), Some(hi), "the client's newest");
+    assert_eq!(negotiate(PRODUCE, &[other, (PRODUCE, 0, lo)]), Some(lo), "the broker's newest");
+    assert_eq!(negotiate(PRODUCE, &[other, (PRODUCE, hi + 1, hi + 5)]), None, "ranges apart");
+    assert_eq!(negotiate(PRODUCE, &[other]), None, "the API not spoken");
+    let &(_, flo, fhi, _) = VERSIONS.iter().find(|v| v.0 == FETCH).unwrap();
+    assert_eq!(negotiate(FETCH, &[(PRODUCE, 0, 100), (FETCH, flo, fhi)]), Some(fhi), "Fetch's own range");
+}
+
+/// A metadata answer's broker and topic, looked up by id and name: that one, or none.
+#[test]
+fn metadata_finds_its_broker_and_topic_by_id_and_name() {
+    let b = |id| Broker { id, host: format!("h{id}"), port: 9092 };
+    let t = |name: &str| TopicMeta { name: name.into(), error: Code::NONE, partitions: vec![] };
+    let md = Metadata { brokers: vec![b(1), b(2)], topics: vec![t("a"), t("b")], ..Metadata::default() };
+    assert_eq!(md.broker(2).map(|b| b.host.as_str()), Some("h2"));
+    assert!(md.broker(3).is_none());
+    assert_eq!(md.topic("b").map(|t| t.name.as_str()), Some("b"));
+    assert!(md.topic("c").is_none());
+}

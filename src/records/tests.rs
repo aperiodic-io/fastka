@@ -526,3 +526,42 @@ fn a_batch_whose_count_or_offsets_disagree_is_refused() {
     assert!(matches!(all(&c, &ReadOpts { check_crcs: false, ..opts() }), Err(Error::Protocol(_))));
     assert_eq!(all(&changed(23, 5), &opts()).unwrap().len(), 2, "a gap after them (compaction) is a batch's");
 }
+
+/// A base offset below zero, or one whose batch ends past i64's last offset (delta 0, base
+/// i64::MAX: its next offset is past it), is a broker's corruption: refused.
+#[test]
+fn a_negative_base_offset_or_one_at_i64s_end_is_refused() {
+    let one = || written(NONE, &[Out { timestamp: 1, key: None, value: Some(b"v"), headers: &[] }]);
+    for base in [-1, i64::MIN, i64::MAX] {
+        let b = at(one(), base);
+        assert!(matches!(all(&b, &ReadOpts { check_crcs: false, ..opts() }), Err(Error::Protocol(_))), "{base}");
+    }
+    assert_eq!(all(&at(one(), 0), &opts()).unwrap()[0].0, 0);
+}
+
+/// `decompress` appends: what `out` held before is kept and not counted against the most.
+#[test]
+fn decompressing_appends_and_counts_only_its_own_bytes() {
+    let zeros = &vec![7u8; 4000][..];
+    let xerial = {
+        let mut x = b"\x82SNAPPY\x00\x00\x00\x00\x01\x00\x00\x00\x01".to_vec();
+        for half in zeros.chunks(2000) {
+            let block = snap::raw::Encoder::new().compress_vec(half).unwrap();
+            x.extend((block.len() as i32).to_be_bytes());
+            x.extend(block);
+        }
+        x
+    };
+    for codec in [GZIP, SNAPPY, LZ4, ZSTD] {
+        let mut c = vec![];
+        compress(codec, zeros, &mut c).unwrap();
+        let framed = if codec == SNAPPY { xerial.clone() } else { c.clone() };
+        for b in [&c, &framed] {
+            let mut out = vec![1u8; 3000];
+            decompress(codec, b, &mut out, 4000).unwrap();
+            assert_eq!((&out[..3000], &out[3000..]), (&[1u8; 3000][..], zeros), "{codec}");
+            let mut out = vec![1u8; 3000];
+            assert!(decompress(codec, b, &mut out, 3999).is_err(), "{codec}");
+        }
+    }
+}

@@ -36,12 +36,18 @@ impl Sock {
     }
 }
 
+/// A socket's timeout as the deadline's WouldBlock: Unix says EAGAIN (WouldBlock), Windows
+/// TimedOut.
+fn timed_out<T>(r: std::io::Result<T>) -> std::io::Result<T> {
+    r.map_err(|e| if e.kind() == ErrorKind::TimedOut { ErrorKind::WouldBlock.into() } else { e })
+}
+
 impl Read for Sock {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if let Some(left) = self.left()? {
             self.tcp.set_read_timeout(Some(left))?;
         }
-        self.tcp.read(buf)
+        timed_out(self.tcp.read(buf))
     }
 }
 
@@ -50,7 +56,7 @@ impl Write for Sock {
         if let Some(left) = self.left()? {
             self.tcp.set_write_timeout(Some(left))?;
         }
-        self.tcp.write(buf)
+        timed_out(self.tcp.write(buf))
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.tcp.flush()
@@ -346,42 +352,44 @@ impl Conn {
 
     /// Sends a request of `api` and waits for its answer: the response after its correlation id.
     pub fn call(&mut self, api: i16, body: impl FnOnce(&mut Vec<u8>)) -> Result<Vec<u8>> {
-        self.corr = self.corr.wrapping_add(1);
-        let corr = self.corr;
-        let mut out = std::mem::take(&mut self.out);
-        let v = if api == wire::API_VERSIONS { 0 } else { self.version(api) };
-        wire::request_at(&mut out, api, v, corr, &self.client_id, body);
-        let r = self.round_trip(&out, corr);
-        self.out = out;
-        r
-    }
-
-    fn round_trip(&mut self, out: &[u8], corr: i32) -> Result<Vec<u8>> {
-        let addr = &self.addr;
-        let timeout = |e: std::io::Error| match e.kind() {
-            ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-                Error::Timeout(format!("{addr}: no answer in {:?}", self.timeout))
-            }
-            _ => tls_error(addr, e),
-        };
         let deadline = deadline_in(self.timeout);
         let deadline = self.until.map_or(deadline, |u| deadline.min(u)); // connecting: its deadline too
-        let mut s = Until(&mut self.stream, deadline);
-        let mut written = 0;
-        while !write_all(&mut s, out, &mut written).map_err(timeout)? {
-            if Instant::now() > deadline {
-                return Err(Error::Timeout(format!("{addr}: sending a request")));
-            }
-        }
+        let corr = self.send_request(api, deadline, body)?;
         let mut buf = vec![];
-        while !read_frame(&mut s, &mut buf, self.max_response).map_err(timeout)? {
-            if Instant::now() > deadline {
-                return Err(Error::Timeout(format!("{addr}: no answer in {:?}", self.timeout)));
-            }
+        if !self.recv(&mut buf, deadline)? {
+            return Err(Error::Timeout(format!("{}: no answer in {:?}", self.addr, self.timeout)));
         }
         wire::response(&buf[4..], corr)?;
         buf.drain(..8); // its size and correlation id
         Ok(buf)
+    }
+
+    /// Sends a request of `api`, whole by `until`, without waiting for its answer: its
+    /// correlation id. Answers come in the order the requests were sent (`recv`), so several may
+    /// be outstanding (the producer's pipelining, `max.in.flight`).
+    pub fn send_request(&mut self, api: i16, until: Instant, body: impl FnOnce(&mut Vec<u8>)) -> Result<i32> {
+        self.corr = self.corr.wrapping_add(1);
+        let corr = self.corr;
+        let mut out = std::mem::take(&mut self.out);
+        // ApiVersions at v0: the one request sent before the versions are known
+        let v = if api == wire::API_VERSIONS { 0 } else { self.version(api) };
+        wire::request_at(&mut out, api, v, corr, &self.client_id, body);
+        // not whole by `until`: the socket's deadline said WouldBlock
+        let r = match write_all(&mut Until(&mut self.stream, until), &out, &mut 0) {
+            Ok(true) => Ok(corr),
+            Ok(false) => Err(Error::Timeout(format!("{}: sending a request", self.addr))),
+            Err(e) => Err(tls_error(&self.addr, e)),
+        };
+        self.out = out;
+        r
+    }
+
+    /// Reads an answer into `buf` until `until`: true once it is whole (its size and correlation
+    /// id first: `wire::response`); false at `until`, what was read kept in `buf` for the next
+    /// call.
+    pub fn recv(&mut self, buf: &mut Vec<u8>, until: Instant) -> Result<bool> {
+        let max = self.max_response;
+        read_frame(&mut Until(&mut self.stream, until), buf, max).map_err(|e| tls_error(&self.addr, e))
     }
 
     /// The time left for one request.
