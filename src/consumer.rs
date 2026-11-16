@@ -217,6 +217,8 @@ struct Part {
     not_before: Instant,
     errors: u32,
     at_end: bool,
+    /// when the newest Fetch answered for it, and finding it at its end, was sent (`ended_at`)
+    ended: Option<Instant>,
     eof: bool,
     /// one more at each `seek`: what was asked before it is not taken
     epoch: u32,
@@ -295,6 +297,7 @@ impl Consumer {
                 not_before: Instant::now(),
                 errors: 0,
                 at_end: false,
+                ended: None,
                 eof: false,
                 epoch: 0,
                 reset_from: None,
@@ -366,7 +369,7 @@ impl Consumer {
         p.epoch = p.epoch.wrapping_add(1);
         p.queue.clear();
         (p.incoming, p.incoming_bytes, p.bytes) = (0, 0, 0);
-        (p.at_end, p.eof, p.reset_from, p.want) = (false, false, None, offset);
+        (p.at_end, p.ended, p.eof, p.reset_from, p.want) = (false, None, false, None, offset);
         p.next = match offset {
             Offset::At(o) => Some(o),
             _ => None,
@@ -593,7 +596,7 @@ impl Consumer {
         br.buf.clear();
         for p in self.parts.iter_mut().filter(|p| p.broker == Some(b)) {
             p.broker = None;
-            (p.incoming, p.incoming_bytes) = (0, 0);
+            (p.incoming, p.incoming_bytes, p.ended) = (0, 0, None);
         }
         self.lookup_at = self.lookup_at.min(now);
     }
@@ -780,6 +783,7 @@ impl Consumer {
     /// with it comes again from the Fetch asked again).
     fn answered(&mut self, b: usize, frame: &[u8], notice: &mut dyn FnMut(Notice)) -> Result<std::io::Result<()>> {
         let inflight = self.brokers[b].inflight.take().expect("a Fetch in flight");
+        let asked_at = inflight.since;
         let body = wire::response(&frame[4..], inflight.corr)?;
         let base = 4; // ranges are of `frame[4..]`
         let got = wire::fetch(body)?;
@@ -847,7 +851,7 @@ impl Consumer {
                         }
                     };
                     // told once where it reads on from is found
-                    (p.want, p.next, p.reset_from) = (to, None, Some(*asked));
+                    (p.want, p.next, p.reset_from, p.ended) = (to, None, Some(*asked), None);
                     self.lookup_at = Instant::now();
                 }
                 c if c.stale_metadata() || c.retriable() => {
@@ -862,7 +866,7 @@ impl Consumer {
                         p.topic, p.partition
                     );
                     notice(Notice::Retrying(why));
-                    (p.broker, p.not_before) = (None, Instant::now() + wait);
+                    (p.broker, p.not_before, p.ended) = (None, Instant::now() + wait, None);
                 }
                 c => drop(fatal.get_or_insert(Error::Broker(c, format!("fetching {}/{}", p.topic, p.partition)))),
             }
@@ -901,7 +905,7 @@ impl Consumer {
             if let Err(e) = read {
                 // fetched again from where it was asked (the Fetch sent dropped with the broker):
                 // none of this response's records given
-                (p.bytes, p.incoming_bytes) = (bytes, 0);
+                (p.bytes, p.incoming_bytes, p.ended) = (bytes, 0, None);
                 p.queue.truncate(before);
                 p.next = Some(asked);
                 corrupt.get_or_insert(in_part(p, e));
@@ -914,12 +918,30 @@ impl Consumer {
                 p.eof = true;
             }
             p.at_end = caught;
+            // what the broker held of it when this Fetch was sent, it gave: it is at its end as of then
+            p.ended = caught.then_some(asked_at);
         }
         self.plain = plain;
         match (corrupt, fatal, sent) {
             (Some(e), _, _) | (None, Some(e), Ok(())) => Err(e),
             (None, _, sent) => Ok(sent),
         }
+    }
+
+    /// When partition `i` is known to be at its end as of: the time the newest Fetch answered for
+    /// it was sent, if that answer found it at its end and every message it gave has been taken
+    /// (`poll`, `next_any`). Every record the broker appended to it before then has been given.
+    /// None if not: messages are queued, its last answer was not its end (or an error), or it was
+    /// `seek`ed or its broker lost since. Unlike its end (`Polled::Eof`), said once each time it is
+    /// reached, this moves on with each Fetch that finds it there, and never past one: an answer
+    /// read late (the caller did not pump for a while) is as old as its Fetch, not as its reading.
+    ///
+    /// # Panics
+    ///
+    /// If `i` is not an index of [`partitions`](Consumer::partitions).
+    pub fn ended_at(&self, i: usize) -> Option<Instant> {
+        let p = &self.parts[i];
+        p.ended.filter(|_| p.queue.is_empty())
     }
 
     /// Partition `i`'s next message, its end once (with `enable.partition.eof`), or nothing yet
