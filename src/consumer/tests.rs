@@ -625,6 +625,54 @@ fn poll_gives_the_messages_then_the_end_once() {
     }
 }
 
+/// `ended_at`: the end as of the Fetch that found it, not as of its reading. A caller that stops
+/// pumping (a stalled loop) and reads on later first takes the answer to the Fetch sent before it
+/// stopped: that answer says nothing of what was appended while it did not pump, and its end is
+/// as old as its Fetch (brrrrr, 2026-11-16: an end read after a pause closed the pause's windows
+/// on the clock before their records were fetched).
+#[test]
+fn an_end_is_as_old_as_the_fetch_that_found_it() {
+    let mut a = Log::default();
+    a.push(0, &["a"]);
+    let logs = logs(&[("t", 0, a)]);
+    let br = log_broker(logs.clone(), no_fault());
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    let (started, until) = (Instant::now(), Instant::now() + Duration::from_secs(5));
+    let mut got = vec![];
+    while c.ended_at(0).is_none() {
+        assert!(Instant::now() < until, "{got:?}");
+        c.pump(&mut |_| {}).unwrap();
+        if let Polled::Msg(m) = c.poll(0) {
+            got.push(m.value.unwrap());
+        } else if got.is_empty() {
+            assert_eq!(c.ended_at(0), None, "nothing given yet");
+        }
+    }
+    assert_eq!(got, [b"a".to_vec()], "its end only once what it gave was taken");
+    assert!(c.ended_at(0).unwrap() >= started);
+    // a Fetch in flight (pipelined, `the_next_fetch_is_pipelined`), then no pump for a while: "b"
+    // is appended meanwhile, after the Fetch in flight was sent
+    let stalled = Instant::now();
+    std::thread::sleep(Duration::from_millis(100));
+    logs.lock().unwrap().get_mut(&("t".to_string(), 0)).unwrap().push(0, &["b"]);
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < until, "b never given");
+        c.pump(&mut |_| {}).unwrap();
+        match c.poll(0) {
+            Polled::Msg(m) => break assert_eq!(m.value.as_deref(), Some(&b"b"[..])),
+            _ => assert!(c.ended_at(0).is_none_or(|t| t < stalled), "an end as of after b was appended, b unread"),
+        }
+    }
+    while c.ended_at(0).is_none_or(|t| t < stalled) {
+        assert!(Instant::now() < until, "no end after b");
+        c.pump(&mut |_| {}).unwrap();
+        assert!(!matches!(c.poll(0), Polled::Msg(_)), "b only once");
+    }
+    c.seek(0, Offset::At(0)).unwrap();
+    assert_eq!(c.ended_at(0), None, "seeked: not known to be at its end");
+}
+
 /// The next Fetch is sent as soon as a response is in, before its records are read.
 #[test]
 fn the_next_fetch_is_pipelined() {
