@@ -362,17 +362,30 @@ impl Client {
     /// reached or spoken to; [`Error::Broker`] for a code a retry does not mend.
     /// [`Error::Config`]: a topic name over 32767 bytes. A topic's own error is in its entry.
     pub fn create_topics(&self, topics: &[(String, i32, i16)], timeout: Duration) -> Result<Vec<(String, Result<()>)>> {
+        let ts: Vec<NewTopic<'_>> = topics.iter().map(|(n, p, r)| (n.clone(), *p, *r, &[][..])).collect();
+        self.create_topics_with(&ts, timeout)
+    }
+
+    /// [`create_topics`](Client::create_topics) with each topic's configs (name, value), e.g.
+    /// `("cleanup.policy", "compact")`: (name, partitions, replication factor, configs).
+    ///
+    /// # Errors
+    ///
+    /// As [`create_topics`](Client::create_topics); a config the broker refuses is the topic's
+    /// own error (INVALID_CONFIG).
+    pub fn create_topics_with(&self, topics: &[NewTopic<'_>], timeout: Duration) -> Result<Vec<(String, Result<()>)>> {
         names("topic", topics.iter().map(|t| t.0.as_str()))?;
         let mut lost = false;
         self.retried(timeout, |inner, deadline| {
             let md = self.refresh(inner, deadline, Some(&[]))?;
-            let ts: Vec<(&str, i32, i16)> = topics.iter().map(|(n, p, r)| (n.as_str(), *p, *r)).collect();
+            let ts: Vec<wire::CreatableTopic<'_>> =
+                topics.iter().map(|(n, p, r, c)| (n.as_str(), *p, *r, *c)).collect();
             // the broker's wait ends before this client's, so that its answer comes back in time
             let wait = deadline.saturating_duration_since(Instant::now()).min(self.net.request_timeout);
             let ms = i32::try_from((wait - (wait / 4).min(Duration::from_secs(1))).as_millis()).unwrap_or(i32::MAX);
             let retry = lost;
             let r = self.call(inner, To::Broker(md.controller), deadline, wire::CREATE_TOPICS, &|o| {
-                wire::create_topics_request(o, &ts, ms)
+                wire::create_topics_request_with(o, &ts, ms)
             });
             lost |= matches!(&r, Err(e) if transient_err(e));
             let frame = r?;
@@ -472,6 +485,9 @@ pub type Listed = (String, i32, Result<Option<i64>>);
 
 /// A topic's settings: name, value (None for a sensitive one).
 pub type TopicConfig = HashMap<String, Option<String>>;
+
+/// A topic to create: (name, partitions, replication factor; -1 the broker's default, configs).
+pub type NewTopic<'a> = (String, i32, i16, &'a [(&'a str, &'a str)]);
 
 /// A partition asked of its leader: (topic, (partition, timestamp)).
 type Asked<'a> = (&'a str, (i32, i64));

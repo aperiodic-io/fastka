@@ -341,6 +341,26 @@ fn create_topics() {
     every_cut_fails(&frame, super::create_topics);
 }
 
+/// A topic's configs, as the spec's codec reads them; none for `create_topics_request`.
+#[test]
+fn create_topics_with_configs() {
+    let mut out = vec![];
+    let compact: &[(&str, &str)] = &[("cleanup.policy", "compact"), ("retention.ms", "-1")];
+    let topics = [("s", 1, 1, compact), ("t", 2, -1, &[][..])];
+    request(&mut out, CREATE_TOPICS, 4, "fastka", |o| create_topics_request_with(o, &topics, 1000));
+    let r: km::CreateTopicsRequest = oracle_request(&out, CREATE_TOPICS, 4);
+    let configs: Vec<Vec<(String, Option<String>)>> = r
+        .topics
+        .iter()
+        .map(|t| t.configs.iter().map(|c| (c.name.to_string(), c.value.as_ref().map(|v| v.to_string()))).collect())
+        .collect();
+    assert_eq!(
+        configs,
+        [vec![("cleanup.policy".into(), Some("compact".into())), ("retention.ms".into(), Some("-1".into()))], vec![]]
+    );
+    assert_eq!((r.topics[0].num_partitions, r.topics[1].replication_factor), (1, -1));
+}
+
 #[test]
 fn describe_configs() {
     let mut out = vec![];

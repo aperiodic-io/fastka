@@ -593,13 +593,27 @@ pub fn init_producer_id(mut c: Cur<'_>) -> Result<(Code, i64, i16)> {
 
 /// CreateTopics v4 of `topics` (name, partitions, replication factor; -1: the broker's default).
 pub fn create_topics_request(out: &mut Vec<u8>, topics: &[(&str, i32, i16)], timeout_ms: i32) {
+    let ts: Vec<CreatableTopic<'_>> = topics.iter().map(|(n, p, r)| (*n, *p, *r, &[][..])).collect();
+    create_topics_request_with(out, &ts, timeout_ms)
+}
+
+/// A topic CreateTopics asks for: name, partitions, replication factor (-1: the broker's
+/// default), its configs (name, value; e.g. `cleanup.policy=compact`).
+pub type CreatableTopic<'a> = (&'a str, i32, i16, &'a [(&'a str, &'a str)]);
+
+/// CreateTopics v4 of `topics`, with their configs.
+pub fn create_topics_request_with(out: &mut Vec<u8>, topics: &[CreatableTopic<'_>], timeout_ms: i32) {
     out.count(topics.len());
-    for (name, partitions, replication) in topics {
+    for (name, partitions, replication, configs) in topics {
         out.str(name);
         out.i32(*partitions);
         out.i16(*replication);
         out.count(0); // assignments
-        out.count(0); // configs
+        out.count(configs.len());
+        for (k, v) in *configs {
+            out.str(k);
+            out.nstr(Some(v));
+        }
     }
     out.i32(timeout_ms);
     out.i8(0); // validate only
