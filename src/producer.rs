@@ -16,6 +16,15 @@
 //! producer is made to go on. Each failed delivery says whether it may be on the log
 //! (`Persisted`).
 //!
+//! With `enable.idempotence=false` (librdkafka's plain producer, `acks=1` or `all`) no producer id
+//! is asked for and every batch carries none (-1), as a broker that treats such batches apart
+//! needs them. A partition still has one batch in flight, so the messages reported delivered keep
+//! the order sent; a retry of a batch whose answer was lost may be written twice (reported once,
+//! at the offset of the copy answered). A request given up at its messages' timeout (failed,
+//! `Persisted::Possibly`) may still reach the broker after later batches and be written there:
+//! only a producer id lets a broker refuse it, which is why the idempotent producer goes fatal
+//! instead. Nothing makes such a producer fatal: there is no sequence to break.
+//!
 //! The entry point is [`Producer::new`], with a [`Deliveries`] context; build each message with
 //! [`Record::to`] and queue it with [`Producer::send`].
 use crate::client::Client;
@@ -225,6 +234,8 @@ struct State<O> {
     topics: HashMap<Arc<str>, Topic<O>>,
     pid: Option<(i64, i16)>,
     fatal: Option<(Code, String)>,
+    /// `ProducerSettings::idempotent`: else no batch has a sequence a gap could break
+    idempotent: bool,
     /// brokers' addresses
     brokers: HashMap<i32, String>,
     /// the brokers with a thread
@@ -294,6 +305,7 @@ impl<C: Deliveries> Producer<C> {
             topics: HashMap::default(),
             pid: None,
             fatal: None,
+            idempotent: s.idempotent,
             brokers: HashMap::default(),
             threads: vec![],
             next_thread: 0,
@@ -676,7 +688,7 @@ fn manage<C: Deliveries>(sh: &Arc<Shared<C>>) {
         let need_metadata = st.metadata_due || stale || unresolved(&st);
         // at once, not at the first message (librdkafka's idempotent producer too): the first
         // message then waits on the metadata and its leader's connection alone
-        let need_pid = st.pid.is_none() && st.fatal.is_none();
+        let need_pid = sh.s.idempotent && st.pid.is_none() && st.fatal.is_none();
         if !need_metadata && !need_pid {
             let wait =
                 next_deadline(&st).map_or(Duration::from_millis(100), |d| d.saturating_duration_since(Instant::now()));
@@ -824,8 +836,8 @@ fn apply_metadata<C: Deliveries>(sh: &Arc<Shared<C>>, md: &wire::Metadata) {
 }
 
 /// Messages queued past their deadline given up; a batch in flight past its first message's
-/// deadline too, which makes the producer fatal if the broker may have written it (its sequence
-/// may now have a gap), else gives its sequence to the next batch.
+/// deadline too, which makes an idempotent producer fatal if the broker may have written it (its
+/// sequence may now have a gap), else gives its sequence to the next batch.
 fn expire<O>(st: &mut State<O>, now: Instant) {
     let mut gone = vec![];
     let mut gap = None;
@@ -847,7 +859,9 @@ fn expire<O>(st: &mut State<O>, now: Instant) {
             if timed_out {
                 let s = part.inflight.take().expect("in flight");
                 let persisted = if s.maybe_written {
-                    gap = Some(format!("{name}/{id}: a batch timed out in flight (message.timeout.ms)"));
+                    if st.idempotent {
+                        gap = Some(format!("{name}/{id}: a batch timed out in flight (message.timeout.ms)"));
+                    }
                     Persisted::Possibly
                 } else {
                     part.seq = s.seq; // never written: the broker's next sequence is still its
@@ -979,7 +993,12 @@ fn take_due<C: Deliveries>(
         fail_queued(st);
         return (out, fresh, None);
     }
-    let Some((pid, epoch)) = st.pid else { return (out, fresh, None) };
+    // without idempotence, no producer id and no sequences (-1: none)
+    let (pid, epoch) = match (s.idempotent, st.pid) {
+        (false, _) => (-1, -1),
+        (true, Some(id)) => id,
+        (true, None) => return (out, fresh, None),
+    };
     // what is due: since when, its partition, how many messages to seal (0: one to send again),
     // its bytes (a batch to seal: as `size_of` counts them, which its encoding does not pass)
     let mut due: Vec<(Instant, Arc<str>, i32, usize, usize)> = vec![];
@@ -1044,7 +1063,8 @@ fn take_due<C: Deliveries>(
             attempts: 1,
             maybe_written: false,
         });
-        fresh.push((name.clone(), pnum, msgs, Stamp { producer_id: pid, epoch, base_sequence: seq }));
+        let base_sequence = if s.idempotent { seq } else { -1 };
+        fresh.push((name.clone(), pnum, msgs, Stamp { producer_id: pid, epoch, base_sequence }));
         sealed.push((name, pnum));
     }
     // the next keyless messages go to another partition: a partition a batch (librdkafka's sticky
@@ -1358,7 +1378,7 @@ fn ask<C: Deliveries>(
     let until = Instant::now() + left.min(sh.s.request_timeout + sh.client.net().request_timeout);
     let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX).max(1);
     let batches: Vec<(&str, (i32, &[u8]))> = req.iter().map(|(t, p, b, _)| (&**t, (*p, b.as_slice()))).collect();
-    let sent = c.send_request(wire::PRODUCE, until, |o| wire::produce_request(o, -1, ms, &batches));
+    let sent = c.send_request(wire::PRODUCE, until, |o| wire::produce_request(o, sh.s.acks, ms, &batches));
     drop(batches);
     match sent {
         Ok(corr) => Ok(Asked { req, corr, until }),
@@ -1402,7 +1422,7 @@ fn applied<C: Deliveries>(sh: &Shared<C>, st: &mut State<C::Opaque>, req: &Reque
                 // one batch a partition in flight: refused before it was appended, and no attempt
                 // of it written, no later sequence was sent, and the broker's next is this batch's
                 sent.maybe_written |= !refused_before_append(c) && !sequence_broken(c);
-                let gap = sent.maybe_written || sequence_broken(c);
+                let gap = st.idempotent && (sent.maybe_written || sequence_broken(c));
                 if !gap {
                     part.seq = sent.seq;
                 }

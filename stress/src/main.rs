@@ -6,11 +6,17 @@
 //! client makes (bootstrap, leaders, the producer's and the consumer's) passes through it.
 //!
 //! Checked, for every message the producer was given:
-//! - **at most once**: no message is in the log twice (the idempotent producer, through retries);
+//! - **at most once**: no message is in the log twice (the idempotent producer, through retries).
+//!   With `STRESS_IDEMPOTENCE=false` a retry may write a message again, so copies are counted, and
+//!   the checks below hold of every copy (reported truly) or of each message's first (in order); no
+//!   such producer is ever fatal;
 //! - **reported truly**: a delivery reported at an offset is in the log at that offset; a message
 //!   reported not persisted is not in the log at all;
 //! - **in order**: a key's messages are in the log in the order sent (one producer's, until it is
-//!   fatal and replaced: a new producer is a new sequence);
+//!   fatal and replaced: a new producer is a new sequence). Without idempotence, a key's messages
+//!   reported delivered: a request given up at its timeout (its messages reported failed,
+//!   possibly persisted) may still land after later ones, and only a producer id would let the
+//!   broker refuse it (which is why an idempotent producer goes fatal there instead);
 //! - **every outcome reported**: each message sent has exactly one delivery report;
 //! - **read whole**: the consumer, reading through the same faults, reads each partition's log
 //!   exactly as a reader without faults does: no record skipped, none twice, in offset order.
@@ -177,6 +183,12 @@ fn main() {
             cfg.set(k, &v);
         }
     }
+    // without idempotence (STRESS_IDEMPOTENCE=false, STRESS_ACKS=1 or all): batches without a
+    // producer id, as a broker's dedup filter needs them
+    let plain = std::env::var("STRESS_IDEMPOTENCE").is_ok_and(|v| v == "false");
+    if plain {
+        cfg.set("enable.idempotence", "false").set("acks", env("STRESS_ACKS", "all".to_string()));
+    }
     let admin = fastka::client::Client::new(&cfg).unwrap();
     for (t, r) in admin.create_topics(&[(topic.clone(), parts, 1)], Duration::from_secs(20)).unwrap() {
         r.unwrap_or_else(|e| panic!("creating {t}: {e}"));
@@ -263,8 +275,9 @@ fn main() {
             ));
         }
     }
-    // where each message is in the log
+    // where each message is in the log: its first copy; `copies` the others (without idempotence)
     let mut at: HashMap<usize, (i32, i64)> = HashMap::new();
+    let mut copies: HashMap<usize, Vec<(i32, i64)>> = HashMap::new();
     for (p, log) in clean.iter().enumerate() {
         for &(offset, ref key, id) in log {
             let Some(s) = sent.get(id) else {
@@ -274,8 +287,12 @@ fn main() {
             if *key != format!("k{}", s.key) {
                 fail(format!("message {id}: key {key}, sent with k{}", s.key));
             }
-            if let Some(first) = at.insert(id, (p as i32, offset)) {
-                fail(format!("message {id} written twice: at {first:?} and {:?}", (p, offset)));
+            match at.get(&id) {
+                None => drop(at.insert(id, (p as i32, offset))),
+                Some(first) if !plain => {
+                    fail(format!("message {id} written twice: at {first:?} and {:?}", (p, offset)))
+                }
+                Some(_) => copies.entry(id).or_default().push((p as i32, offset)),
             }
         }
     }
@@ -288,7 +305,9 @@ fn main() {
         match (err, at.get(&id)) {
             (None, Some(&(p, o))) => {
                 delivered += 1;
-                if *part != Some(p) || offset.is_some_and(|x| x != o) {
+                // without idempotence, reported at any of its copies (the one whose answer came)
+                let other = |x: i64| copies.get(&id).is_some_and(|c| c.contains(&(p, x)));
+                if *part != Some(p) || offset.is_some_and(|x| x != o && !other(x)) {
                     fail(format!("message {id}: reported at {part:?}/{offset:?}, in the log at {p}/{o}"));
                 }
             }
@@ -305,17 +324,27 @@ fn main() {
             }
         }
     }
-    // a key's messages in the log in the order sent, within one producer's generation
-    for log in &clean {
+    // a key's messages in the log in the order sent, within one producer's generation (each
+    // message's first copy)
+    for (p, log) in clean.iter().enumerate() {
         let mut last: HashMap<(u32, u32), usize> = HashMap::new();
         for &(offset, _, id) in log {
             let Some(s) = sent.get(id) else { continue };
+            if at.get(&id) != Some(&(p as i32, offset)) {
+                continue; // a later copy
+            }
+            if plain && s.outcome.as_ref().is_some_and(|o| o.2.is_some()) {
+                continue; // reported failed (possibly persisted): it may have landed late
+            }
             if let Some(prev) = last.insert((s.key, s.generation), id) {
                 if prev > id {
                     fail(format!("key k{}: message {id} at offset {offset} after message {prev}, sent later", s.key));
                 }
             }
         }
+    }
+    if plain && fatal_producers > 0 {
+        fail(format!("{fatal_producers} producers fatal without idempotence"));
     }
     let records: usize = clean.iter().map(Vec::len).sum();
     let distinct: HashSet<usize> = at.keys().copied().collect();

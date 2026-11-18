@@ -80,7 +80,8 @@ fn sink(topics: &'static [&'static str], parts: i32, fault: Fault) -> (Broker, L
 fn produce(r: &Req, logs: &Logs) -> Vec<u8> {
     let mut c = Cur::new(&r.body);
     assert_eq!(c.nstr().unwrap(), None, "not transactional");
-    assert_eq!(c.i16().unwrap(), -1, "acks=all");
+    let acks = c.i16().unwrap();
+    assert!(acks == -1 || acks == 1, "acks={acks}");
     c.i32().unwrap();
     let mut out = vec![];
     let nt = c.i32().unwrap();
@@ -98,11 +99,19 @@ fn produce(r: &Req, logs: &Logs) -> Vec<u8> {
             let seq = i32::from_be_bytes(batch[53..57].try_into().unwrap());
             let mut l = logs.lock().unwrap();
             let log = l.entry((t.clone(), p)).or_default();
-            if epoch > log.epoch && seq == 0 {
+            // without a producer id: no idempotence, every batch appended (a retry again)
+            let plain = b.producer_id < 0;
+            assert!(plain || acks == -1, "an idempotent producer with acks={acks}");
+            if plain {
+                assert_eq!((epoch, seq), (-1, -1), "a batch without a producer id has no epoch nor sequence");
+            }
+            if !plain && epoch > log.epoch && seq == 0 {
                 // a bumped epoch starts the partition's sequence again: nothing is a duplicate
                 (log.epoch, log.next_seq, log.last) = (epoch, 0, None);
             }
-            let (code, base) = if epoch < log.epoch {
+            let (code, base) = if plain {
+                (0, append(log, batch, &b, epoch, seq))
+            } else if epoch < log.epoch {
                 (47, -1)
             } else if epoch > log.epoch {
                 (45, -1)
@@ -111,20 +120,7 @@ fn produce(r: &Req, logs: &Logs) -> Vec<u8> {
             } else if seq != log.next_seq {
                 (45, -1)
             } else {
-                let base = log.values.len() as i64;
-                log.pid = b.producer_id;
-                records::read(batch, &ReadOpts { check_crcs: true, ..Default::default() }, &mut vec![], |r| {
-                    let hs = r.headers().map(|(k, v)| (k.to_string(), v.map(<[u8]>::to_vec))).collect();
-                    log.values.push((r.value.unwrap_or_default().to_vec(), hs));
-                    log.records.push((r.key.map(<[u8]>::to_vec), r.value.map(<[u8]>::to_vec)));
-                    log.stamps.push(r.timestamp);
-                    log.ids.push((b.producer_id, epoch));
-                })
-                .unwrap();
-                log.batches += 1;
-                log.next_seq = seq + b.count;
-                log.last = Some((seq, base));
-                (0, base)
+                (0, append(log, batch, &b, epoch, seq))
             };
             out.i32(p);
             out.i16(code);
@@ -137,6 +133,24 @@ fn produce(r: &Req, logs: &Logs) -> Vec<u8> {
     }
     out.i32(0);
     out
+}
+
+/// A batch appended to its partition's log: its base offset.
+fn append(log: &mut Log, batch: &[u8], b: &records::Batch, epoch: i16, seq: i32) -> i64 {
+    let base = log.values.len() as i64;
+    log.pid = b.producer_id;
+    records::read(batch, &ReadOpts { check_crcs: true, ..Default::default() }, &mut vec![], |r| {
+        let hs = r.headers().map(|(k, v)| (k.to_string(), v.map(<[u8]>::to_vec))).collect();
+        log.values.push((r.value.unwrap_or_default().to_vec(), hs));
+        log.records.push((r.key.map(<[u8]>::to_vec), r.value.map(<[u8]>::to_vec)));
+        log.stamps.push(r.timestamp);
+        log.ids.push((b.producer_id, epoch));
+    })
+    .unwrap();
+    log.batches += 1;
+    log.next_seq = seq.wrapping_add(b.count);
+    log.last = Some((seq, base));
+    base
 }
 
 /// A Produce v8 answer of one partition: an error, no offset.
@@ -2399,4 +2413,173 @@ fn records_sent_before_the_topic_was_known_keep_the_keyless_together() {
     let h = heard(&p, 3);
     let at = |o| h.iter().find(|x| x.5 == o).unwrap().1;
     assert_eq!(at(1), at(3), "the keyless together: {h:?}");
+}
+
+/// The acks of every Produce request the broker was sent.
+fn acks_asked(b: &Broker) -> Vec<i16> {
+    b.requests(wire::PRODUCE)
+        .iter()
+        .map(|r| {
+            let mut c = Cur::new(&r.body);
+            c.nstr().unwrap();
+            c.i16().unwrap()
+        })
+        .collect()
+}
+
+const PLAIN: (&str, &str) = ("enable.idempotence", "false");
+
+/// Without idempotence no producer id is asked for, and every batch carries none (producer id,
+/// epoch and base sequence -1): what a broker that treats batches without one apart (a dedup
+/// filter, which skips idempotent batches) needs to see. The acks asked are the ones set.
+#[test]
+fn without_idempotence_no_producer_id_is_asked_nor_carried() {
+    for (acks, want) in [(None, -1), (Some("all"), -1), (Some("-1"), -1), (Some("1"), 1)] {
+        let (b, logs) = sink(&["o"], 2, no_fault());
+        let mut extra = vec![PLAIN, ("batch.num.messages", "4")];
+        extra.extend(acks.map(|a| ("acks", a)));
+        let p = producer(&b, &extra);
+        for i in 0..40 {
+            p.send(Record::to("o").key(format!("k{}", i % 5).as_bytes()).value(format!("m{i}").as_bytes()), i).unwrap();
+        }
+        let h = heard(&p, 40);
+        assert!(h.iter().all(|x| x.3.is_none() && x.6 == Persisted::Yes), "{acks:?}: {h:?}");
+        assert!(b.requests(wire::INIT_PRODUCER_ID).is_empty(), "{acks:?}: a producer id asked for");
+        let l = log_of(&logs);
+        let ids: Vec<(i64, i16)> = l.values().flat_map(|l| l.ids.clone()).collect();
+        assert_eq!(ids, vec![(-1, -1); 40], "{acks:?}: every record without a producer id");
+        let asked = acks_asked(&b);
+        assert!(!asked.is_empty() && asked.iter().all(|a| *a == want), "{acks:?}: {asked:?}");
+        // each reported at its own offset, each partition in the order sent
+        for x in &h {
+            let i = x.5;
+            let log = &l[&(x.0.clone(), x.1.unwrap())];
+            assert_eq!(log.values[x.2.unwrap() as usize].0, format!("m{i}").into_bytes(), "{acks:?}");
+        }
+        for log in l.values() {
+            let v: Vec<u32> =
+                log.values.iter().map(|(v, _)| std::str::from_utf8(&v[1..]).unwrap().parse().unwrap()).collect();
+            assert!(v.windows(2).all(|w| w[0] < w[1]), "{acks:?}: out of order: {v:?}");
+        }
+        drop(l);
+        assert!(p.fatal_error().is_none());
+    }
+}
+
+/// Without idempotence, a batch written whose answer was lost is sent again and written again:
+/// on the log twice, reported delivered once (at the copy answered), the partition's order of
+/// first copies kept, and the producer never fatal.
+#[test]
+fn without_idempotence_a_lost_answer_is_retried_and_may_be_written_twice() {
+    let fault: Fault = Box::new(|r, i, logs| {
+        (i % 2 == 0).then(|| {
+            let _ = produce(r, logs); // written, then the answer lost
+            Answer::Drop
+        })
+    });
+    let (b, logs) = sink(&["o"], 1, fault);
+    let p = producer(&b, &[PLAIN, ("batch.num.messages", "3")]);
+    for i in 0..10 {
+        send(&p, "o", &format!("m{i}"), i);
+    }
+    let h = heard(&p, 10);
+    assert!(h.iter().all(|x| x.3.is_none() && x.6 == Persisted::Yes), "{h:?}");
+    let mut opaques: Vec<u64> = h.iter().map(|x| x.5).collect();
+    opaques.sort_unstable();
+    assert_eq!(opaques, (0..10).collect::<Vec<_>>(), "each reported once");
+    let v = values(&logs, "o", 0);
+    assert!(v.len() > 10, "written again: {v:?}");
+    let mut first = v.clone();
+    let mut seen = std::collections::HashSet::new();
+    first.retain(|m| seen.insert(m.clone()));
+    assert_eq!(first, (0..10).map(|i| format!("m{i}")).collect::<Vec<_>>(), "every message, in order");
+    for x in &h {
+        assert_eq!(v[x.2.unwrap() as usize], format!("m{}", x.5), "reported at a copy of its own");
+    }
+    assert!(p.fatal_error().is_none());
+}
+
+/// Without idempotence, a batch in flight that times out (the broker never answers) fails,
+/// possibly persisted, and the producer goes on: there is no sequence a gap could break. Once
+/// the broker answers again, later messages are delivered by the same producer.
+#[test]
+fn without_idempotence_a_batch_timed_out_in_flight_is_not_fatal() {
+    let quiet = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let q2 = quiet.clone();
+    let (b, logs) = sink(&["o"], 1, Box::new(move |_, _, _| q2.load(Ordering::SeqCst).then_some(Answer::Silence)));
+    let p = producer(
+        &b,
+        &[PLAIN, ("message.timeout.ms", "400"), ("request.timeout.ms", "100"), ("socket.timeout.ms", "100")],
+    );
+    send(&p, "o", "x", 1);
+    let h = heard(&p, 1);
+    assert_eq!((h[0].3.as_deref(), h[0].6), (Some("message timed out (message.timeout.ms)"), Persisted::Possibly));
+    assert!(p.fatal_error().is_none(), "{:?}", p.fatal_error());
+    quiet.store(false, Ordering::SeqCst);
+    send(&p, "o", "y", 2);
+    let h = heard(&p, 2);
+    assert_eq!((h[1].5, h[1].3.as_ref(), h[1].6), (2, None, Persisted::Yes), "{h:?}");
+    assert_eq!(values(&logs, "o", 0), ["y"]);
+}
+
+/// Without idempotence, a batch refused for good fails alone: whatever the code (one this crate
+/// does not know, one about sequences), the producer is not fatal and the next batch is sent.
+#[test]
+fn without_idempotence_a_refusal_fails_its_batch_alone() {
+    for code in [45, 87, 10] {
+        // OUT_OF_ORDER_SEQUENCE_NUMBER, INVALID_RECORD, MESSAGE_TOO_LARGE
+        let fault: Fault = Box::new(move |_, i, _| (i == 0).then(|| Answer::Body(refusal("o", 0, code))));
+        let (b, logs) = sink(&["o"], 1, fault);
+        let p = producer(&b, &[PLAIN]);
+        send(&p, "o", "x", 1);
+        let h = heard(&p, 1);
+        assert_eq!(h[0].4, Some(Code(code)), "{code}: {h:?}");
+        assert!(p.fatal_error().is_none(), "{code}: {:?}", p.fatal_error());
+        send(&p, "o", "y", 2);
+        let h = heard(&p, 2);
+        assert_eq!((h[1].5, h[1].3.as_ref()), (2, None), "{code}: {h:?}");
+        assert_eq!(values(&logs, "o", 0), ["y"], "{code}");
+    }
+}
+
+/// Without idempotence, many messages over a connection that drops every few requests, pipelined
+/// too: each delivered, each partition's first copies in the order sent, the copies past them
+/// only where an answer was lost.
+#[test]
+fn without_idempotence_under_repeated_faults_each_message_lands_in_order() {
+    let pipelined: &[(&str, &str)] = &[("max.in.flight", "5"), ("max.request.size", "300")];
+    for (parts, extra) in [(2, &[][..]), (6, pipelined)] {
+        let fault: Fault = Box::new(|r, i, logs| match i % 5 {
+            1 => {
+                let _ = produce(r, logs);
+                Some(Answer::Drop)
+            }
+            3 => Some(Answer::Drop),
+            _ => None,
+        });
+        let (b, logs) = sink(&["o"], parts, fault);
+        let mut settings = vec![PLAIN, ("acks", "1"), ("batch.num.messages", "7"), ("linger.ms", "1")];
+        settings.extend_from_slice(extra);
+        let p = producer(&b, &settings);
+        for i in 0..300 {
+            send(&p, "o", &format!("m{i}"), i);
+            if i % 50 == 0 {
+                p.poll(Duration::ZERO);
+            }
+        }
+        let h = heard(&p, 300);
+        assert!(h.iter().all(|x| x.3.is_none()), "{extra:?}: {:?}", h.iter().find(|x| x.3.is_some()));
+        let mut all = vec![];
+        for q in 0..parts {
+            let v: Vec<u32> = values(&logs, "o", q).iter().map(|m| m[1..].parse().unwrap()).collect();
+            let mut seen = std::collections::HashSet::new();
+            let first: Vec<u32> = v.iter().copied().filter(|m| seen.insert(*m)).collect();
+            assert!(first.windows(2).all(|w| w[0] < w[1]), "{extra:?}: partition {q} out of order: {v:?}");
+            all.extend(first);
+        }
+        all.sort_unstable();
+        assert_eq!(all, (0..300).collect::<Vec<_>>(), "{extra:?}: none lost");
+        assert!(p.fatal_error().is_none(), "{extra:?}");
+        assert!(b.requests(wire::INIT_PRODUCER_ID).is_empty());
+    }
 }
