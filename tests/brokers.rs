@@ -368,3 +368,77 @@ fn apache_kafka_lost_answer() {
     };
     a_lost_answer_is_written_once(&addr);
 }
+
+/// The (producer id, base sequence) of every batch of `topic`/`partition` on the broker's log,
+/// read with one raw Fetch (a one-broker cluster: it leads every partition).
+fn batch_ids(addr: &str, topic: &str, partition: i32) -> Vec<(i64, i32)> {
+    use fastka::wire;
+    let client = Client::new(&cfg(addr)).unwrap();
+    let l = wire::FetchLimits {
+        max_wait_ms: 0,
+        min_bytes: 0,
+        max_bytes: 64 << 20,
+        isolation: 0,
+        partition_max_bytes: 64 << 20,
+    };
+    let frame = client.call_any(wire::FETCH, &|o| wire::fetch_request(o, &l, &[(topic, (partition, 0))]), T).unwrap();
+    let fetched = wire::fetch(wire::Cur::new(&frame)).unwrap();
+    let part = fetched.parts.iter().find(|p| p.topic == topic && p.partition == partition).unwrap();
+    assert_eq!(part.error, Code::NONE);
+    fastka::records::batches(&frame[part.records.clone()])
+        .map(|b| b.unwrap())
+        // the base sequence: header bytes 53..57, `checked` starting after the CRC (byte 21)
+        .map(|b| (b.producer_id, i32::from_be_bytes(b.checked[53 - 21..57 - 21].try_into().unwrap())))
+        .collect()
+}
+
+/// Without idempotence, against a broker: in every codec and with acks=1 and all, every batch on
+/// the log carries no producer id (what a broker's dedup filter that skips idempotent batches
+/// needs to see), and each message is read back once, in order, at the offset reported. With
+/// idempotence (the default) the same batches carry the id the broker gave.
+fn without_idempotence(addr: &str) {
+    let client = Client::new(&cfg(addr)).unwrap();
+    for (idempotence, acks) in [("false", "1"), ("false", "all"), ("true", "all")] {
+        let topic = unique(&format!("plain-{idempotence}-{acks}"));
+        assert_eq!(client.create_topics(&[(topic.clone(), 2, -1)], T).unwrap()[0].1, Ok(()));
+        let mut sent = vec![];
+        for codec in ["none", "gzip", "snappy", "lz4", "zstd"] {
+            let mut c = cfg(addr);
+            c.set("enable.idempotence", idempotence).set("acks", acks);
+            c.set("compression.type", codec).set("batch.num.messages", "40");
+            let values: Vec<String> = (0..100).map(|i| format!("{codec}-{i:03}")).collect();
+            let h = produce_all(&c, &topic, &values);
+            assert!(h.iter().all(|x| x.2.is_none() && x.1.is_some()), "{acks}/{codec}: {h:?}");
+            sent.extend(values.into_iter().zip(h));
+        }
+        let read = consume_all(&cfg(addr), &topic, &[0, 1]);
+        assert_eq!(read.len(), sent.len(), "{idempotence}/{acks}: each once");
+        for (v, (p, o, _, _)) in &sent {
+            let (_, m) = read.iter().find(|(rp, m)| Some(*rp) == *p && Some(m.offset) == *o).expect("at its offset");
+            assert_eq!(m.value.as_deref(), Some(v.as_bytes()), "{idempotence}/{acks}");
+        }
+        for p in [0, 1] {
+            let ids = batch_ids(addr, &topic, p);
+            assert!(!ids.is_empty(), "{idempotence}/{acks}: partition {p} empty");
+            if idempotence == "false" {
+                assert!(ids.iter().all(|i| *i == (-1, -1)), "{acks}: partition {p}: {ids:?}");
+            } else {
+                assert!(ids.iter().all(|i| i.0 >= 0 && i.1 >= 0), "idempotent: partition {p}: {ids:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn redpanda_without_idempotence() {
+    let Some(addr) = brokers("FASTKA_IT") else { return eprintln!("FASTKA_IT unset: skipped") };
+    without_idempotence(&addr);
+}
+
+#[test]
+fn apache_kafka_without_idempotence() {
+    let Some(addr) = brokers("FASTKA_IT_APACHE") else {
+        return eprintln!("FASTKA_IT_APACHE unset: skipped");
+    };
+    without_idempotence(&addr);
+}

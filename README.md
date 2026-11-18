@@ -42,7 +42,12 @@ runs; [details below](#benchmarks)):
     flight included;
   - partitioning by key with Java's murmur2, so keyed records land where the Java client puts
     them; sticky partitioning (KIP-480) for keyless records;
-  - each report says whether a failed message may still have been written (`Persisted::Possibly`).
+  - each report says whether a failed message may still have been written (`Persisted::Possibly`);
+  - with `enable.idempotence=false`, librdkafka's plain producer (`acks=1` or `all`): no producer
+    id, so a broker that treats such batches apart (a dedup filter that skips idempotent batches)
+    sees every one. A retry may then write a batch twice, and a request given up at its timeout
+    may land after later ones; the messages reported delivered keep their order, and nothing
+    makes the producer fatal.
 - **A control plane:**
   - metadata and watermarks;
   - offsets for timestamps;
@@ -68,6 +73,7 @@ loudly at startup, not half-supported:
 |---|---|
 | **Consumer groups** (subscribe, rebalancing, partition assignment by the broker) | Assign partitions yourself (`Assignment`). You can still commit offsets to a group with `Client::commit`. |
 | **Transactions** (transactional producer, exactly-once across topics) | rdkafka. fastka *reads* transactional topics correctly with `read_committed`. |
+| **acks=0** (fire and forget: no answer, so a loss looks like a delivery) | `acks=1` with `enable.idempotence=false`, or rdkafka. |
 | **async/await** | It is synchronous by design. In an async program, run it on a dedicated thread (`spawn_blocking`), or use rskafka. |
 | **GSSAPI/Kerberos, OAUTHBEARER, encrypted private keys, JKS/PKCS#12** | rdkafka. |
 | **Flexible protocol versions (KIP-482 tagged fields), Fetch sessions (KIP-227), leader epochs (KIP-320), SASL re-authentication (KIP-368)** | Every broker from Kafka 2.4 to 4.1, and Redpanda, still speaks the versions used here. A broker that drops them is refused at connect, naming the API. |
@@ -233,7 +239,7 @@ Every claim below is a test in this repository that CI runs.
 - **Unit tests against an in-process broker** that drops connections, stalls, moves leaders,
   refuses, throttles and corrupts. A corrupt batch is fetched again on a new connection and
   never delivered.
-- **The stress harness** (`stress/`).
+- **The stress harness** (`stress/`), idempotent and not.
   - The producer and consumer run against a real Redpanda through a proxy that, at random:
     - cuts connections mid-frame;
     - stalls them for seconds;
@@ -244,8 +250,10 @@ Every claim below is a test in this repository that CI runs.
     - every report is true;
     - a key's order is kept;
     - the consumer reads every partition exactly as a reader without faults does.
-  - Each profile (lz4, none, zstd, lz4 with `max.in.flight=5` and small requests, and a harsh
-    one whose stalls outlast `message.timeout.ms`)
+  - Each profile (lz4, none, zstd, lz4 with `max.in.flight=5` and small requests, a harsh
+    one whose stalls outlast `message.timeout.ms`, and three with `enable.idempotence=false`:
+    acks=1, acks=all pipelined, and harsh; there copies are allowed, every report must be true of
+    them, a key's delivered messages in order, and no producer fatal)
     runs for 90 s on every PR and for 15 minutes nightly, with a new seed each run. The last
     local run sent 31M messages; 22 producers went fatal in the harsh profile and 33k reports
     said "possibly persisted", and every invariant held.
@@ -408,8 +416,9 @@ Settings use librdkafka's names and defaults, except where noted. Unknown keys a
     helps only when several requests' worth of batches are due at once, so pair it with a
     `max.request.size` below them: 5 and 1048576 give librdkafka's request shape
     (`bench/kafka-stress`).
-  - `enable.idempotence=false` and any `acks` other than `all` are refused: the producer is always
-    idempotent.
+  - `enable.idempotence` (default `true`) and `acks` (or `request.required.acks`, default `all`).
+    `acks=1` needs `enable.idempotence=false`. `acks=0` is refused: every Produce is answered here,
+    so a delivery is never told from a loss by guesswork.
 
 ## License
 

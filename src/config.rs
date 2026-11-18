@@ -268,8 +268,8 @@ pub struct ConsumerSettings {
     pub check_crcs: bool,
 }
 
-/// A producer's settings, made by `Config::producer`. The producer is always idempotent with
-/// `acks=all`.
+/// A producer's settings, made by `Config::producer`. The producer is idempotent with `acks=all`
+/// unless `enable.idempotence=false`.
 #[derive(Clone, Debug)]
 pub struct ProducerSettings {
     /// How long a partition's first queued message waits for others before its batch is sent
@@ -316,6 +316,14 @@ pub struct ProducerSettings {
     /// The metadata looked up again this often (`topic.metadata.refresh.interval.ms`, default
     /// 300000 ms, at least 10 ms); None for -1: never.
     pub metadata_refresh: Option<Duration>,
+    /// Whether the producer is idempotent (`enable.idempotence`, default true): it has a producer
+    /// id, and each batch a sequence the broker writes once. False: batches carry no producer id
+    /// (-1), so a retry of a batch whose answer was lost may be written twice, and nothing makes
+    /// the producer fatal.
+    pub idempotent: bool,
+    /// The acks each Produce asks for (`acks` or `request.required.acks`): -1 (`all`, the
+    /// default) or, without idempotence, 1 (the leader's).
+    pub acks: i16,
 }
 
 impl Config {
@@ -478,24 +486,30 @@ impl Config {
     /// # Errors
     ///
     /// [`Error::Config`]: a key this client does not know, a value out of range or not of its
-    /// type, or a key and its alias set to different values. Also: `enable.idempotence=false`, `acks` other than
-    /// `all`/`-1`, or `linger.ms` not less than `message.timeout.ms`.
+    /// type, or a key and its alias set to different values. Also: `acks=0` (every Produce is
+    /// answered here), `acks=1` with idempotence, or `linger.ms` not less than `message.timeout.ms`.
     pub fn producer(&self) -> Result<ProducerSettings> {
         self.check()?;
         let g = |k, d| self.get(k).unwrap_or(d);
-        // every producer of this client is idempotent: its ordering and once-only writes rest on it
-        if let Some(v) = self.get("enable.idempotence") {
-            if !boolean("enable.idempotence", v)? {
-                return Err(Error::Config("enable.idempotence=false: this producer is always idempotent".into()));
+        // idempotent unless told otherwise: its once-only writes rest on it
+        let idempotent = match self.get("enable.idempotence") {
+            Some(v) => boolean("enable.idempotence", v)?,
+            None => true,
+        };
+        let acks = match self.aliased("acks", "request.required.acks")?.map(str::trim) {
+            None | Some("all" | "-1") => -1,
+            Some("1") if !idempotent => 1,
+            Some("1") => {
+                return Err(Error::Config(
+                    "acks=1: an idempotent producer waits for all replicas (acks=all); \
+                     enable.idempotence=false for acks=1"
+                        .into(),
+                ))
             }
-        }
-        if let Some(v) = self.get("acks").or(self.get("request.required.acks")) {
-            if !matches!(v.trim(), "all" | "-1") {
-                return Err(Error::Config(format!(
-                    "acks={v}: an idempotent producer waits for all replicas (acks=all)"
-                )));
-            }
-        }
+            // no answer to wait for: a delivery could never be told from a loss
+            Some("0") => return Err(Error::Config("acks=0: every Produce is answered here (acks=1 or all)".into())),
+            Some(v) => return Err(Error::Config(format!("acks={v}: all, -1 or 1"))),
+        };
         for k in ["retries", "message.send.max.retries"] {
             if let Some(v) = self.get(k) {
                 int(k, v, 0, i32::MAX as i64)?; // retries are bounded by message.timeout.ms
@@ -572,6 +586,8 @@ impl Config {
                 // a value out of range named by the key it was set under
                 int(if self.get(long).is_some() { long } else { "max.in.flight" }, v, 1, 5)? as usize
             },
+            idempotent,
+            acks,
             metadata_refresh: match int(
                 "topic.metadata.refresh.interval.ms",
                 g("topic.metadata.refresh.interval.ms", "300000"),
@@ -663,8 +679,10 @@ mod tests {
             ("ssl.keystore.location", "/x", "not a setting this client honours"),
             ("sasl.kerberos.service.name", "kafka", "not a setting this client honours"),
             ("security.protocol", "ssl_plaintext", "one of plaintext"),
-            ("enable.idempotence", "false", "always idempotent"),
+            ("enable.idempotence", "maybe", "not a boolean"),
             ("acks", "1", "acks=all"),
+            ("acks", "0", "every Produce is answered"),
+            ("request.required.acks", "2", "all, -1 or 1"),
             ("enable.auto.commit", "true", "commits only when asked"),
             ("compression.type", "brotli", "none, gzip"),
             ("isolation.level", "dirty", "read_committed or"),

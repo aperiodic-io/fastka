@@ -21,3 +21,11 @@ STRESS_CODEC=lz4 STRESS_MAX_IN_FLIGHT=5 STRESS_MAX_REQUEST_SIZE=65536 target/rel
 # producers go fatal and are replaced, and every report must still be true
 STRESS_CODEC=lz4 STRESS_CUT_PPM=30000 STRESS_STALL_PPM=20000 STRESS_STALL_MS=6000 \
   STRESS_MESSAGE_TIMEOUT_MS=3000 target/release/fastka-stress
+# without idempotence (enable.idempotence=false: batches without a producer id, as a broker's dedup
+# filter needs them): a retry may write a message again, every report must still be true, a key's
+# first copies in order, and no producer fatal; acks=1 and all, pipelined, and the harsh faults
+STRESS_CODEC=zstd STRESS_IDEMPOTENCE=false STRESS_ACKS=1 target/release/fastka-stress
+STRESS_CODEC=lz4 STRESS_IDEMPOTENCE=false STRESS_ACKS=all STRESS_MAX_IN_FLIGHT=5 STRESS_MAX_REQUEST_SIZE=65536 \
+  target/release/fastka-stress
+STRESS_CODEC=lz4 STRESS_IDEMPOTENCE=false STRESS_ACKS=1 STRESS_CUT_PPM=30000 STRESS_STALL_PPM=20000 \
+  STRESS_STALL_MS=6000 STRESS_MESSAGE_TIMEOUT_MS=3000 target/release/fastka-stress
