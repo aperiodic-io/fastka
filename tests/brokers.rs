@@ -442,3 +442,33 @@ fn apache_kafka_without_idempotence() {
     };
     without_idempotence(&addr);
 }
+
+/// A topic created with configs has them: what the broker describes of it.
+fn created_with_configs(addr: &str) {
+    let client = Client::new(&cfg(addr)).unwrap();
+    let topic = unique("compacted");
+    let configs: &[(&str, &str)] = &[("cleanup.policy", "compact"), ("retention.ms", "3600000")];
+    let made = client.create_topics_with(&[(topic.clone(), 1, -1, configs)], T).unwrap();
+    assert_eq!(made[0].1, Ok(()));
+    let got = client.describe_topic_configs(&[&topic], T).unwrap().pop().unwrap().unwrap();
+    assert_eq!(got.get("cleanup.policy"), Some(&Some("compact".to_string())));
+    assert_eq!(got.get("retention.ms"), Some(&Some("3600000".to_string())));
+    // a config the broker does not take is the topic's own error
+    let bad: &[(&str, &str)] = &[("cleanup.policy", "shred")];
+    let made = client.create_topics_with(&[(unique("bad"), 1, -1, bad)], T).unwrap();
+    assert!(made[0].1.is_err(), "{made:?}");
+}
+
+#[test]
+fn redpanda_created_with_configs() {
+    let Some(addr) = brokers("FASTKA_IT") else { return eprintln!("FASTKA_IT unset: skipped") };
+    created_with_configs(&addr);
+}
+
+#[test]
+fn apache_kafka_created_with_configs() {
+    let Some(addr) = brokers("FASTKA_IT_APACHE") else {
+        return eprintln!("FASTKA_IT_APACHE unset: skipped");
+    };
+    created_with_configs(&addr);
+}

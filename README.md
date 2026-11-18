@@ -52,7 +52,7 @@ runs; [details below](#benchmarks)):
   - metadata and watermarks;
   - offsets for timestamps;
   - topic configs;
-  - topic creation (idempotent across a lost answer);
+  - topic creation, with configs if given (idempotent across a lost answer);
   - offset commits for a group.
 - **TLS** through rustls: a CA given by file or PEM, otherwise the system roots; client
   certificates.
