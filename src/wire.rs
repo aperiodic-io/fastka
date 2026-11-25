@@ -747,21 +747,28 @@ pub fn offset_fetch_request(out: &mut Vec<u8>, group: &str, parts: &[(&str, i32)
 pub type FetchedOffset = (String, i32, i64, Code);
 
 /// The partitions' offsets and the group's own error (v2+: e.g. COORDINATOR_LOAD_IN_PROGRESS).
-pub fn offset_fetch(mut c: Cur<'_>) -> Result<(Vec<FetchedOffset>, Code)> {
-    c.i32()?; // throttle
+pub fn offset_fetch(c: Cur<'_>) -> Result<(Vec<FetchedOffset>, Code)> {
     let mut out = vec![];
-    // a topic: name 2, partitions 4; a partition: index 4, offset 8, metadata 2, error 2
+    let code = offset_fetch_each(c, |t, p, o, e| out.push((t.to_string(), p, o, e)))?;
+    Ok((out, code))
+}
+
+/// `offset_fetch`'s reading, each partition (topic, partition, offset, error) handed to `each` as
+/// it is read, nothing allocated: what the Kani proof checks (`proofs.rs`).
+pub fn offset_fetch_each<'a>(mut c: Cur<'a>, mut each: impl FnMut(&'a str, i32, i64, Code)) -> Result<Code> {
+    c.i32()?; // throttle
+              // a topic: name 2, partitions 4; a partition: index 4, offset 8, metadata 2, error 2
     for _ in 0..c.count(6)? {
         let topic = c.str()?;
         for _ in 0..c.count(16)? {
             let (p, offset) = (c.i32()?, c.i64()?);
             c.nstr()?; // the committer's metadata
-            out.push((topic.to_string(), p, offset, c.code()?));
+            each(topic, p, offset, c.code()?);
         }
     }
     let code = c.code()?;
     c.end()?;
-    Ok((out, code))
+    Ok(code)
 }
 
 // SASL -----------------------------------------------------------------------------------------
