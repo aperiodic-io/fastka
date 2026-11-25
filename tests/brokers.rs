@@ -200,6 +200,57 @@ fn interop_with_another_client() {
     client.commit("it-lag", &[(topic.clone(), 0, 3), (topic.clone(), 1, 4)], T).unwrap();
     let described = rpk(&ctr, &["group", "describe", "it-lag"], None);
     assert!(described.contains(&topic), "{described}");
+
+    // what rpk commits as a member of a group (franz-go, its own consumer), this client reads back
+    let read = unique("rpk-group");
+    rpk(&ctr, &["topic", "create", &read, "-p", "1"], None);
+    produce_all(&c, &read, &(0..5).map(|i| i.to_string()).collect::<Vec<_>>());
+    let group = unique("rpk-g");
+    rpk(&ctr, &["topic", "consume", &read, "-g", &group, "-n", "3"], None);
+    assert_eq!(client.committed(&group, &[(read.clone(), 0)], T).unwrap(), [(read.clone(), 0, Some(3))]);
+}
+
+/// Why: the archiver commits each partition's offset after its upload and reads them back when it
+/// starts; an offset read back that is not the one committed re-archives or skips records. Against
+/// each broker: what this client commits it reads back, a later commit over an earlier, and what
+/// was never committed (a partition, a group, a topic the cluster has not) is `None`.
+fn committed_round_trip(c: &Config) {
+    let client = Client::new(c).unwrap();
+    let topic = unique("committed");
+    assert_eq!(client.create_topics(&[(topic.clone(), 3, -1)], T).unwrap()[0].1, Ok(()));
+    let group = unique("g");
+    let asked: Vec<(String, i32)> = (0..3).map(|p| (topic.clone(), p)).collect();
+    assert!(client.committed(&group, &asked, T).unwrap().iter().all(|g| g.2.is_none()), "before any commit");
+    client.commit(&group, &[(topic.clone(), 0, 5), (topic.clone(), 2, 0)], T).unwrap();
+    client.commit(&group, &[(topic.clone(), 0, 9)], T).unwrap();
+    assert_eq!(
+        client.committed(&group, &asked, T).unwrap(),
+        [(topic.clone(), 0, Some(9)), (topic.clone(), 1, None), (topic.clone(), 2, Some(0))]
+    );
+    let missing = unique("no-such-topic");
+    assert_eq!(client.committed(&group, &[(missing.clone(), 0)], T).unwrap(), [(missing, 0, None)]);
+}
+
+#[test]
+fn redpanda_committed_round_trip() {
+    let Some(addr) = brokers("FASTKA_IT") else { return eprintln!("FASTKA_IT unset: skipped") };
+    committed_round_trip(&cfg(&addr));
+}
+
+#[test]
+fn apache_kafka_committed_round_trip() {
+    let Some(addr) = brokers("FASTKA_IT_APACHE") else { return eprintln!("FASTKA_IT_APACHE unset: skipped") };
+    committed_round_trip(&cfg(&addr));
+}
+
+/// Redpanda 26.2, the version the archivers' clusters run, here with SASL/SCRAM.
+#[test]
+fn redpanda_26_committed_round_trip() {
+    let Some(addr) = brokers("FASTKA_IT_SASL") else { return eprintln!("FASTKA_IT_SASL unset: skipped") };
+    let mut c = cfg(&addr);
+    c.set("security.protocol", "sasl_plaintext").set("sasl.mechanisms", "SCRAM-SHA-256");
+    c.set("sasl.username", "it").set("sasl.password", "it-secret");
+    committed_round_trip(&c);
 }
 
 /// SASL/SCRAM against a broker that requires it: each mechanism with the right password, and a

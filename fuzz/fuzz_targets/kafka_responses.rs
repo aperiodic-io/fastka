@@ -7,7 +7,7 @@ use fastka::wire::{self, Cur};
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     let Some((&which, b)) = data.split_first() else { return };
     let c = Cur::new(b);
-    let _ = match which % 13 {
+    let _ = match which % 14 {
         0 => wire::metadata(c).map(drop),
         1 => wire::fetch(c).map(drop),
         2 => wire::list_offsets(c).map(drop),
@@ -20,6 +20,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
         9 => wire::offset_commit(c).map(drop),
         10 => wire::sasl_handshake(c).map(drop),
         11 => wire::sasl_authenticate(c).map(drop),
+        12 => wire::offset_fetch(c).map(drop),
         _ => wire::api_versions(c).map(drop),
     };
 });

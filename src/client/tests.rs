@@ -615,3 +615,155 @@ fn call_any_gives_the_brokers_answer() {
     let got = c.call_any(wire::INIT_PRODUCER_ID, &wire::init_producer_id_request, T).unwrap();
     assert_eq!(got, [0, 0, 0, 7, 9, 9]);
 }
+
+/// An OffsetFetch v3 answer to `r`: each partition asked, its (offset, error) by `of`, and the
+/// group's own error.
+fn offset_fetch_answer(r: &Req, group_error: i16, of: impl Fn(&str, i32) -> Option<(i64, i16)>) -> Vec<u8> {
+    let mut c = Cur::new(&r.body);
+    c.str().unwrap();
+    let mut topics = vec![];
+    for _ in 0..c.i32().unwrap() {
+        let t = c.str().unwrap().to_string();
+        let ps: Vec<i32> = (0..c.i32().unwrap()).map(|_| c.i32().unwrap()).collect();
+        topics.push((t, ps));
+    }
+    let mut out = vec![];
+    out.i32(0);
+    out.i32(topics.len() as i32);
+    for (t, ps) in &topics {
+        out.str(t);
+        let answered: Vec<(i32, (i64, i16))> = ps.iter().filter_map(|&p| of(t, p).map(|a| (p, a))).collect();
+        out.i32(answered.len() as i32);
+        for (p, (o, e)) in answered {
+            out.i32(p);
+            out.i64(o);
+            out.nstr(Some(""));
+            out.i16(e);
+        }
+    }
+    out.i16(group_error);
+    out
+}
+
+/// A broker that is its own group's coordinator (id 7), FindCoordinator answered by `find`, and
+/// OffsetFetch by `fetch`.
+fn coordinator(
+    find: impl Fn() -> i16 + Send + Sync + 'static,
+    fetch: impl Fn(&Req) -> Answer + Send + Sync + 'static,
+) -> Broker {
+    Broker::start(move |r| match r.api {
+        wire::FIND_COORDINATOR => {
+            let (host, port) = r.me.rsplit_once(':').unwrap();
+            let mut out = vec![];
+            out.i32(0);
+            out.i16(find());
+            out.nstr(None);
+            out.i32(7);
+            out.str(host);
+            out.i32(port.parse().unwrap());
+            Answer::Body(out)
+        }
+        wire::OFFSET_FETCH => fetch(r),
+        _ => Answer::Drop,
+    })
+}
+
+/// Why: an archiver resumes each partition from the offset its group committed, so a partition
+/// read back with another's offset, or "no offset" read as 0, re-archives or skips records. Each
+/// offset comes back on the partition asked, in the order asked, and "none committed" (-1) is
+/// `None`, never an offset to start at.
+#[test]
+fn committed_offsets_are_read_from_the_groups_coordinator() {
+    let b = coordinator(
+        || 0,
+        |r| {
+            let mut c = Cur::new(&r.body);
+            assert_eq!(c.str().unwrap(), "g");
+            Answer::Body(offset_fetch_answer(r, 0, |t, p| match (t, p) {
+                ("t", 0) => Some((42, 0)),
+                ("t", 1) => Some((-1, 0)),
+                ("u", 3) => Some((0, 0)),
+                _ => Some((-1, 0)),
+            }))
+        },
+    );
+    let c = Client::new(&config(&b.addr)).unwrap();
+    let asked = [("u".to_string(), 3), ("t".to_string(), 1), ("t".to_string(), 0), ("v".to_string(), 0)];
+    let got = c.committed("g", &asked, T).unwrap();
+    assert_eq!(
+        got,
+        [("u".into(), 3, Some(0)), ("t".into(), 1, None), ("t".into(), 0, Some(42)), ("v".into(), 0, None)]
+    );
+    assert_eq!(b.requests(wire::OFFSET_FETCH).len(), 1, "one request for every partition");
+}
+
+/// Why: right after a leadership storm the group's coordinator moves (NOT_COORDINATOR) or is
+/// still loading the offsets topic (COORDINATOR_LOAD_IN_PROGRESS, the group's own error since v2,
+/// or a partition's): those mend, and a reader that gave up on them would start a partition from
+/// nowhere. Each is asked again, the coordinator looked up again, until the answer.
+#[test]
+fn a_coordinator_moving_or_loading_is_asked_again() {
+    let n = Arc::new(AtomicUsize::new(0));
+    let n2 = n.clone();
+    let b = coordinator(
+        || 0,
+        move |r| {
+            let (group, part) = match n2.fetch_add(1, Ordering::SeqCst) {
+                0 => (14, 0), // the group's own: loading
+                1 => (0, 16), // a partition's: not the coordinator
+                2 => (15, 0), // not available
+                _ => (0, 0),
+            };
+            Answer::Body(offset_fetch_answer(r, group, |_, _| Some((9, part))))
+        },
+    );
+    let mut cfg = config(&b.addr);
+    cfg.set("reconnect.backoff.ms", "1");
+    let c = Client::new(&cfg).unwrap();
+    assert_eq!(c.committed("g", &[("t".into(), 0)], T).unwrap(), [("t".into(), 0, Some(9))]);
+    assert_eq!(n.load(Ordering::SeqCst), 4);
+    assert!(b.requests(wire::FIND_COORDINATOR).len() >= 3, "the coordinator looked up again");
+}
+
+/// Why: a refusal no retry mends (the group not authorized) must reach the caller at once and
+/// name the partition, not hold its start-up until the timeout and then say "timed out".
+#[test]
+fn a_refusal_fails_at_once_naming_the_partition() {
+    let b =
+        coordinator(|| 0, |r| Answer::Body(offset_fetch_answer(r, 0, |_, p| Some((5, if p == 1 { 30 } else { 0 })))));
+    let c = Client::new(&config(&b.addr)).unwrap();
+    let t0 = Instant::now();
+    let e = c.committed("g", &[("t".into(), 0), ("t".into(), 1)], Duration::from_secs(30)).unwrap_err();
+    assert!(t0.elapsed() < Duration::from_secs(5), "not retried: {:?}", t0.elapsed());
+    assert_eq!(e.code(), Some(Code::GROUP_AUTHORIZATION_FAILED));
+    assert!(e.to_string().contains("t/1"), "{e}");
+
+    let b = coordinator(|| 30, |_| Answer::Drop);
+    let c = Client::new(&config(&b.addr)).unwrap();
+    let e = c.committed("g", &[("t".into(), 0)], Duration::from_secs(30)).unwrap_err();
+    assert_eq!(e.code(), Some(Code::GROUP_AUTHORIZATION_FAILED), "FindCoordinator's refusal: {e}");
+}
+
+/// Why: a coordinator answering without a partition it was asked must not read as "no offset"
+/// (the partition would start from `auto.offset.reset`): it is an error, and no panic.
+#[test]
+fn a_partition_left_out_of_the_answer_is_an_error_not_no_offset() {
+    let b = coordinator(|| 0, |r| Answer::Body(offset_fetch_answer(r, 0, |_, p| (p == 0).then_some((5, 0)))));
+    let c = Client::new(&config(&b.addr)).unwrap();
+    let e = c.committed("g", &[("t".into(), 0), ("t".into(), 1)], T).unwrap_err();
+    assert!(matches!(e, Error::Protocol(_)) && e.to_string().contains("t/1"), "{e}");
+}
+
+/// Nothing asked: nothing sent. A partition named twice is the caller's mistake, said before any
+/// request; so is a name the protocol cannot carry.
+#[test]
+fn committed_checks_what_it_is_asked_before_sending() {
+    let b = coordinator(|| 0, |r| Answer::Body(offset_fetch_answer(r, 0, |_, _| Some((1, 0)))));
+    let c = Client::new(&config(&b.addr)).unwrap();
+    assert_eq!(c.committed("g", &[], T).unwrap(), []);
+    let e = c.committed("g", &[("t".into(), 0), ("t".into(), 0)], T).unwrap_err();
+    assert!(matches!(e, Error::Config(_)), "{e}");
+    let e = c.committed(&"g".repeat(40_000), &[("t".into(), 0)], T).unwrap_err();
+    assert!(matches!(e, Error::Config(_)), "{e}");
+    assert!(b.requests(wire::FIND_COORDINATOR).is_empty() && b.requests(wire::OFFSET_FETCH).is_empty());
+}

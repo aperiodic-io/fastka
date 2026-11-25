@@ -20,6 +20,8 @@ pub const VERSIONS: &[(i16, i16, i16, &str)] = &[
     (LIST_OFFSETS, 2, 2, "ListOffsets"),
     (METADATA, 4, 4, "Metadata"),
     (OFFSET_COMMIT, 2, 2, "OffsetCommit"),
+    // v3: the group's own error at the top (v2) and the throttle (v3); every broker since Kafka 2.0
+    (OFFSET_FETCH, 3, 3, "OffsetFetch"),
     (FIND_COORDINATOR, 1, 1, "FindCoordinator"),
     (SASL_HANDSHAKE, 1, 1, "SaslHandshake"),
     (API_VERSIONS, 0, 0, "ApiVersions"),
@@ -34,6 +36,7 @@ pub const FETCH: i16 = 1;
 pub const LIST_OFFSETS: i16 = 2;
 pub const METADATA: i16 = 3;
 pub const OFFSET_COMMIT: i16 = 8;
+pub const OFFSET_FETCH: i16 = 9;
 pub const FIND_COORDINATOR: i16 = 10;
 pub const SASL_HANDSHAKE: i16 = 17;
 pub const API_VERSIONS: i16 = 18;
@@ -721,6 +724,44 @@ pub fn offset_commit(mut c: Cur<'_>) -> Result<Vec<(String, i32, Code)>> {
     }
     c.end()?;
     Ok(out)
+}
+
+// OffsetFetch v3 -------------------------------------------------------------------------------
+
+/// OffsetFetch v3 of `parts` (topic, partition) for `group`: the offsets it committed. Never null
+/// (every topic the group has): only what is asked is answered.
+pub fn offset_fetch_request(out: &mut Vec<u8>, group: &str, parts: &[(&str, i32)]) {
+    out.str(group);
+    let topics = by_topic(parts);
+    out.count(topics.len());
+    for (t, ps) in topics {
+        out.str(t);
+        out.count(ps.len());
+        for p in ps {
+            out.i32(p);
+        }
+    }
+}
+
+/// (topic, partition, committed offset (-1: none), error)
+pub type FetchedOffset = (String, i32, i64, Code);
+
+/// The partitions' offsets and the group's own error (v2+: e.g. COORDINATOR_LOAD_IN_PROGRESS).
+pub fn offset_fetch(mut c: Cur<'_>) -> Result<(Vec<FetchedOffset>, Code)> {
+    c.i32()?; // throttle
+    let mut out = vec![];
+    // a topic: name 2, partitions 4; a partition: index 4, offset 8, metadata 2, error 2
+    for _ in 0..c.count(6)? {
+        let topic = c.str()?;
+        for _ in 0..c.count(16)? {
+            let (p, offset) = (c.i32()?, c.i64()?);
+            c.nstr()?; // the committer's metadata
+            out.push((topic.to_string(), p, offset, c.code()?));
+        }
+    }
+    let code = c.code()?;
+    c.end()?;
+    Ok((out, code))
 }
 
 // SASL -----------------------------------------------------------------------------------------

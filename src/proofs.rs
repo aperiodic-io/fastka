@@ -111,3 +111,23 @@ fn keys_land_on_a_partition_the_topic_has() {
     let h = crate::producer::murmur2(&key[..len]);
     assert!(((h & 0x7fffffff) as usize % n) < n);
 }
+
+/// No bytes make the OffsetFetch decoder panic, and it never yields more partitions than the bytes
+/// could hold (16 bytes each at their smallest): a committed offset read at start-up is one the
+/// coordinator sent, never one made up from a length. The first topic's name is held empty (its
+/// length bytes 0): a string's bytes are `take`n, proved in bounds above, and a symbolic name's
+/// copy is what runs CBMC out of memory; every other byte, the lengths of both arrays and the
+/// response's own included, is any.
+#[kani::proof]
+#[kani::stub(std::fmt::format, no_format)]
+#[kani::unwind(3)]
+fn offset_fetch_never_panics_nor_invents_partitions() {
+    // 33 bytes: the smallest response holding a partition (32), and one past it
+    let mut b: [u8; 33] = kani::any();
+    (b[8], b[9]) = (0, 0);
+    let n: usize = kani::any_where(|n| *n <= 33);
+    if let Ok((parts, _)) = wire::offset_fetch(Cur::new(&b[..n])) {
+        // the throttle (4), a topic array (4), a topic (2 + 4), the group's error (2)
+        assert!(parts.is_empty() || parts.len() * 16 + 16 <= n);
+    }
+}
