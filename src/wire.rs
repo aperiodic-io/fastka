@@ -693,9 +693,10 @@ pub fn find_coordinator(mut c: Cur<'_>) -> Result<(Code, Option<String>, Broker)
 
 // OffsetCommit v2 ------------------------------------------------------------------------------
 
-/// OffsetCommit v2 of `offsets` (topic, (partition, offset)) for `group`, as a client outside the
-/// group's membership commits (generation -1, no member id): the group's offsets for lag tools.
-pub fn offset_commit_request(out: &mut Vec<u8>, group: &str, offsets: &[(&str, (i32, i64))]) {
+/// OffsetCommit v2 of `offsets` (topic, (partition, offset, its metadata)) for `group`, as a client
+/// outside the group's membership commits (generation -1, no member id): the group's offsets for
+/// lag tools.
+pub fn offset_commit_request(out: &mut Vec<u8>, group: &str, offsets: &[(&str, ToCommit<'_>)]) {
     out.str(group);
     out.i32(-1);
     out.str("");
@@ -705,13 +706,16 @@ pub fn offset_commit_request(out: &mut Vec<u8>, group: &str, offsets: &[(&str, (
     for (t, ps) in topics {
         out.str(t);
         out.count(ps.len());
-        for (p, o) in ps {
+        for (p, o, meta) in ps {
             out.i32(p);
             out.i64(o);
-            out.nstr(None);
+            out.nstr(meta);
         }
     }
 }
+
+/// A partition's offset to commit: (partition, offset, its metadata).
+pub type ToCommit<'a> = (i32, i64, Option<&'a str>);
 
 /// (topic, partition, error)
 pub fn offset_commit(mut c: Cur<'_>) -> Result<Vec<(String, i32, Code)>> {
@@ -743,27 +747,30 @@ pub fn offset_fetch_request(out: &mut Vec<u8>, group: &str, parts: &[(&str, i32)
     }
 }
 
-/// (topic, partition, committed offset (-1: none), error)
-pub type FetchedOffset = (String, i32, i64, Code);
+/// (topic, partition, committed offset (-1: none), error, the committer's metadata)
+pub type FetchedOffset = (String, i32, i64, Code, Option<String>);
 
 /// The partitions' offsets and the group's own error (v2+: e.g. COORDINATOR_LOAD_IN_PROGRESS).
 pub fn offset_fetch(c: Cur<'_>) -> Result<(Vec<FetchedOffset>, Code)> {
     let mut out = vec![];
-    let code = offset_fetch_each(c, |t, p, o, e| out.push((t.to_string(), p, o, e)))?;
+    let code = offset_fetch_each(c, |t, p, o, e, m| out.push((t.to_string(), p, o, e, m.map(str::to_string))))?;
     Ok((out, code))
 }
 
-/// `offset_fetch`'s reading, each partition (topic, partition, offset, error) handed to `each` as
-/// it is read, nothing allocated: what the Kani proof checks (`proofs.rs`).
-pub fn offset_fetch_each<'a>(mut c: Cur<'a>, mut each: impl FnMut(&'a str, i32, i64, Code)) -> Result<Code> {
+/// `offset_fetch`'s reading, each partition (topic, partition, offset, error, metadata) handed to
+/// `each` as it is read, nothing allocated: what the Kani proof checks (`proofs.rs`).
+pub fn offset_fetch_each<'a>(
+    mut c: Cur<'a>,
+    mut each: impl FnMut(&'a str, i32, i64, Code, Option<&'a str>),
+) -> Result<Code> {
     c.i32()?; // throttle
               // a topic: name 2, partitions 4; a partition: index 4, offset 8, metadata 2, error 2
     for _ in 0..c.count(6)? {
         let topic = c.str()?;
         for _ in 0..c.count(16)? {
             let (p, offset) = (c.i32()?, c.i64()?);
-            c.nstr()?; // the committer's metadata
-            each(topic, p, offset, c.code()?);
+            let meta = c.nstr()?; // the committer's
+            each(topic, p, offset, c.code()?, meta);
         }
     }
     let code = c.code()?;

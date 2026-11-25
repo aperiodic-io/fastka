@@ -1633,3 +1633,46 @@ fn partitions_assigned_later_are_fetched_and_the_others_kept() {
     assert_eq!(vals(&got, 2), ["u0", "EOF"]);
     assert!(heard.is_empty(), "{heard:?}");
 }
+
+/// Why (aperiodic-io/archiver#17): a broker that hangs (SIGSTOPped, a volume stall) still completes
+/// the TCP handshake in the kernel, so a reconnect to it waits for ApiVersions until
+/// `socket.connection.setup.timeout.ms` (30 s), and its partitions, mapped to a broker still
+/// connecting, were not looked up again meanwhile: they stayed unread after their leaders had moved.
+/// A broker connecting for longer than a Fetch may stay unanswered is overdue: its partitions'
+/// leaders are looked up, and a partition led elsewhere is fetched there within seconds.
+#[test]
+fn a_leader_that_hangs_while_connecting_is_left_for_the_new_leader() {
+    let mut log = Log::default();
+    log.push(0, &["one"]);
+    // the hung broker: the handshake completes, nothing is ever answered
+    let hung = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let hung_addr = hung.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let mut held = vec![];
+        for s in hung.incoming() {
+            held.push(s);
+        }
+    });
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let (l2, h2) = (lookups.clone(), hung_addr.clone());
+    let data = log_handler(logs(&[("t", 0, log)]), no_fault());
+    let good = Broker::start(move |r| {
+        if r.api == wire::METADATA {
+            // the first lookup names the hung broker the leader; later ones, this one
+            let leader = if l2.fetch_add(1, Ordering::SeqCst) == 0 { 1 } else { 0 };
+            Answer::Body(metadata(&[(0, &r.me), (1, &h2)], &[("t", &[(0, leader)])]))
+        } else {
+            data(r)
+        }
+    });
+    let mut c = consumer(
+        &good,
+        &[("socket.connection.setup.timeout.ms", "30000"), ("fetch.wait.max.ms", "100")],
+        vec![Assignment::new("t", 0, Offset::At(0))],
+    );
+    let t0 = Instant::now();
+    let (got, heard) = drain(&mut c, 1);
+    assert_eq!(vals(&got, 0), ["one", "EOF"], "{heard:?}");
+    assert!(t0.elapsed() < Duration::from_secs(5), "read in {:?}: waited out the connect timeout", t0.elapsed());
+    assert!(lookups.load(Ordering::SeqCst) >= 2, "looked up again while connecting");
+}

@@ -229,6 +229,20 @@ fn committed_round_trip(c: &Config) {
     );
     let missing = unique("no-such-topic");
     assert_eq!(client.committed(&group, &[(missing.clone(), 0)], T).unwrap(), [(missing, 0, None)]);
+
+    // each offset's metadata is kept with it and given back, replaced by the next commit's (the
+    // archiver keeps there what identifies the record before the offset: aperiodic-io/archiver#17)
+    let fp = "archiver/1 1700000000000 9f2c";
+    let with = [(topic.clone(), 0, 11, Some(fp.to_string())), (topic.clone(), 1, 3, None)];
+    client.commit_with_metadata(&group, &with, T).unwrap();
+    let got = client.committed_with_metadata(&group, &asked, T).unwrap();
+    assert_eq!((got[0].2, got[0].3.as_deref()), (Some(11), Some(fp)));
+    // none committed: null, or the empty string a broker stores for it
+    assert!(got[1].2 == Some(3) && got[1].3.as_deref().unwrap_or("").is_empty(), "{got:?}");
+    client.commit(&group, &[(topic.clone(), 0, 12)], T).unwrap();
+    let after = client.committed_with_metadata(&group, &asked[..1], T).unwrap();
+    assert_eq!(after[0].2, Some(12));
+    assert!(after[0].3.as_deref().unwrap_or("").is_empty(), "a commit without metadata replaces it: {after:?}");
 }
 
 #[test]

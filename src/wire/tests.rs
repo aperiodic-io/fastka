@@ -412,15 +412,21 @@ fn find_coordinator_and_offset_commit() {
     assert_eq!((code, b), (Code::NONE, Broker { id: 3, host: "k3".into(), port: 9094 }));
     every_cut_fails(&frame, super::find_coordinator);
 
-    request(&mut out, OFFSET_COMMIT, 2, "fastka", |o| offset_commit_request(o, "g", &[("t", (0, 10)), ("t", (1, 20))]));
+    request(&mut out, OFFSET_COMMIT, 2, "fastka", |o| {
+        offset_commit_request(o, "g", &[("t", (0, 10, None)), ("t", (1, 20, Some("archiver/1 7 ab")))])
+    });
     let r: km::OffsetCommitRequest = oracle_request(&out, OFFSET_COMMIT, 2);
     assert_eq!(
         (r.group_id.0.as_str(), r.generation_id_or_member_epoch, r.member_id.as_str(), r.retention_time_ms),
         ("g", -1, "", -1),
         "a commit from outside the group's membership"
     );
-    let ps: Vec<(i32, i64)> = r.topics[0].partitions.iter().map(|p| (p.partition_index, p.committed_offset)).collect();
-    assert_eq!(ps, [(0, 10), (1, 20)]);
+    let ps: Vec<(i32, i64, Option<&str>)> = r.topics[0]
+        .partitions
+        .iter()
+        .map(|p| (p.partition_index, p.committed_offset, p.committed_metadata.as_deref()))
+        .collect();
+    assert_eq!(ps, [(0, 10, None), (1, 20, Some("archiver/1 7 ab"))], "each offset's metadata, null where none");
     use km::offset_commit_response::*;
     let r = km::OffsetCommitResponse::default().with_topics(vec![OffsetCommitResponseTopic::default()
         .with_name(topic("t"))
@@ -471,9 +477,9 @@ fn offset_fetch() {
     assert_eq!(
         got,
         [
-            ("t".into(), 0, 42, Code::NONE),
-            ("t".into(), 1, -1, Code::NONE),
-            ("u".into(), 2, 7, Code::GROUP_AUTHORIZATION_FAILED)
+            ("t".into(), 0, 42, Code::NONE, Some("by kcat".into())),
+            ("t".into(), 1, -1, Code::NONE, Some("by kcat".into())),
+            ("u".into(), 2, 7, Code::GROUP_AUTHORIZATION_FAILED, Some("by kcat".into()))
         ]
     );
     every_cut_fails(&frame, super::offset_fetch);

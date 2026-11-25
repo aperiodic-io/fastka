@@ -445,11 +445,28 @@ impl Client {
     /// [`Code::GROUP_AUTHORIZATION_FAILED`]), or if no coordinator is found;
     /// [`Error::Config`]: a group or topic name over 32767 bytes.
     pub fn commit(&self, group: &str, offsets: &[(String, i32, i64)], timeout: Duration) -> Result<()> {
+        let os: Vec<CommitWith> = offsets.iter().map(|(t, p, o)| (t.clone(), *p, *o, None)).collect();
+        self.commit_with_metadata(group, &os, timeout)
+    }
+
+    /// [`commit`](Client::commit) with each offset's metadata (Kafka's `OffsetAndMetadata`): a
+    /// string the coordinator keeps with it and gives back with
+    /// [`committed_with_metadata`](Client::committed_with_metadata), e.g. what identifies the
+    /// record before the offset. `None` commits none.
+    ///
+    /// # Errors
+    ///
+    /// As [`commit`](Client::commit); a metadata string over the coordinator's
+    /// `offset.metadata.max.bytes` (4096 by default) is the partition's refusal
+    /// (OFFSET_METADATA_TOO_LARGE), and one over 32767 bytes [`Error::Config`].
+    pub fn commit_with_metadata(&self, group: &str, offsets: &[CommitWith], timeout: Duration) -> Result<()> {
         names("group.id", [group])?;
         names("topic", offsets.iter().map(|o| o.0.as_str()))?;
+        names("offset metadata", offsets.iter().filter_map(|o| o.3.as_deref()))?;
         self.retried(timeout, |inner, deadline| {
             let coordinator = self.coordinator(inner, deadline, group)?;
-            let os: Vec<(&str, (i32, i64))> = offsets.iter().map(|(t, p, o)| (t.as_str(), (*p, *o))).collect();
+            let os: Vec<(&str, wire::ToCommit<'_>)> =
+                offsets.iter().map(|(t, p, o, m)| (t.as_str(), (*p, *o, m.as_deref()))).collect();
             let frame = self.call(inner, To::Broker(coordinator), deadline, wire::OFFSET_COMMIT, &|o| {
                 wire::offset_commit_request(o, group, &os)
             })?;
@@ -479,6 +496,22 @@ impl Client {
     /// [`Error::Protocol`] if a partition asked is not answered;
     /// [`Error::Config`]: a partition named twice, or a group or topic name over 32767 bytes.
     pub fn committed(&self, group: &str, partitions: &[(String, i32)], timeout: Duration) -> Result<Vec<Committed>> {
+        let got = self.committed_with_metadata(group, partitions, timeout)?;
+        Ok(got.into_iter().map(|(t, p, o, _)| (t, p, o)).collect())
+    }
+
+    /// [`committed`](Client::committed) with each offset's metadata, as its committer left it
+    /// (`None`: none, or no offset).
+    ///
+    /// # Errors
+    ///
+    /// As [`committed`](Client::committed).
+    pub fn committed_with_metadata(
+        &self,
+        group: &str,
+        partitions: &[(String, i32)],
+        timeout: Duration,
+    ) -> Result<Vec<CommittedWith>> {
         names("group.id", [group])?;
         names("topic", partitions.iter().map(|p| p.0.as_str()))?;
         let mut seen = std::collections::HashSet::new();
@@ -499,14 +532,14 @@ impl Client {
                 moved(inner, coordinator, code);
                 return Err(Error::Broker(code, format!("reading group {group}'s offsets")));
             }
-            if let Some((t, p, _, code)) = got.iter().find(|g| g.3 != Code::NONE) {
+            if let Some((t, p, _, code, _)) = got.iter().find(|g| g.3 != Code::NONE) {
                 moved(inner, coordinator, *code);
                 return Err(Error::Broker(*code, format!("reading {t}/{p}'s offset for group {group}")));
             }
             ps.iter()
                 .map(|&(t, p)| match got.iter().find(|g| g.0 == t && g.1 == p) {
                     // -1: none committed; any other negative is no offset either, never one to start at
-                    Some(g) => Ok((t.to_string(), p, (g.2 >= 0).then_some(g.2))),
+                    Some(g) => Ok((t.to_string(), p, (g.2 >= 0).then_some(g.2), g.4.clone().filter(|_| g.2 >= 0))),
                     None => Err(Error::Protocol(format!(
                         "broker {coordinator}: OffsetFetch without {t}/{p}, which it was asked"
                     ))),
@@ -544,6 +577,12 @@ fn moved(inner: &mut Inner, coordinator: i32, code: Code) {
 
 /// A group's committed offset: (topic, partition, its offset; `None` if none is committed).
 pub type Committed = (String, i32, Option<i64>);
+
+/// A committed offset and its metadata: (topic, partition, offset, metadata).
+pub type CommittedWith = (String, i32, Option<i64>, Option<String>);
+
+/// An offset to commit with its metadata: (topic, partition, offset, metadata).
+pub type CommitWith = (String, i32, i64, Option<String>);
 
 /// A partition's offset found: (topic, partition, its offset (None: no record that recent), or why
 /// not).

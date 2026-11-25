@@ -159,7 +159,8 @@ const WAIT: Duration = Duration::from_millis(10);
 enum Link {
     /// not connected: may connect at `.0`
     Idle(Instant),
-    Connecting(mpsc::Receiver<Result<Conn>>),
+    /// connecting since `.1`
+    Connecting(mpsc::Receiver<Result<Conn>>, Instant),
     Ready(Stream),
 }
 
@@ -541,14 +542,10 @@ impl Consumer {
                 let (_, addr) = addrs.iter().find(|a| a.0 == leader)?;
                 let br = &self.brokers[b];
                 (leader != br.id || *addr != br.addr).then(|| {
-                    let since = now.duration_since(br.inflight.as_ref().map_or(now, |f| f.since));
-                    (
-                        b,
-                        format!(
-                            "its Fetch unanswered for {since:?}, {t}/{} is led by broker {leader} now",
-                            p.partition
-                        ),
-                    )
+                    let since = now.duration_since(self.waited_since(b, now));
+                    let what =
+                        if matches!(br.link, Link::Connecting(..)) { "connecting" } else { "its Fetch unanswered" };
+                    (b, format!("{what} for {since:?}, {t}/{} is led by broker {leader} now", p.partition))
                 })
             });
             if let Some((b, why)) = moved {
@@ -592,13 +589,29 @@ impl Consumer {
         failed
     }
 
-    /// Whether broker `b`'s Fetch, written whole, is unanswered `OVERDUE` past its own wait.
+    /// Whether broker `b`'s Fetch, written whole, is unanswered `OVERDUE` past its own wait; or it
+    /// has been connecting that long. A broker that hangs (stopped, a volume stall) completes the
+    /// TCP handshake in its kernel and answers nothing, so a connection to it waits out
+    /// `socket.connection.setup.timeout.ms`: meanwhile its partitions' leaders are looked up.
     fn overdue(&self, b: usize, now: Instant) -> bool {
         let br = &self.brokers[b];
         let wait = Duration::from_millis(self.s.max_wait_ms as u64) + OVERDUE;
-        matches!(br.link, Link::Ready(_))
-            && br.written == br.out.len()
-            && br.inflight.as_ref().is_some_and(|f| now.duration_since(f.since) > wait)
+        match &br.link {
+            Link::Ready(_) => {
+                br.written == br.out.len() && br.inflight.as_ref().is_some_and(|f| now.duration_since(f.since) > wait)
+            }
+            Link::Connecting(_, since) => now.duration_since(*since) > wait,
+            Link::Idle(_) => false,
+        }
+    }
+
+    /// Since when broker `b` has been waited on: its Fetch in flight, or its connection.
+    fn waited_since(&self, b: usize, now: Instant) -> Instant {
+        let br = &self.brokers[b];
+        match &br.link {
+            Link::Connecting(_, since) => *since,
+            _ => br.inflight.as_ref().map_or(now, |f| f.since),
+        }
     }
 
     /// Broker `b` is lost: its partitions' leaders looked up again, its Fetch asked again (from
@@ -690,10 +703,10 @@ impl Consumer {
                 Link::Idle(at) if now < *at => continue,
                 Link::Idle(_) => {
                     let rx = conn::open_in_background(self.net.clone(), self.brokers[b].addr.clone());
-                    self.brokers[b].link = Link::Connecting(rx);
+                    self.brokers[b].link = Link::Connecting(rx, now);
                     continue;
                 }
-                Link::Connecting(rx) => match rx.try_recv() {
+                Link::Connecting(rx, _) => match rx.try_recv() {
                     Err(mpsc::TryRecvError::Empty) => continue,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         self.drop_broker(b, now, "connecting: the thread ended".into(), notice);
@@ -1057,7 +1070,8 @@ impl Consumer {
     fn wait_slice(&self, now: Instant, until: Option<Instant>) -> Duration {
         let pending = self.lookup.is_some()
             || self.brokers.iter().any(|b| {
-                matches!(b.link, Link::Connecting(_)) || b.inflight.is_some() && (b.written < b.out.len() || !b.flushed)
+                matches!(b.link, Link::Connecting(..))
+                    || b.inflight.is_some() && (b.written < b.out.len() || !b.flushed)
             });
         let timers = self
             .brokers
