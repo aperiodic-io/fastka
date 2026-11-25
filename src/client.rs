@@ -448,36 +448,102 @@ impl Client {
         names("group.id", [group])?;
         names("topic", offsets.iter().map(|o| o.0.as_str()))?;
         self.retried(timeout, |inner, deadline| {
-            let frame = self.call(inner, To::Any, deadline, wire::FIND_COORDINATOR, &|o| {
-                wire::find_coordinator_request(o, group)
-            })?;
-            let (code, msg, b) = wire::find_coordinator(Cur::new(&frame))?;
-            if code != Code::NONE {
-                return Err(Error::Broker(
-                    code,
-                    format!("finding group {group}'s coordinator: {}", msg.unwrap_or_default()),
-                ));
-            }
-            let md = inner.metadata.get_or_insert_with(Metadata::default);
-            if md.broker(b.id).is_none() {
-                md.brokers.push(b.clone());
-            }
+            let coordinator = self.coordinator(inner, deadline, group)?;
             let os: Vec<(&str, (i32, i64))> = offsets.iter().map(|(t, p, o)| (t.as_str(), (*p, *o))).collect();
-            let frame = self.call(inner, To::Broker(b.id), deadline, wire::OFFSET_COMMIT, &|o| {
+            let frame = self.call(inner, To::Broker(coordinator), deadline, wire::OFFSET_COMMIT, &|o| {
                 wire::offset_commit_request(o, group, &os)
             })?;
             for (t, p, code) in wire::offset_commit(Cur::new(&frame))? {
                 if code != Code::NONE {
-                    if matches!(code, Code::NOT_COORDINATOR | Code::COORDINATOR_NOT_AVAILABLE) {
-                        inner.conns.remove(&b.id);
-                    }
+                    moved(inner, coordinator, code);
                     return Err(Error::Broker(code, format!("committing {t}/{p} for group {group}")));
                 }
             }
             Ok(())
         })
     }
+
+    /// The offsets `group` committed for `partitions` (topic, partition), in the order asked:
+    /// `None` where it has none (a group or a partition it never committed for, a topic the
+    /// cluster has not). Read from the group's coordinator, as a client outside its membership
+    /// reads them; retried while the coordinator moves or loads. Nothing is asked for no
+    /// partitions.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`] (or the last transient error) if `timeout` passes first;
+    /// [`Error::Transport`], [`Error::Auth`] or [`Error::Unsupported`] if no broker can be
+    /// reached or spoken to; [`Error::Broker`] for a code a retry does not mend.
+    /// [`Error::Broker`] for the group's own error or the first partition's the coordinator
+    /// refused (e.g. [`Code::GROUP_AUTHORIZATION_FAILED`]), or if no coordinator is found;
+    /// [`Error::Protocol`] if a partition asked is not answered;
+    /// [`Error::Config`]: a partition named twice, or a group or topic name over 32767 bytes.
+    pub fn committed(&self, group: &str, partitions: &[(String, i32)], timeout: Duration) -> Result<Vec<Committed>> {
+        names("group.id", [group])?;
+        names("topic", partitions.iter().map(|p| p.0.as_str()))?;
+        let mut seen = std::collections::HashSet::new();
+        if let Some((t, p)) = partitions.iter().find(|tp| !seen.insert(*tp)) {
+            return Err(Error::Config(format!("{t}/{p}: asked for twice in one OffsetFetch")));
+        }
+        if partitions.is_empty() {
+            return Ok(vec![]);
+        }
+        let ps: Vec<(&str, i32)> = partitions.iter().map(|(t, p)| (t.as_str(), *p)).collect();
+        self.retried(timeout, |inner, deadline| {
+            let coordinator = self.coordinator(inner, deadline, group)?;
+            let frame = self.call(inner, To::Broker(coordinator), deadline, wire::OFFSET_FETCH, &|o| {
+                wire::offset_fetch_request(o, group, &ps)
+            })?;
+            let (got, code) = wire::offset_fetch(Cur::new(&frame))?;
+            if code != Code::NONE {
+                moved(inner, coordinator, code);
+                return Err(Error::Broker(code, format!("reading group {group}'s offsets")));
+            }
+            if let Some((t, p, _, code)) = got.iter().find(|g| g.3 != Code::NONE) {
+                moved(inner, coordinator, *code);
+                return Err(Error::Broker(*code, format!("reading {t}/{p}'s offset for group {group}")));
+            }
+            ps.iter()
+                .map(|&(t, p)| match got.iter().find(|g| g.0 == t && g.1 == p) {
+                    // -1: none committed; any other negative is no offset either, never one to start at
+                    Some(g) => Ok((t.to_string(), p, (g.2 >= 0).then_some(g.2))),
+                    None => Err(Error::Protocol(format!(
+                        "broker {coordinator}: OffsetFetch without {t}/{p}, which it was asked"
+                    ))),
+                })
+                .collect()
+        })
+    }
+
+    /// The id of `group`'s coordinator, found by any broker and put among the brokers to call.
+    fn coordinator(&self, inner: &mut Inner, deadline: Instant, group: &str) -> Result<i32> {
+        let frame =
+            self.call(inner, To::Any, deadline, wire::FIND_COORDINATOR, &|o| wire::find_coordinator_request(o, group))?;
+        let (code, msg, b) = wire::find_coordinator(Cur::new(&frame))?;
+        if code != Code::NONE {
+            return Err(Error::Broker(
+                code,
+                format!("finding group {group}'s coordinator: {}", msg.unwrap_or_default()),
+            ));
+        }
+        let md = inner.metadata.get_or_insert_with(Metadata::default);
+        if md.broker(b.id).is_none() {
+            md.brokers.push(b.clone());
+        }
+        Ok(b.id)
+    }
 }
+
+/// A coordinator that says it is not (any more) has its connection dropped: the retry finds the
+/// group's coordinator again.
+fn moved(inner: &mut Inner, coordinator: i32, code: Code) {
+    if matches!(code, Code::NOT_COORDINATOR | Code::COORDINATOR_NOT_AVAILABLE) {
+        inner.conns.remove(&coordinator);
+    }
+}
+
+/// A group's committed offset: (topic, partition, its offset; `None` if none is committed).
+pub type Committed = (String, i32, Option<i64>);
 
 /// A partition's offset found: (topic, partition, its offset (None: no record that recent), or why
 /// not).

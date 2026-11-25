@@ -1598,3 +1598,38 @@ fn a_retriable_fetch_error_backs_off_and_doubles() {
     );
     assert!(gaps[1] > gaps[0] * 3 / 2 && gaps[2] > gaps[1] * 3 / 2, "the waits not doubling: {gaps:?}");
 }
+
+/// Why: a reader that assigns partitions itself (no group) must pick up a topic created, or
+/// partitions added, after it started, without dropping what it holds of the others: an archiver
+/// re-made for each new topic would re-fetch, and with its queues dropped re-read, every other
+/// partition. Partitions added are fetched from where they say, after the others; those assigned
+/// before keep their index, position and queue; one assigned twice is refused, and nothing added.
+#[test]
+fn partitions_assigned_later_are_fetched_and_the_others_kept() {
+    let (mut a, mut b, mut u) = (Log::default(), Log::default(), Log::default());
+    a.push(0, &["a0", "a1"]);
+    b.push(0, &["b0", "b1", "b2"]);
+    u.push(0, &["u0"]);
+    let l = logs(&[("t", 0, a)]);
+    let br = log_broker(l.clone(), no_fault());
+    let mut c = consumer(&br, &[], vec![Assignment::new("t", 0, Offset::Beginning)]);
+    let (got, _) = drain(&mut c, 1);
+    assert_eq!(vals(&got, 0), ["a0", "a1", "EOF"]);
+    l.lock().unwrap().insert(("t".into(), 1), b);
+    l.lock().unwrap().insert(("u".into(), 0), u);
+    l.lock().unwrap().get_mut(&("t".into(), 0)).unwrap().push(0, &["a2"]);
+
+    let e = c.assign(vec![Assignment::new("t", 1, Offset::At(1)), Assignment::new("t", 0, Offset::Beginning)]);
+    assert!(matches!(e, Err(Error::Config(_))), "t/0 is assigned already: {e:?}");
+    let e = c.assign(vec![Assignment::new("u", 0, Offset::Beginning), Assignment::new("u", 0, Offset::End)]);
+    assert!(matches!(e, Err(Error::Config(_))), "u/0 named twice: {e:?}");
+    assert_eq!(c.partitions().count(), 1, "nothing added by a refused assign");
+
+    c.assign(vec![Assignment::new("t", 1, Offset::At(1)), Assignment::new("u", 0, Offset::Beginning)]).unwrap();
+    assert_eq!(c.partitions().collect::<Vec<_>>(), [("t", 0), ("t", 1), ("u", 0)]);
+    let (got, heard) = drain(&mut c, 1);
+    assert_eq!(vals(&got, 0), ["a2", "EOF"], "t/0 read on from where it was, not again");
+    assert_eq!(vals(&got, 1), ["b1", "b2", "EOF"], "from offset 1");
+    assert_eq!(vals(&got, 2), ["u0", "EOF"]);
+    assert!(heard.is_empty(), "{heard:?}");
+}

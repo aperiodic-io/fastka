@@ -72,6 +72,7 @@ in_spec! {
     LIST_OFFSETS => km::ListOffsetsRequest, km::ListOffsetsResponse;
     METADATA => km::MetadataRequest, km::MetadataResponse;
     OFFSET_COMMIT => km::OffsetCommitRequest, km::OffsetCommitResponse;
+    OFFSET_FETCH => km::OffsetFetchRequest, km::OffsetFetchResponse;
     FIND_COORDINATOR => km::FindCoordinatorRequest, km::FindCoordinatorResponse;
     SASL_HANDSHAKE => km::SaslHandshakeRequest, km::SaslHandshakeResponse;
     API_VERSIONS => km::ApiVersionsRequest, km::ApiVersionsResponse;
@@ -435,6 +436,54 @@ fn find_coordinator_and_offset_commit() {
     every_cut_fails(&frame, super::offset_commit);
 }
 
+/// OffsetFetch v3 asks only what it names (never null, which is every topic the group has), and
+/// reads each partition's offset, -1 where none is committed, and the group's own error.
+#[test]
+fn offset_fetch() {
+    let mut out = vec![];
+    request(&mut out, OFFSET_FETCH, 3, "fastka", |o| offset_fetch_request(o, "g", &[("t", 0), ("u", 2), ("t", 1)]));
+    let r: km::OffsetFetchRequest = oracle_request(&out, OFFSET_FETCH, 3);
+    assert_eq!(r.group_id.0.as_str(), "g");
+    let ts: Vec<(&str, Vec<i32>)> = r
+        .topics
+        .as_ref()
+        .expect("never null")
+        .iter()
+        .map(|t| (t.name.0.as_str(), t.partition_indexes.clone()))
+        .collect();
+    assert_eq!(ts, [("t", vec![0, 1]), ("u", vec![2])]);
+
+    use km::offset_fetch_response::*;
+    let part = |p: i32, o: i64, e: i16| {
+        OffsetFetchResponsePartition::default()
+            .with_partition_index(p)
+            .with_committed_offset(o)
+            .with_metadata(Some(s("by kcat")))
+            .with_error_code(e)
+    };
+    let r = km::OffsetFetchResponse::default().with_throttle_time_ms(5).with_topics(vec![
+        OffsetFetchResponseTopic::default().with_name(topic("t")).with_partitions(vec![part(0, 42, 0), part(1, -1, 0)]),
+        OffsetFetchResponseTopic::default().with_name(topic("u")).with_partitions(vec![part(2, 7, 30)]),
+    ]);
+    let frame = oracle_response(&r, OFFSET_FETCH, 3);
+    let (got, code) = super::offset_fetch(response(&frame, 3).unwrap()).unwrap();
+    assert_eq!(code, Code::NONE);
+    assert_eq!(
+        got,
+        [
+            ("t".into(), 0, 42, Code::NONE),
+            ("t".into(), 1, -1, Code::NONE),
+            ("u".into(), 2, 7, Code::GROUP_AUTHORIZATION_FAILED)
+        ]
+    );
+    every_cut_fails(&frame, super::offset_fetch);
+
+    let r = km::OffsetFetchResponse::default().with_error_code(14);
+    let frame = oracle_response(&r, OFFSET_FETCH, 3);
+    let (got, code) = super::offset_fetch(response(&frame, 3).unwrap()).unwrap();
+    assert_eq!((got.len(), code), (0, Code::COORDINATOR_LOAD_IN_PROGRESS), "the group's own error, at the end");
+}
+
 #[test]
 fn sasl() {
     let mut out = vec![];
@@ -517,6 +566,7 @@ proptest::proptest! {
         let _ = super::describe_configs(Cur::new(&b));
         let _ = super::create_topics(Cur::new(&b));
         let _ = super::offset_commit(Cur::new(&b));
+        let _ = super::offset_fetch(Cur::new(&b));
         let _ = super::api_versions(Cur::new(&b));
         let _ = super::find_coordinator(Cur::new(&b));
         let _ = super::sasl_handshake(Cur::new(&b));
@@ -587,6 +637,13 @@ fn the_smallest_elements_decode() {
     ]);
     let frame = oracle_response(&r, OFFSET_COMMIT, 1);
     assert_eq!(super::offset_commit(response(&frame, 1).unwrap()).unwrap().len(), 1);
+
+    use km::offset_fetch_response::*;
+    let r = km::OffsetFetchResponse::default().with_topics(vec![OffsetFetchResponseTopic::default()
+        .with_name(topic(""))
+        .with_partitions(vec![OffsetFetchResponsePartition::default().with_metadata(None)])]);
+    let frame = oracle_response(&r, OFFSET_FETCH, 3);
+    assert_eq!(super::offset_fetch(response(&frame, 3).unwrap()).unwrap().0.len(), 1);
 
     let r = km::SaslHandshakeResponse::default().with_mechanisms(vec![s("")]);
     let frame = oracle_response(&r, SASL_HANDSHAKE, 1);

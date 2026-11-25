@@ -53,7 +53,7 @@ runs; [details below](#benchmarks)):
   - offsets for timestamps;
   - topic configs;
   - topic creation, with configs if given (idempotent across a lost answer);
-  - offset commits for a group.
+  - offset commits for a group, and the offsets a group committed read back (`Client::committed`).
 - **TLS** through rustls: a CA given by file or PEM, otherwise the system roots; client
   certificates.
 - **SASL**: PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512.
@@ -71,7 +71,7 @@ loudly at startup, not half-supported:
 
 | Not supported | What to use instead |
 |---|---|
-| **Consumer groups** (subscribe, rebalancing, partition assignment by the broker) | Assign partitions yourself (`Assignment`). You can still commit offsets to a group with `Client::commit`. |
+| **Consumer groups** (subscribe, rebalancing, partition assignment by the broker) | Assign partitions yourself (`Assignment`, and `Consumer::assign` for partitions that appear later). You can still commit offsets to a group with `Client::commit`, and read them back with `Client::committed`. |
 | **Transactions** (transactional producer, exactly-once across topics) | rdkafka. fastka *reads* transactional topics correctly with `read_committed`. |
 | **acks=0** (fire and forget: no answer, so a loss looks like a delivery) | `acks=1` with `enable.idempotence=false`, or rdkafka. |
 | **async/await** | It is synchronous by design. In an async program, run it on a dedicated thread (`spawn_blocking`), or use rskafka. |
@@ -188,7 +188,9 @@ Every claim below is a test in this repository that CI runs.
     transactions the Java producer committed and aborted;
   - a transaction it holds open holds `read_committed` at the transaction's start;
   - a broker quota (on `client.id`) throttles fastka, and nothing fails;
-  - offsets fastka commits are the group's offsets as the Java admin client sees them.
+  - offsets fastka commits are the group's offsets as the Java admin client sees them;
+  - offsets the Java consumer commits as a member of the group are read back on the partitions
+    asked, and none (not 0) where it committed none.
 
   Against Redpanda: where a partition is read from (its end, an offset, past its end under each
   `auto.offset.reset`, `seek`); records at the broker's size limit; 48 partitions of 3 topics with
@@ -204,13 +206,17 @@ Every claim below is a test in this repository that CI runs.
   partition is led elsewhere, then started again:
   - while producing, each delivery is in the log once, where it was reported, and a key's order
     is kept;
-  - while reading, every record is read once.
+  - while reading, every record is read once;
+  - a group's committed offsets are read back with its coordinator stopped, from the one that
+    takes over.
 - **Real brokers** (`tests/brokers.rs`, CI's `brokers` job):
   - Redpanda 24.2;
   - Apache Kafka 4.1 (KRaft);
   - Redpanda 26.2 requiring SASL/SCRAM;
   - interoperability with `rpk` (franz-go, an independent implementation) both ways in every codec;
-  - a lost answer replayed against each broker's idempotence state.
+  - a lost answer replayed against each broker's idempotence state;
+  - a group's offsets committed and read back (Redpanda 24.2 and 26.2, Apache Kafka 4.1), and
+    what rpk commits as a member read back.
 - **Exhaustive model checking of the producer** (`tests/produce_model.rs`).
   - Setup: the producer's rules, with a broker that keeps Kafka's idempotence state.
   - What is explored: every reachable state, covering every interleaving of sends, deadlines,
@@ -229,7 +235,8 @@ Every claim below is a test in this repository that CI runs.
 - **Kani proofs** (`src/proofs.rs`, CI's `kani` job). These hold for *every* input up to their
   bounds, not a sample:
   - varints round-trip for every `i64`;
-  - no bytes make the varint, cursor or batch-header decoders panic or read out of bounds;
+  - no bytes make the varint, cursor, batch-header or OffsetFetch decoders panic or read out of
+    bounds, and OffsetFetch never yields more partitions than its bytes hold;
   - an array length from the wire is never trusted beyond the bytes that are actually present;
   - version negotiation picks the newest common version;
   - every key lands on a partition the topic has, whatever its partition count.

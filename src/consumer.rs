@@ -226,6 +226,33 @@ struct Part {
     reset_from: Option<i64>,
 }
 
+impl Part {
+    fn new(a: Assignment) -> Part {
+        Part {
+            next: match a.offset {
+                Offset::At(o) => Some(o),
+                _ => None,
+            },
+            topic: a.topic,
+            partition: a.partition,
+            want: a.offset,
+            queue: VecDeque::new(),
+            paused: a.paused,
+            broker: None,
+            incoming: 0,
+            incoming_bytes: 0,
+            bytes: 0,
+            not_before: Instant::now(),
+            errors: 0,
+            at_end: false,
+            ended: None,
+            eof: false,
+            epoch: 0,
+            reset_from: None,
+        }
+    }
+}
+
 /// The Fetch of the partitions assigned it, on the caller's thread.
 ///
 /// Made with [`Consumer::from_config`] (or [`Consumer::new`] on a shared [`Client`]). Drive it
@@ -278,31 +305,7 @@ impl Consumer {
                 return Err(Error::Config(format!("{}/{}: assigned twice", a.topic, a.partition)));
             }
         }
-        let parts = parts
-            .into_iter()
-            .map(|a| Part {
-                next: match a.offset {
-                    Offset::At(o) => Some(o),
-                    _ => None,
-                },
-                topic: a.topic,
-                partition: a.partition,
-                want: a.offset,
-                queue: VecDeque::new(),
-                paused: a.paused,
-                broker: None,
-                incoming: 0,
-                incoming_bytes: 0,
-                bytes: 0,
-                not_before: Instant::now(),
-                errors: 0,
-                at_end: false,
-                ended: None,
-                eof: false,
-                epoch: 0,
-                reset_from: None,
-            })
-            .collect();
+        let parts = parts.into_iter().map(Part::new).collect();
         Ok(Consumer {
             net: client.net().clone(),
             client,
@@ -377,6 +380,30 @@ impl Consumer {
         if p.next.is_none() {
             self.lookup_at = self.lookup_at.min(Instant::now());
         }
+        Ok(())
+    }
+
+    /// `parts` added to the assignment, after those it has: their indices follow, and every
+    /// partition assigned before keeps its own, its position and what is queued of it. Each new
+    /// partition's leader (and its offset, unless [`Offset::At`]) is looked up at the next pump,
+    /// as at the start: a topic created, or partitions added to one, after the consumer was made.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`]: a partition already assigned or named twice, or an [`Offset::At`]
+    /// below 0. Nothing is added then.
+    pub fn assign(&mut self, parts: Vec<Assignment>) -> Result<()> {
+        for (i, a) in parts.iter().enumerate() {
+            checked(&a.topic, a.partition, a.offset)?;
+            let twice = |t: &str, p: i32| t == a.topic && p == a.partition;
+            if self.parts.iter().any(|b| twice(&b.topic, b.partition))
+                || parts[..i].iter().any(|b| twice(&b.topic, b.partition))
+            {
+                return Err(Error::Config(format!("{}/{}: assigned twice", a.topic, a.partition)));
+            }
+        }
+        self.parts.extend(parts.into_iter().map(Part::new));
+        self.lookup_at = Instant::now(); // at the next pump, not after a backoff the others met
         Ok(())
     }
 

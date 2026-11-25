@@ -7,6 +7,7 @@
 //   consume   <bootstrap> <topic> <partitions> <n> <isolation>
 //   quota     <bootstrap> <client-id> <bytes-per-s>        producer and consumer byte rates
 //   group-offsets <bootstrap> <group>
+//   group-commit <bootstrap> <group> <topic> <p:offset,...>  joined as a member (subscribe), committed, left
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
@@ -150,6 +151,27 @@ public class Oracle {
                             x -> x.getKey().topic() + "/" + x.getKey().partition(), x -> x.getValue().offset()))).entrySet())
                         System.out.println("{\"tp\":\"" + e.getKey() + "\",\"offset\":" + e.getValue() + "}");
                 }
+                break;
+            }
+            case "group-commit": {
+                Properties p = props(a[1]);
+                p.put("group.id", a[2]);
+                p.put("key.deserializer", ByteArrayDeserializer.class.getName());
+                p.put("value.deserializer", ByteArrayDeserializer.class.getName());
+                p.put("enable.auto.commit", "false");
+                Map<TopicPartition, OffsetAndMetadata> commit = new HashMap<>();
+                for (String po : a[4].split(",")) {
+                    String[] x = po.split(":");
+                    commit.put(new TopicPartition(a[3], Integer.parseInt(x[0])), new OffsetAndMetadata(Long.parseLong(x[1])));
+                }
+                try (KafkaConsumer<byte[], byte[]> c = new KafkaConsumer<>(p)) {
+                    c.subscribe(List.of(a[3]));
+                    long until = System.currentTimeMillis() + 60_000;
+                    while (!c.assignment().containsAll(commit.keySet()) && System.currentTimeMillis() < until)
+                        c.poll(Duration.ofMillis(200));
+                    c.commitSync(commit);
+                }
+                System.out.println("{\"committed\":true}");
                 break;
             }
             default:

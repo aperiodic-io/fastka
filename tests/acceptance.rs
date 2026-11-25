@@ -334,6 +334,29 @@ fn committed_offsets_are_the_groups() {
     assert_eq!(got, [(format!("{topic}/0"), 11), (format!("{topic}/2"), 42)]);
 }
 
+/// Why: the archiver's groups were committed by librdkafka as members of the group, and the
+/// archiver on fastka must resume each partition from exactly those offsets. What a member of the
+/// group (the Java consumer, subscribed) committed is read back on the partition asked; a partition
+/// it never committed for, and a group that never existed, have none (`None`), never an offset 0.
+#[test]
+fn offsets_a_group_member_committed_are_read_back() {
+    let Some(addr) = apache() else { return };
+    let c = cfg(&addr);
+    let topic = unique("member");
+    create(&c, &topic, 3, 1);
+    let group = unique("g");
+    assert_eq!(java(&["group-commit", &addr, &group, &topic, "0:11,2:42"])[0]["committed"], true);
+    let client = Client::new(&c).unwrap();
+    let asked: Vec<(String, i32)> = (0..3).map(|p| (topic.clone(), p)).collect();
+    let got = client.committed(&group, &asked, T).unwrap();
+    assert_eq!(got, [(topic.clone(), 0, Some(11)), (topic.clone(), 1, None), (topic.clone(), 2, Some(42))]);
+    let never = client.committed(&unique("never"), &asked, T).unwrap();
+    assert!(never.iter().all(|g| g.2.is_none()), "a group that never committed: {never:?}");
+    // and what fastka commits it reads back, over what the member had
+    client.commit(&group, &[(topic.clone(), 1, 7)], T).unwrap();
+    assert_eq!(client.committed(&group, &asked[1..2], T).unwrap(), [(topic.clone(), 1, Some(7))]);
+}
+
 // ---- against Redpanda --------------------------------------------------------------------
 
 fn redpanda() -> Option<String> {
@@ -706,6 +729,42 @@ fn consuming_through_a_leader_stopped_and_started() {
         x
     };
     assert_eq!(key(&read), key(&healthy), "every record once, as the healthy cluster has them");
+}
+
+/// Why: a leadership storm moves `__consumer_offsets`' leaders too (8 times on production on
+/// 2026-11-23), so a reader starting then meets a group coordinator that has just stopped. Its
+/// committed offsets are read all the same, from the coordinator that took over, within the
+/// timeout: never "no offset" (which would start the partition from `auto.offset.reset`).
+#[test]
+fn committed_offsets_are_read_through_their_coordinator_stopped() {
+    let Some((addr, nodes)) = cluster() else { return };
+    let mut c = cfg(&addr);
+    c.set("socket.timeout.ms", "5000");
+    let _restart = Restart(&nodes);
+    wait_cluster(&nodes);
+    let topic = unique("coord");
+    create(&c, &topic, 2, 3);
+    let group = unique("g");
+    let client = Client::new(&c).unwrap();
+    client.commit(&group, &[(topic.clone(), 0, 100), (topic.clone(), 1, 200)], T).unwrap();
+    // the coordinator, as rpk names it (COORDINATOR-NODE on 26.2, COORDINATOR before)
+    let out = Command::new("docker")
+        .args(["exec", &nodes[0], "rpk", "group", "describe", &group, "-X", "brokers=127.0.0.1:49090"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let id: usize = (text
+        .lines()
+        .find_map(|l| l.strip_prefix("COORDINATOR-NODE").or_else(|| l.strip_prefix("COORDINATOR ")))
+        .map(str::trim))
+    .and_then(|v| v.parse().ok())
+    .unwrap_or_else(|| panic!("no coordinator in: {text}"));
+    docker(&["stop", "-t", "1", &nodes[id]]);
+    let asked = [(topic.clone(), 0), (topic.clone(), 1)];
+    let got = client.committed(&group, &asked, Duration::from_secs(90));
+    docker(&["start", &nodes[id]]);
+    assert_eq!(got.unwrap(), [(topic.clone(), 0, Some(100)), (topic.clone(), 1, Some(200))]);
+    wait_cluster(&nodes);
 }
 
 /// Every node of the cluster up and answering again. A node not running (one that died starting
