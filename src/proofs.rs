@@ -131,7 +131,7 @@ fn offset_fetch_never_panics_nor_invents_partitions() {
     (b[26], b[27]) = (0xff, 0xff); // the partition's metadata: null (throttle 4, topics 4, name 2, partitions 4, index 4, offset 8)
     let n: usize = kani::any_where(|n| *n <= 33);
     let mut parts = 0usize;
-    if wire::offset_fetch_each(Cur::new(&b[..n]), |_, _, _, _| parts += 1).is_ok() {
+    if wire::offset_fetch_each(Cur::new(&b[..n]), |_, _, _, _, _| parts += 1).is_ok() {
         // the throttle (4), a topic array (4), a topic (2 + 4), the group's error (2)
         assert!(parts == 0 || parts * 16 + 16 <= n);
     }

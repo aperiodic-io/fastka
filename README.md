@@ -53,7 +53,8 @@ runs; [details below](#benchmarks)):
   - offsets for timestamps;
   - topic configs;
   - topic creation, with configs if given (idempotent across a lost answer);
-  - offset commits for a group, and the offsets a group committed read back (`Client::committed`).
+  - offset commits for a group, and the offsets a group committed read back (`Client::committed`),
+    each with its metadata if wanted (`commit_with_metadata`, `committed_with_metadata`).
 - **TLS** through rustls: a CA given by file or PEM, otherwise the system roots; client
   certificates.
 - **SASL**: PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512.
@@ -207,6 +208,9 @@ Every claim below is a test in this repository that CI runs.
   - while producing, each delivery is in the log once, where it was reported, and a key's order
     is kept;
   - while reading, every record is read once;
+  - a partition whose leader hangs (its connection waiting for ApiVersions until
+    `socket.connection.setup.timeout.ms`) is fetched from its new leader within seconds (unit, with
+    a listener that never answers);
   - a group's committed offsets are read back with its coordinator stopped, from the one that
     takes over.
 - **Real brokers** (`tests/brokers.rs`, CI's `brokers` job):
@@ -215,8 +219,8 @@ Every claim below is a test in this repository that CI runs.
   - Redpanda 26.2 requiring SASL/SCRAM;
   - interoperability with `rpk` (franz-go, an independent implementation) both ways in every codec;
   - a lost answer replayed against each broker's idempotence state;
-  - a group's offsets committed and read back (Redpanda 24.2 and 26.2, Apache Kafka 4.1), and
-    what rpk commits as a member read back.
+  - a group's offsets committed and read back, with their metadata (Redpanda 24.2 and 26.2,
+    Apache Kafka 4.1), and what rpk commits as a member read back.
 - **Exhaustive model checking of the producer** (`tests/produce_model.rs`).
   - Setup: the producer's rules, with a broker that keeps Kafka's idempotence state.
   - What is explored: every reachable state, covering every interleaving of sends, deadlines,
